@@ -1,8 +1,10 @@
-# rag-preflight + RAG Pipeline
+# ODW.ai Vault
 
-A **fully offline** pre-flight pipeline + end-to-end RAG system for mixed-format document corpora. Analyzes a hierarchical folder of documents, identifies formats, deduplicates, extracts text, generates embeddings, and provides query access — all running on-premises with no outbound network calls during inference.
+> The sovereign knowledge core of the ODW.ai suite — a self-hosted, open-source Retrieval-Augmented Generation (RAG) platform that turns internal documents, wikis, and structured data into an AI-queryable knowledge base without any data leaving your infrastructure.
 
-**Status:** Part 1 (pre-flight) and Part 2 (RAG pipeline) both implemented and operational. 167 tests passing. Full corpus processed: 384 unique files, 325 extractions, 8,159 chunks (all context-augmented), 8,275 embeddings.
+ODW.ai Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for mixed-format document corpora. It analyzes a hierarchical folder of documents, identifies formats, deduplicates, extracts text, generates embeddings, and provides query access — all running on-premises with no outbound network calls during inference.
+
+**Status:** Part 1 (pre-flight) and Part 2 (RAG pipeline) both implemented and operational. 167 tests passing.
 
 ## Features
 
@@ -63,89 +65,45 @@ ollama pull qwen3-embedding:8b
 # Siegfried: download from https://github.com/richardlehane/siegfried/releases, place as ./sf
 ```
 
-### 4. Initialize
+### 4. Place a corpus
 ```bash
-PYTHONPATH=. python cli.py init --root "/path/to/corpus"
+# Put your documents in a folder, e.g. data/my-corpus
+vault init --root ./data/my-corpus
 ```
 Creates `corpus.db` and `.rag-cache/` in the project directory.
 
 ### 5. Run Pre-Flight (Part 1)
 ```bash
-PYTHONPATH=. python cli.py run-all
+vault run-all
 ```
 
 ### 6. Run RAG Pipeline (Part 2)
 ```bash
 # Extract, summarize, chunk, embed
-PYTHONPATH=. python cli.py extract
-PYTHONPATH=. python cli.py summarize
-PYTHONPATH=. python cli.py chunk
-PYTHONPATH=. python cli.py context      # optional, slow
-PYTHONPATH=. python cli.py embed
+vault extract
+vault summarize
+vault chunk
+vault context      # optional, slow
+vault embed
 ```
 
 ### 7. Query
 ```bash
 # CLI
-PYTHONPATH=. python cli.py query "What is this corpus about?" --top-k 5
+vault query "What is this corpus about?" --top-k 5
 
 # JSON output
-PYTHONPATH=. python cli.py query "What formats are in the corpus?" --json
+vault query "What formats are in the corpus?" --json
 
 # API server
-PYTHONPATH=. python cli.py serve --port 8001 &
+vault serve --port 8001 &
 curl -X POST http://127.0.0.1:8001/query \
   -H "Content-Type: application/json" \
   -d '{"question": "What CAD files exist?"}'
 
 # Gradio UI
-PYTHONPATH=. python cli.py ui
+vault ui
 ```
-
-## Verified Results
-
-### Pre-Flight Results
-
-| Metric | Value |
-|--------|-------|
-| Total files | 2,177 |
-| Unique files (after dedup) | 384 |
-| Duplicate copies removed | 1,793 |
-| Total folders | 71 |
-| Corpus size | 7.4 GB |
-| Languages | English (63), Chinese (5) |
-| Video duration | 1.41 hours (36 files) |
-| Audio duration | 0.42 hours (10 files) |
-| Scanned PDFs | 0 |
-| Unknown formats | 0 |
-
-### RAG Pipeline Results
-
-| Metric | Value |
-|--------|-------|
-| Successful extractions | 325 / 372 eligible |
-| Document summaries | 45 |
-| Text chunks | 8,159 |
-| Chunks with context | 8,159 / 8,159 (complete) |
-| Chunk embeddings | 8,159 |
-| Summary embeddings | 45 |
-| Folder embeddings | 71 |
-| Query response time | ~30s |
-
-### Top Formats
-
-| Format | Count | Category |
-|--------|-------|----------|
-| Windows PE (fmt/899) | 112 | cad |
-| Unknown (UNKNOWN-pak) | 55 | data |
-| JPEG (fmt/43) | 31 | image |
-| HEIC (fmt/1101) | 23 | image |
-| MP4 (fmt/199) | 21 | video |
-| Unknown (UNKNOWN-qm) | 16 | data |
-| QuickTime (x-fmt/384) | 15 | video |
-| XLSX (fmt/214) | 11 | spreadsheet |
-| CSV (x-fmt/18) | 11 | data |
-| MP3 (fmt/134) | 10 | audio |
 
 ## Architecture
 
@@ -267,38 +225,38 @@ rrf_k = 60
 
 ```bash
 # Part 1: Pre-Flight
-PYTHONPATH=. python cli.py init --root "/path/to/corpus" [--force]
-PYTHONPATH=. python cli.py run-all
-PYTHONPATH=. python cli.py archives [--max-depth N] [--dry-run]
-PYTHONPATH=. python cli.py walk [--workers N] [--rehash]
-PYTHONPATH=. python cli.py identify [--reidentify]
-PYTHONPATH=. python cli.py triage [--workers N] [--categories CAT1,...]
-PYTHONPATH=. python cli.py dedup
-PYTHONPATH=. python cli.py folder-meta [--model NAME] [--reinfer]
-PYTHONPATH=. python cli.py report [--output PATH]
-PYTHONPATH=. python cli.py exclude --target {file,folder} --id N --reason TEXT
-PYTHONPATH=. python cli.py exclude-batch --from-file exclusions.csv
-PYTHONPATH=. python cli.py approve --by NAME
-PYTHONPATH=. python cli.py status
-PYTHONPATH=. python cli.py serve --port 8001           # API server
+vault init --root "/path/to/corpus" [--force]
+vault run-all
+vault archives [--max-depth N] [--dry-run]
+vault walk [--workers N] [--rehash]
+vault identify [--reidentify]
+vault triage [--workers N] [--categories CAT1,CAT2,...]
+vault dedup
+vault folder-meta [--model NAME] [--reinfer]
+vault report [--output PATH]
+vault exclude --target {file,folder} --id N --reason TEXT
+vault exclude-batch --from-file exclusions.csv
+vault approve --by NAME
+vault status              # JSON per-phase status
+vault serve --port 8001   # Launch Datasette
 
 # Part 2: RAG Pipeline
-PYTHONPATH=. python cli.py extract [--workers N] [--reextract]
-PYTHONPATH=. python cli.py summarize [--resummarize]
-PYTHONPATH=. python cli.py chunk [--window-size N] [--rechunk]
-PYTHONPATH=. python cli.py context [--regenerate]
-PYTHONPATH=. python cli.py embed [--model NAME] [--reembed]
-PYTHONPATH=. python cli.py embed-switch-to --model NAME
-PYTHONPATH=. python cli.py embed-gc
-PYTHONPATH=. python cli.py embed-list
-PYTHONPATH=. python cli.py query "question" [--top-k N] [--json]
-PYTHONPATH=. python cli.py serve --port 8001           # API server
-PYTHONPATH=. python cli.py ui --port 7860              # Gradio UI
-PYTHONPATH=. python cli.py eval add/run/report
-PYTHONPATH=. python cli.py models list/pull/check
+vault extract [--workers N] [--reextract]
+vault summarize [--resummarize]
+vault chunk [--window-size N] [--rechunk]
+vault context [--regenerate]
+vault embed [--model NAME] [--reembed]
+vault embed-switch-to --model NAME
+vault embed-gc
+vault embed-list
+vault query "question" [--top-k N] [--json]
+vault serve --port 8001           # API server
+vault ui --port 7860                # Gradio UI
+vault eval add/run/report
+vault models list/pull/check
 
 # Tests
-PYTHONPATH=. pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
+pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
 ```
 
 ## Documentation
@@ -318,8 +276,8 @@ PYTHONPATH=. pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
 ### Quality
 2. **Chinese FTS5 tokenizer** — current Porter stemmer only handles English.
 3. **Reranker implementation** — configured but not wired up.
-4. **Evaluation benchmarks** — load questions, run eval.
-5. **Whisper extractor** — implement for audio/video (92 files).
+4. **Evaluation benchmarks** — eval framework exists but no questions loaded.
+5. **Whisper extractor** — implement for audio/video.
 
 ## License
 

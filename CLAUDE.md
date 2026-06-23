@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **local, fully offline RAG pre-flight pipeline** (`rag-preflight`) that analyzes a hierarchical folder of mixed-format documents and produces a structured, queryable manifest (`corpus.db`) of the corpus. The manifest serves as the foundation for downstream RAG phases (extraction, chunking, embedding, retrieval).
+**ODW.ai Vault** is a self-hosted, open-source Retrieval-Augmented Generation (RAG) platform — the sovereign knowledge core of the ODW.ai suite. It provides a `vault` CLI that runs a local, fully offline pre-flight pipeline (`rag-preflight`) and an end-to-end RAG system over a hierarchical folder of mixed-format documents.
+
+The pre-flight phase analyzes documents, produces a structured, queryable manifest (`corpus.db`), and prepares the corpus for downstream extraction, chunking, embedding, and retrieval. The RAG pipeline then extracts text, summarizes, chunks, augments context, generates embeddings, and serves a queryable knowledge base through a FastAPI backend and a Gradio UI.
 
 The system runs entirely on-premises with no outbound network calls during inference. All format identification, triage, and LLM inference use locally hosted resources (Ollama, Siegfried, etc.).
 
-**Current state:** All 7 pre-flight phases are implemented, verified, and covered by 167 unit tests at 86% line coverage. The pipeline has been run end-to-end on the sample corpus (`SourceData/` — 2177 files, 7.4 GB, 71 folders, 0 unknown formats). Context augmentation is complete (8,159/8,159 chunks). The pre-flight is ready for downstream RAG phases (Phase 8+).
+**Current state:** All 7 pre-flight phases and all RAG pipeline phases (8–14) are implemented and covered by 167 unit tests at 86% line coverage. The codebase is distributed without any bundled corpus, database, vector store, or cached artifacts; users provide their own documents and run the pipeline locally.
 
 ## Key Documents
 
@@ -21,7 +23,7 @@ The system runs entirely on-premises with no outbound network calls during infer
 
 ## Source Corpus
 
-`SourceData/` contains 2177 files (384 unique after dedup), 7.4 GB, across 71 folders. Content is bilingual: English (92.6%) and Chinese Traditional/Simplified (7.4%). Formats include PDF, Office documents, images, video, audio, archives, CAD files, and executables.
+This repository ships without a sample corpus. Users place their own documents under a directory (conventionally `data/`) and run `vault init --root ./data/my-corpus` to point the pipeline at them. Supported formats include PDF, Office documents, images, video, audio, archives, CAD files, and executables.
 
 ## Architecture
 
@@ -52,15 +54,16 @@ All paths relative to project root.
 ```
 .
 ├── cli.py                          # 30+ click commands (pre-flight + RAG pipeline)
-├── corpus.db                       # SQLite database (current run)
 ├── config.toml                     # Configuration
 ├── pyproject.toml                  # Dependencies + pytest config
-├── sf                              # Siegfried binary (v1.11.4)
+├── sf                              # Siegfried binary (v1.11.4), user-provided
 ├── README.md
 ├── BUILD_STATUS.md
 ├── CLAUDE.md
 ├── TEST_REPORT.md                  # Test suite report (167 tests, 86% coverage)
 ├── PART_2_STATUS.md                # Part 2 build status (phases 8-14)
+├── data/
+│   └── README.md                   # Instructions for placing a corpus
 ├── seeds/
 │   └── format_policy.csv           # 87 PRONOM policy entries (incl. UNKNOWN-* fallbacks)
 ├── pipeline/
@@ -92,11 +95,9 @@ All paths relative to project root.
 │   ├── test_phase7_exclude.py      # 8 tests
 │   ├── test_cli.py                 # 14 tests
 │   └── test_e2e_pipeline.py        # 6 tests
-├── SourceData/                     # Sample corpus (7.4 GB, 2177 files)
-│   └── preflight_report.md         # Generated report
 ├── rag/                            # Part 2: extraction through generation
 │   ├── phase8_extract.py           # Extraction dispatcher
-│   ├── phase8b_transcribe.py       # Audio/video transcription (opt-in)
+│   ├── phase8b_transcribe.py     # Audio/video transcription (opt-in)
 │   ├── phase9_summarize.py         # Document summarization
 │   ├── phase10_chunk.py            # Sentence-window chunking
 │   ├── phase10_5_context.py        # Contextual retrieval augmentation
@@ -111,11 +112,9 @@ All paths relative to project root.
 │   └── schemas.py                  # Pydantic request/response models
 ├── eval/                           # Part 2: Evaluation
 │   └── runner.py                   # add_question, run_eval, eval_report
-├── ui/                             # Part 2: User interface
-│   ├── gradio_app.py               # Gradio chat interface
-│   └── gradio_app_legacy.py        # Original Gradio UI (backup)
-├── chroma/                         # Chroma vector store (persistent collections)
-└── .rag-cache/                     # Derived artifacts (logs, extractions, models)
+└── ui/                             # Part 2: User interface
+    ├── gradio_app.py               # Gradio chat interface
+    └── gradio_app_legacy.py        # Original Gradio UI (backup)
 ```
 
 ### Phase Pipeline (execute in order)
@@ -133,7 +132,7 @@ All paths relative to project root.
 
 7. **Phase 6 — `report`**: Compute folder-level aggregates (file_count, total_bytes, document_count, dominant_format). Generate `preflight_report.md` with: corpus overview, format histogram (top 30), category breakdown, OCR workload, transcription workload, duplicate summary, problem files, unknown formats, language distribution, folder taxonomy tree, failure summary. Marks `preflight_completed_at` in config table.
 
-8. **Phase 7 — `exclude` + `approve`**: Mark files/folders as `excluded=1` with reason. Batch CSV import (`target,id,reason`). `db[table].get(id)` raises `NotFoundError` for missing rows — catch and convert to `ValueError` in single exclusion, skip in batch. Final sign-off records `preflight_approved_by` and `preflight_completed_at`.
+8. **Phase 7 — `exclude` + `approve`**: Mark files/folders as `excluded=1` with reason. Batch CSV import (`target,id,reason`). `db[table].get(id)` raises `NotFoundError` if row doesn't exist — catch and convert to `ValueError` in single exclusion, skip in batch. Final sign-off records `preflight_approved_by` and `preflight_completed_at`.
 
 ### Guiding Principles
 - **Originals are never modified** — all derived artifacts go under `.rag-cache/`
@@ -142,9 +141,9 @@ All paths relative to project root.
 - **All failures go to the `failure` table** — silent failures are defects
 - **No outbound HTTP during pre-flight** — phases 0–7 are air-gap capable. Phase 12 (generation) uses Ollama.com API by default, can be switched to local Ollama.
 
-## Commands
+### Commands
 
-All commands run from project root with `PYTHONPATH=.`.
+All commands run from project root.
 
 ```bash
 # Setup
@@ -152,36 +151,36 @@ source .venv/bin/activate
 uv pip install -e ".[dev]"
 
 # Initialize a new corpus
-PYTHONPATH=. python cli.py init --root "/path/to/corpus" [--force]
+vault init --root "/path/to/corpus" [--force]
 
 # Run all phases
-PYTHONPATH=. python cli.py run-all
+vault run-all
 
 # Individual phases
-PYTHONPATH=. python cli.py archives [--max-depth N] [--dry-run]
-PYTHONPATH=. python cli.py walk [--workers N] [--rehash]
-PYTHONPATH=. python cli.py identify [--reidentify]
-PYTHONPATH=. python cli.py triage [--workers N] [--categories CAT1,CAT2,...]
-PYTHONPATH=. python cli.py dedup
-PYTHONPATH=. python cli.py folder-meta [--model NAME] [--reinfer] [--max-folders N]
-PYTHONPATH=. python cli.py report [--output PATH]
+vault archives [--max-depth N] [--dry-run]
+vault walk [--workers N] [--rehash]
+vault identify [--reidentify]
+vault triage [--workers N] [--categories CAT1,CAT2,...]
+vault dedup
+vault folder-meta [--model NAME] [--reinfer] [--max-folders N]
+vault report [--output PATH]
 
 # Exclusion
-PYTHONPATH=. python cli.py exclude --target {file,folder} --id N --reason TEXT
-PYTHONPATH=. python cli.py exclude-batch --from-file exclusions.csv
+vault exclude --target {file,folder} --id N --reason TEXT
+vault exclude-batch --from-file exclusions.csv
 
 # Sign-off
-PYTHONPATH=. python cli.py approve --by NAME
+vault approve --by NAME
 
 # Diagnostics
-PYTHONPATH=. python cli.py status              # JSON per-phase status
-PYTHONPATH=. python cli.py serve --port 8001   # Launch Datasette
+vault status              # JSON per-phase status
+vault serve --port 8001   # Launch Datasette
 
 # Tests
-PYTHONPATH=. pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
+pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
 ```
 
-## External Dependencies (macOS)
+### External Dependencies (macOS)
 
 ```bash
 brew install ffmpeg unar ollama
@@ -189,9 +188,9 @@ ollama pull gemma4:latest
 # Siegfried: download from GitHub releases, place as ./sf
 ```
 
-## Important Implementation Notes
+### Important Implementation Notes
 
-### sqlite-utils API Patterns
+#### sqlite-utils API Patterns
 - `db.query("SELECT ...")` — returns list of dicts. Use for all SELECT queries.
 - `db.execute("UPDATE ...", [params])` — returns Cursor, does NOT auto-commit. Must call `db.conn.commit()` explicitly for data-modifying queries outside of `with db.conn:` context.
 - `db["table"].rows_where("col = ?", [val])` — returns iterator. Use `next(...)` for single row lookup.
@@ -201,17 +200,17 @@ ollama pull gemma4:latest
 - `db["table"].update(id, updates)` — safe way to modify existing rows.
 - All connections: `PRAGMA foreign_keys = ON`, `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`.
 
-### Phase-Specific Gotchas
+#### Phase-Specific Gotchas
 - **Phase 1 walk** must skip files already in DB from Phase 0 (check `hash_status in ("done", "skipped")`). Uses UPDATE for existing rows, not INSERT OR REPLACE.
 - **Phase 2 identify** only processes rows already in `file` table with `identify_status='pending'` and `hash_status='done'`. Creating files on disk without DB rows results in 0 files processed.
 - **Phase 3 triage** workers need per-thread DB connections with explicit `conn.commit()` after UPDATEs. Shared connections cause `database is locked` errors.
 - **Phase 5 folder-meta** requires `folder` rows in DB. Empty DB = 0 folders = 0 inferences. Uses bottom-up traversal so children are processed before parents.
 - **Phase 7 exclude** — `db[table].get(id)` raises `NotFoundError`, not `None`. The pipeline code catches this and converts to `ValueError` for single exclusion, or skips silently in batch mode.
 
-### Category Values
+#### Category Values
 `document`, `spreadsheet`, `presentation`, `pdf-text`, `pdf-scanned`, `image`, `image-with-text`, `video`, `audio`, `archive`, `code`, `executable`, `data`, `email`, `ebook`, `cad`, `ros-bag`, `unknown`
 
-### Extract Strategy Values
+#### Extract Strategy Values
 `docling`, `tika`, `ocr`, `whisper`, `textutil`, `filename-only`, `metadata-only`, `skip`, `manual`, `unsupported`
 
 ### Database Schema
@@ -219,14 +218,14 @@ ollama pull gemma4:latest
 
 Key tables:
 - `folder` — directory tree with semantic labels (inferred_category, inferred_label, etc.)
-- `file` — file inventory: hash, format, category, triage results, dedup status
+- `file` — file inventory: hash, format, category, triage, dedup status
 - `format_policy` — PRONOM ID to category + extract strategy mapping (seeded from CSV)
-- `extraction` — extracted text with provenance (325 rows)
-- `summary` — document summaries (45 rows)
-- `chunk` — sentence-window chunks with FTS5 + context_text (8,159 rows)
-- `embedding_ref` — chunk embedding references (8,159 rows)
-- `summary_embedding_ref` — summary embedding references (45 rows)
-- `folder_embedding_ref` — folder embedding references (71 rows)
+- `extraction` — extracted text with provenance
+- `summary` — document summaries
+- `chunk` — sentence-window chunks with FTS5 + context_text
+- `embedding_ref` — chunk embedding references
+- `summary_embedding_ref` — summary embedding references
+- `folder_embedding_ref` — folder embedding references
 - `archive_expansion` — archive extraction provenance
 - `pipeline_run` — per-phase run history
 - `query_log` — query tracking with feedback
@@ -244,11 +243,11 @@ Key views: `v_format_histogram`, `v_category_summary`, `v_ocr_workload`, `v_tran
 - No static binary fixtures — all test files generated programmatically (PyMuPDF for PDFs, zipfile for archives, zlib-constructed PNG bytes).
 - External dependencies mocked: Ollama (returns `FolderInference`), Siegfried (returns JSON), patool (creates dummy files), ffprobe (returns duration JSON).
 - Shared fixtures in `conftest.py`: `test_corpus`, `test_db`, `test_config`, `mock_plog`, `mock_ollama`, `mock_siegfried`, `mock_patool`.
-- Run: `PYTHONPATH=. pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v`
+- Run: `pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v`
 
-## Pending Work
+### Pending Work
 
-- All 7 pre-flight phases are complete with tests. RAG pipeline (phases 8–14) fully operational. Context augmentation complete (8,159/8,159). Corpus: 325 extractions, 45 summaries, 8,159 chunks, 8,275 embeddings.
+- All 7 pre-flight phases and RAG pipeline phases (8–14) are implemented. Remaining work focuses on expanding test coverage for `rag/`, `api/`, `eval/`, and `ui/` modules.
 
 ### Future Improvements
 
@@ -257,17 +256,8 @@ Key views: `v_format_histogram`, `v_category_summary`, `v_ocr_workload`, `v_tran
 - **Chinese FTS5 tokenizer** — current Porter stemmer only handles English.
 - **Reranker** — configured but not wired up.
 - **Evaluation benchmarks** — eval framework exists but no questions loaded.
-- **Whisper extractor** — stub exists, not implemented (92 audio/video files).
+- **Whisper extractor** — stub exists, not implemented.
 
-## Post-Pre-Flight Phases (8–14)
+### Post-Pre-Flight Phases (8–14)
 
-The TSD covers phases 0–7 only. Phases 8–14 are **out of scope** and "will be specified separately" in subsequent documents. All phases 8–14 are implemented and operational:
-
-| Phase | Purpose | Schema | Status |
-|-------|---------|--------|--------|
-| 8 | Text extraction (docling/tika/OCR/whisper) | `extraction` table | 325 extractions |
-| 9 | Document summarization (Ollama) | `summary` table | 45 summaries |
-| 10 | Chunking | `chunk` table + `chunk_fts` FTS5 | 8,159 chunks |
-| 10.5 | Contextual augmentation | `chunk.context_text` | 8,159/8,159 |
-| 11 | Embedding generation | `embedding_ref` table | 8,159 + 45 + 71 |
-| 12–14 | Vector store, retrieval, API, UI | See `PART_2_STATUS.md` | Operational |
+The TSD covers phases 0–7 only. Phases 8–14 are **out of scope** and "will be specified separately" in subsequent documents. All phases 8–14 are implemented and operational.
