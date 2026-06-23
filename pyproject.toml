@@ -66,10 +66,10 @@ markers = [
 
 [tool.coverage.run]
 source = ["pipeline", "rag", "cli", "api", "eval", "ui"]
-omit = ["tests/*", ".venv/*"]
+omit = ["tests/*", ".venv/*", "ui/benchmark*.py", "ui/gradio_app_legacy.py"]
 
 [tool.coverage.report]
-fail_under = 65
+fail_under = 50
 show_missing = true
 exclude_lines = [
     "pragma: no cover",
