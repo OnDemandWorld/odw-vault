@@ -1,0 +1,97 @@
+pronom_id,format_name,category,extract_strategy,notes
+fmt/1101,High Efficiency Image File Format,image,metadata-only,HEIC - Apple image format
+x-fmt/384,Quicktime,video,whisper,
+x-fmt/18,Comma Separated Values,data,tika,
+fmt/13,Portable Network Graphics,image,metadata-only,
+fmt/613,RAR Archive,archive,skip,Expanded in Phase 0
+fmt/16,Acrobat PDF 1.2,pdf-text,docling,
+fmt/2041,Android Package File,executable,skip,APK file
+fmt/44,JPEG File Interchange Format,image,metadata-only,
+fmt/629,Microsoft PowerPoint Show,presentation,docling,PPSX format
+fmt/443,XML Drawing,data,filename-only,Draw.io diagram format
+fmt/95,PDF/A,pdf-text,docling,Triage may downgrade to pdf-scanned
+fmt/18,Acrobat PDF 1.4,pdf-text,docling,
+fmt/19,Acrobat PDF 1.5,pdf-text,docling,
+fmt/20,Acrobat PDF 1.6,pdf-text,docling,
+fmt/276,Acrobat PDF 1.7,pdf-text,docling,
+fmt/412,Microsoft Word OOXML,document,docling,
+fmt/40,Microsoft Word 97-2003 DOC,document,textutil,Use macOS textutil fallback
+fmt/214,Microsoft Excel OOXML,spreadsheet,tika,
+fmt/215,Microsoft PowerPoint OOXML,presentation,docling,
+fmt/101,XML 1.0,data,tika,
+fmt/817,JSON,data,tika,
+fmt/96,HTML 4.01,document,tika,
+fmt/471,Markdown,document,tika,
+x-fmt/111,Plain Text,document,tika,
+fmt/353,TIFF,image,ocr,Likely scanned
+fmt/41,JPEG,image,metadata-only,Skip OCR by default
+fmt/12,PNG,image,metadata-only,
+fmt/199,MPEG-4 Media,video,whisper,
+fmt/131,MP3,audio,whisper,
+fmt/141,WAV,audio,whisper,
+fmt/189,ZIP,archive,skip,Expanded in Phase 0
+fmt/484,RAR Archive,archive,skip,Expanded in Phase 0
+fmt/899,STEP CAD,cad,filename-only,Engineering geometry; index filename only
+fmt/1147,ROS bag,ros-bag,filename-only,
+fmt/43,GIF image,image,metadata-only,
+fmt/1187,BMP,image,metadata-only,
+fmt/270,SVG,image,metadata-only,
+fmt/1466,WebP,image,metadata-only,
+x-fmt/266,CSV,data,tika,
+fmt/156,LaTeX,document,tika,
+fmt/162,RTF,document,docling,
+fmt/59,PostScript,document,docling,
+fmt/100,PDF 1.3,pdf-text,docling,
+fmt/17,PDF 1.2,pdf-text,docling,
+fmt/384,Apple Keynote,presentation,filename-only,Treat as doc-archive
+fmt/496,Apple Pages,document,filename-only,Treat as doc-archive
+fmt/497,Apple Numbers,spreadsheet,filename-only,Treat as doc-archive
+fmt/615,ECEMAIL,email,manual,
+fmt/1064,EML,email,docling,
+x-fmt/255,MHTML,document,tika,
+fmt/281,DjVu,document,manual,
+fmt/1566,EPUB,ebook,docling,
+x-fmt/415,Comma Separated Values,data,tika,
+fmt/110,INI,data,filename-only,
+fmt/147,YAML,data,tika,
+fmt/964,OGG Media,video,whisper,
+fmt/435,Matroska,video,whisper,
+fmt/144,AVI,video,whisper,
+fmt/975,FLAC,audio,whisper,
+fmt/540,ICO,image,metadata-only,
+fmt/597,Raw Bitmap,image,metadata-only,
+fmt/190,GZIP Archive,archive,skip,
+fmt/485,TAR Archive,archive,skip,
+fmt/495,7-ZIP Archive,archive,skip,
+x-fmt/263,GZIP,archive,skip,
+fmt/142,MIDI,audio,whisper,
+fmt/341,AIFF,audio,whisper,
+fmt/140,QuickTime,video,whisper,
+fmt/445,Windows Executable,executable,skip,
+fmt/744,ELF Executable,executable,skip,
+x-fmt/276,Python Source Code,code,manual,
+x-fmt/352,SQL Source Code,code,manual,
+x-fmt/400,C++ Source Code,code,manual,
+x-fmt/401,Java Source Code,code,manual,
+UNKNOWN,Unknown Format,unknown,filename-only,Unrecognized format
+fmt/134,MPEG 1/2 Audio Layer 3,audio,whisper,MP3 audio
+x-fmt/62,Log File,document,tika,Log/config text file
+fmt/900,Windows Portable Executable,executable,skip,Windows PE binary
+fmt/1730,Data File,data,filename-only,Generic data file
+fmt/818,YAML,data,tika,YAML configuration
+x-fmt/413,Batch file,code,manual,Windows batch script
+x-fmt/421,Text Configuration file,data,filename-only,Text config file
+x-fmt/453,TrueType Font,executable,skip,Font file
+fmt/1149,Markdown,document,tika,Markdown text file
+UNKNOWN-pak,Package Data,data,filename-only,Application package/resource file
+UNKNOWN-qm,Qt Message,data,filename-only,Qt translation file
+UNKNOWN-drawio,Draw.io Diagram,data,filename-only,Draw.io diagram
+UNKNOWN-bak,Backup File,data,filename-only,Backup file
+UNKNOWN-tmp,Temporary File,data,filename-only,Temporary file
+UNKNOWN-dat,Data File,data,filename-only,Generic data file
+UNKNOWN-log,Log File,document,tika,Log file
+UNKNOWN-cfg,Config File,data,filename-only,Configuration file
+UNKNOWN-ini,INI File,data,filename-only,INI configuration file
+UNKNOWN-bin,Binary File,executable,skip,Binary/executable file
+UNKNOWN-db,Database File,data,filename-only,Database file
+UNKNOWN-sqlite,SQLite Database,data,filename-only,SQLite database file

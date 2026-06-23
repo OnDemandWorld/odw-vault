@@ -1,0 +1,133 @@
+# ============================================================
+# config.example.toml — RAG Pipeline (post pre-flight)
+# Copy this file to config.toml and fill in the placeholders.
+# Every model identity below is a default. Override per-invocation
+# via CLI flags (e.g. `rag embed --model NAME`) or by editing this
+# file. The pipeline never hard-codes a model name.
+# ============================================================
+
+[paths]
+corpus_root = "./SourceData"
+cache_root  = "./.rag-cache"
+chroma_root = "./chroma"
+
+[ollama]
+host             = "http://localhost:11434"
+timeout_seconds  = 300
+max_retries      = 3
+keep_alive       = "10m"
+
+# ============================================================
+# Models — change any name and re-run the affected phase.
+# ============================================================
+
+[models.embedding]
+name              = "qwen3-embedding:8b"
+collection_suffix = "qwen3emb8b"
+batch_size        = 32
+normalize         = true
+# Optional Matryoshka truncation; null = use native dimension.
+truncate_dim      = 0   # 0 means no truncation
+
+[models.embedding.alternatives]
+# Reference list for `rag embed --switch-to <key>` and `rag eval`.
+# Not loaded at runtime; documents the supported alternatives.
+qwen3_4b      = { name = "qwen3-embedding:4b",            suffix = "qwen3emb4b" }
+nomic_v2      = { name = "nomic-embed-text-v2-moe:latest", suffix = "nomicv2"   }
+embedding_gemma = { name = "embeddinggemma:latest",        suffix = "gemmaemb"  }
+
+[models.summarization]
+name           = "gemma4:latest"
+temperature    = 0.3
+max_tokens     = 400
+prompt_version = "v1"
+
+[models.contextual_retrieval]
+# Phase 10.5: Anthropic-style chunk-level context augmentation.
+# Disable to skip Phase 10.5 entirely; the embedding phase will use raw chunk text.
+enabled            = true
+name               = "mlx-community/Qwen3-8B-4bit"
+temperature        = 0.1
+max_context_tokens = 16384
+prompt_version     = "v1"
+
+[models.generation]
+name               = "gpt-oss:20b"
+fallback_name      = "gemma4:latest"
+alternate_name     = "gemma4:26b"
+# Sampling
+temperature        = 0.5
+top_p              = 0.95
+top_k              = 64
+max_context_tokens = 16384
+prompt_version     = "v1"
+thinking           = false       # Gemma 4 thinking mode; off by default for RAG
+
+# Generation endpoint. Swap host to switch between cloud and local.
+# Cloud: host = "https://ollama.com", api_key = "<your-key>"
+# Local: host = "http://localhost:11434", api_key = ""
+[models.generation.endpoint]
+host    = "https://ollama.com"
+api_key = ""   # TODO: set your Ollama Cloud API key, or change host to localhost
+retries = 3
+
+[models.reranker]
+# Optional. Start disabled. Add only after baseline eval shows recall headroom.
+enabled  = false
+name     = "dengcao/Qwen3-Reranker-0.6B"
+top_n_in  = 50
+top_n_out = 8
+
+[models.transcription]
+backend          = "whisper.cpp"
+model            = "large-v3"
+language         = "auto"
+threads          = 8
+word_timestamps  = true
+# Per-folder opt-in glob patterns. Empty list = transcribe nothing.
+opt_in_globs = [
+    "Project/*/Media/*",
+    "Project/*/*Site Visit*/*",
+    "Project/*/*Demonstration*/*",
+]
+
+[models.language_id]
+backend     = "fasttext"
+model_path  = ".rag-cache/models/lid.176.bin"
+
+# ============================================================
+# Pipeline parameters (model-independent)
+# ============================================================
+
+[extract]
+docling_workers              = 4
+tika_url                     = "http://localhost:9998"
+size_threshold_for_summary   = 500
+tika_brute_force_fallback    = true   # retry triage-failed files via Tika
+
+[chunk]
+chunker         = "sentence-window"
+window_size     = 5
+target_tokens   = 512
+chunker_version = "1"
+
+[retrieval]
+top_k_chunks       = 8
+top_k_documents    = 20
+top_k_folders      = 5
+dense_candidates   = 50
+bm25_candidates    = 50
+hierarchical       = true
+rrf_k              = 60
+
+[generation_runtime]
+require_citations         = true
+refuse_on_empty_context   = true
+
+[api]
+host = "127.0.0.1"
+port = 8765
+
+[ui]
+host = "127.0.0.1"
+port = 7860

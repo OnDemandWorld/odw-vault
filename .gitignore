@@ -1,0 +1,46 @@
+# Secrets and credentials
+config.toml
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Large data directories
+SourceData/
+chroma/
+.rag-cache/
+
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.coverage
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Compiled binaries (download from GitHub releases)
+sf
+
+# Chat logs with potential secrets
+chatlog*.md

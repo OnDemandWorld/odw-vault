@@ -1,0 +1,15 @@
+<document>
+{document_text_or_summary}
+</document>
+
+Here is the chunk we want to situate within the whole document:
+
+<chunk>
+{chunk_text}
+</chunk>
+
+Please give a short, succinct context (50-100 tokens) to situate this
+chunk within the overall document, for the purposes of improving search
+retrieval of the chunk. Answer ONLY with the succinct context and nothing
+else. Do not include preamble, do not repeat the chunk content, do not
+add commentary. Output language: match the document's language.
