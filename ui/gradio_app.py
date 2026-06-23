@@ -1,4 +1,4 @@
-"""Phase 14: Modern Gradio chat UI for the RAG pipeline — Novelte Core.
+"""Phase 14: Modern Gradio chat UI for the RAG pipeline — ODW.ai Vault.
 
 Design principles:
 - Composer centered on empty state, docks to bottom when chat starts
@@ -303,7 +303,7 @@ def _get_greeting() -> str:
 # ---------------------------------------------------------------------------
 
 def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_port: int = 7860):
-    """Launch the modern Novelte Core chat interface.
+    """Launch the modern ODW.ai Vault chat interface.
 
     Strategy: Gradio runs on an internal port for its API only.
     A lightweight proxy server runs on the user-facing port,
@@ -343,7 +343,7 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     # Step 1: Start Gradio on internal port for API only
     gradio_port = server_port + 1
 
-    with gr.Blocks(title="Novelte Core") as gradio_app:
+    with gr.Blocks(title="ODW.ai Vault") as gradio_app:
         chatbot = gr.Chatbot(visible=False)
         citations_out = gr.HTML(visible=False)
         msg_box = gr.Textbox(visible=False)
@@ -393,7 +393,7 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     # Use httpx reverse proxy to forward /gradio_api/* to Gradio backend
     from starlette.middleware.base import BaseHTTPMiddleware
 
-    proxy_app = FastAPI(title="Novelte Core")
+    proxy_app = FastAPI(title="ODW.ai Vault")
 
     @proxy_app.get("/")
     async def root():
@@ -434,7 +434,7 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     proxy_app.router.routes.append(
         StarletteRoute("/gradio_api/{full_path:path}", _do_proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
     )
-    print(f"  Novelte Core UI: http://{server_name}:{server_port}")
+    print(f"  ODW.ai Vault UI: http://{server_name}:{server_port}")
 
     uvicorn.run(
         proxy_app,
@@ -451,7 +451,7 @@ def _build_full_page(greeting: str, chips_json: str, folder_options: str, ollama
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Novelte Core</title>
+<title>ODW.ai Vault</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -539,7 +539,7 @@ html,body{height:100dvh;overflow:hidden;background:var(--bg);font-family:var(--f
 <body>
 <div id="app" onclick="_handleClick(event)">
 <div id="topbar">
-<div class="logo">Novelte Core<span>The brain</span></div>
+<div class="logo">ODW.ai Vault<span>The brain</span></div>
 <div class="status">$OLLAMA_STATUS</div>
 </div>
 

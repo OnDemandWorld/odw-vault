@@ -324,10 +324,10 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     folder_choices = ["All folders", *folders]
 
     with gr.Blocks(
-        title="noveltebot Knowledge Assistant",
+        title="ODW.ai Vault Knowledge Assistant",
         theme=gr.themes.Soft(),
     ) as app:
-        gr.Markdown("# noveltebot Knowledge Assistant")
+        gr.Markdown("# ODW.ai Vault Knowledge Assistant")
 
         # Status badge
         status_html = _build_status_html()

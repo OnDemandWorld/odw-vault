@@ -56,7 +56,7 @@ def _load_config():
     return load_app_config(CONFIG_PATH)
 
 
-app = FastAPI(title="noveltebot RAG")
+app = FastAPI(title="ODW.ai Vault RAG")
 
 
 @app.get("/")
@@ -697,7 +697,7 @@ def run_eval():
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROMPT = """\
-You are the noveltebot internal knowledge assistant. You help staff find
+You are the ODW.ai Vault internal knowledge assistant. You help staff find
 information about company projects, products, deployments, and operations
 by answering questions using ONLY the provided context excerpts.
 

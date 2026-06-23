@@ -16,7 +16,7 @@ from rag.retrieval import Hit
 CITATION_RE = re.compile(r"\[(\d+)\]")
 
 DEFAULT_PROMPT = """\
-You are the noveltebot internal knowledge assistant. You help staff find
+You are the ODW.ai Vault internal knowledge assistant. You help staff find
 information about company projects, products, deployments, and operations
 by answering questions using ONLY the provided context excerpts.
 

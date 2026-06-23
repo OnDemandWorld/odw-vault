@@ -334,7 +334,7 @@ def main():
     cfg = load_app_config(str(ROOT / "config.toml"))
     base_url = f"http://{args.host}:{args.port}"
 
-    print(f"\n  Novelte Core RAG Benchmark")
+    print(f"\n  ODW.ai Vault RAG Benchmark")
     print(f"  Queries: {len(queries)}")
     print(f"  Model: {cfg.models.generation.name}")
     print(f"  Embedding: {cfg.models.embedding.name}")

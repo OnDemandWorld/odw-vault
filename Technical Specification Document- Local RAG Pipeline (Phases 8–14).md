@@ -14,7 +14,7 @@
 
 ### 1.1 System Purpose
 
-The system extends the validated pre-flight pipeline into a complete, fully local Retrieval-Augmented Generation system serving the noveltebot project knowledge base. It transforms the inventoried corpus into a queryable knowledge layer that supports natural-language questions in English and Traditional Chinese, returns answers grounded in source documents with explicit citations, and enforces folder-scoped retrieval to maintain client-data segregation.
+The system extends the validated pre-flight pipeline into a complete, fully local Retrieval-Augmented Generation system serving the ODW.ai Vault project knowledge base. It transforms the inventoried corpus into a queryable knowledge layer that supports natural-language questions in English and Traditional Chinese, returns answers grounded in source documents with explicit citations, and enforces folder-scoped retrieval to maintain client-data segregation.
 
 ### 1.2 Core Functional Requirements
 
@@ -345,8 +345,8 @@ The `config.toml` file is the sole source of model identities and operational pa
 # ============================================================
 
 [paths]
-corpus_root = "/Users/eplt/Resilio Sync/eplt-dev-temp/novelte_rag/RAG_POC/SourceData"
-cache_root  = "/Users/eplt/Resilio Sync/eplt-dev-temp/novelte_rag/RAG_POC/.rag-cache"
+corpus_root = "./data/my-corpus"
+cache_root  = "./data/.rag-cache"
 chroma_root = "./chroma"
 
 [ollama]
@@ -698,7 +698,7 @@ The retrieval pipeline is deterministic:
 `prompts/generation_v1.txt`. `prompt_version` recorded in `query_log`.
 
 ```
-You are the noveltebot internal knowledge assistant. You help staff find
+You are the ODW.ai Vault internal knowledge assistant. You help staff find
 information about company projects, products, deployments, and operations
 by answering questions using ONLY the provided context excerpts.
 
@@ -1276,7 +1276,7 @@ The system never modifies files under `corpus_root`. Extraction outputs go to `.
 
 Silent exception suppression remains a defect.
 
-### 7.6 Operational Defaults Specific to the noveltebot Corpus
+### 7.6 Operational Defaults Specific to the ODW.ai Vault Corpus
 
 Based on the BUILD_STATUS report:
 

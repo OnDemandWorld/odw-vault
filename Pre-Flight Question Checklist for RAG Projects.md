@@ -138,6 +138,6 @@ How will success be communicated to the rest of the organization? A demo, a repo
 
 Don't try to answer every question before starting — that's a recipe for analysis paralysis. The goal is to surface which questions you *can't* answer yet, so the pre-flight pipeline (and the pilot project I suggested earlier) becomes targeted at filling those gaps. Re-read the checklist after pre-flight is done; many questions will be easier to answer when you've actually looked at the data.
 
-For your noveltebot situation specifically, the questions I'd push hardest on before writing any code are: corpus size and host machine, the access-control model across clients, and whether CAD/ROS/binary engineering content needs first-class handling or filename-only indexing. Those three answers shape the rest of the design.
+For your ODW.ai Vault situation specifically, the questions I'd push hardest on before writing any code are: corpus size and host machine, the access-control model across clients, and whether CAD/ROS/binary engineering content needs first-class handling or filename-only indexing. Those three answers shape the rest of the design.
 
 Want me to write the Phase 0 + Phase 1 starter script next, or work up a robotics-services-tuned `format_policy.csv` seed file (PRONOM IDs and strategies for the formats you're most likely to encounter)?
