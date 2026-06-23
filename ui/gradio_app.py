@@ -61,12 +61,13 @@ def _get_folders() -> list[str]:
 
 def _make_client():
     """Create an ollama client from the generation endpoint config."""
-    ep = getattr(_cfg.models.generation, "endpoint", None)
-    if ep:
-        kwargs = {"host": ep.host}
-        if getattr(ep, "api_key", ""):
-            kwargs["headers"] = {"Authorization": f"Bearer {ep.api_key}"}
-        return ollama.Client(**kwargs)
+    if _cfg is not None:
+        ep = getattr(_cfg.models.generation, "endpoint", None)
+        if ep:
+            kwargs = {"host": ep.host}
+            if getattr(ep, "api_key", ""):
+                kwargs["headers"] = {"Authorization": f"Bearer {ep.api_key}"}
+            return ollama.Client(**kwargs)
     return ollama.Client(host=_ollama_host)
 
 
