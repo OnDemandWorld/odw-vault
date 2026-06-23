@@ -1,7 +1,7 @@
 [project]
-name = "rag-pipeline"
+name = "odw-vault"
 version = "0.2.0"
-description = "Local, fully offline RAG pipeline for mixed-format document corpora"
+description = "ODW.ai Vault — sovereign, self-hosted Retrieval-Augmented Generation (RAG) platform"
 requires-python = ">=3.11"
 dependencies = [
     "sqlite-utils>=3.36",
@@ -40,7 +40,7 @@ rag = [
 dev = ["pytest>=7.4", "pytest-cov>=4.1", "datasette>=0.64", "ruff>=0.4"]
 
 [project.scripts]
-rag = "cli:main"
+vault = "cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
