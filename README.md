@@ -1,8 +1,8 @@
-# ODW.ai Vault
+# ODW Vault
 
 > The sovereign knowledge core of the ODW.ai suite — a self-hosted, open-source Retrieval-Augmented Generation (RAG) platform that turns internal documents, wikis, and structured data into an AI-queryable knowledge base without any data leaving your infrastructure.
 
-ODW.ai Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for mixed-format document corpora. It analyzes a hierarchical folder of documents, identifies formats, deduplicates, extracts text, generates embeddings, and provides query access — all running on-premises with no outbound network calls during inference.
+ODW Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for mixed-format document corpora. It analyzes a hierarchical folder of documents, identifies formats, deduplicates, extracts text, generates embeddings, and provides query access — all running on-premises with no outbound network calls during inference.
 
 **Status:** Part 1 (pre-flight) and Part 2 (RAG pipeline) both implemented and operational. 167 tests passing.
 
@@ -281,4 +281,5 @@ pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
 
 ## License
 
-MIT
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
