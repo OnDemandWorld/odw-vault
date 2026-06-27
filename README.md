@@ -4,7 +4,11 @@
 
 ODW Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for mixed-format document corpora. It analyzes a hierarchical folder of documents, identifies formats, deduplicates, extracts text, generates embeddings, and provides query access — all running on-premises with no outbound network calls during inference.
 
-**Status:** Part 1 (pre-flight) and Part 2 (RAG pipeline) both implemented and operational. 167 tests passing.
+## Status
+
+⚠️ **Early release.** ODW [Name] is an early, functional release — core features work, but it is not yet hardened for production. We are refining every module toward a first full public release in **Q3 2026**. Until then, it is best used as a foundation to build on with AI coding agents (see below).
+
+** Build Status:** Part 1 (pre-flight) and Part 2 (RAG pipeline) both implemented and operational. 167 tests passing.
 
 ## Features
 
@@ -278,6 +282,9 @@ pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
 3. **Reranker implementation** — configured but not wired up.
 4. **Evaluation benchmarks** — eval framework exists but no questions loaded.
 5. **Whisper extractor** — implement for audio/video.
+
+## Working with AI agents
+This repository is built to be extended with AI coding agents. Rather than a turnkey product, ODW [Name] is a working, well-structured codebase you can clone and adapt to your own needs with an agent like Claude Code. The repo includes agent context files (e.g. `CLAUDE.md`) and clear architecture docs so an agent can quickly understand the structure and help you customise, integrate, and extend it. To get started: clone the repo, open it with your coding agent, point it at this README and the docs, and describe what you want to build.
 
 ## License
 
