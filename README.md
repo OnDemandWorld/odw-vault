@@ -39,49 +39,89 @@ ODW Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for
 - Python 3.11+ (managed via `uv`, venv at `.venv/`)
 
 ### External tools (macOS)
-```bash
-brew install ffmpeg unar ollama
-ollama pull gemma4:latest
-ollama pull qwen3-embedding:8b
-```
-- **Siegfried**: Download from [GitHub releases](https://github.com/richardlehane/siegfried/releases), extract the binary, and place it as `./sf` in the project root.
+
+| Tool | Purpose | Install method |
+|------|---------|---------------|
+| `uv` | Python package manager | `brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| `ffmpeg` | Media duration detection | `brew install ffmpeg` |
+| `unar` | Archive extraction | `brew install unar` |
+| `ollama` | Local LLM server | **Official script** (see below) — ⚠️ Homebrew version is outdated (0.13.x), the latest release (0.31.x+) is required |
+| `sf` (Siegfried) | PRONOM format identification | Manual download (see below) |
+| `LibreOffice` *(optional)* | DOCX → PDF conversion for text extraction | `brew install --cask libreoffice` |
+
+> **⚠️ Ollama version notice:** `brew install ollama` installs an outdated version (0.13.x) that does **not** support the latest models (e.g. `gemma4:latest`). Use the official install script instead:
+> ```bash
+> curl -fsSL https://ollama.com/install.sh | sh
+> ```
 
 ## Quick Start
 
-### 1. Setup
+### Option A — Step-by-step (full control)
+
+#### 1. Install `uv` (Python package manager)
+```bash
+brew install uv
+# or: curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+#### 2. Setup Python environment
 ```bash
 uv venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
-### 2. Configure
+#### 3. Configure
 ```bash
 cp config.example.toml config.toml
 # Edit config.toml — set your Ollama API key if using the cloud endpoint
 ```
 
-### 3. Install external dependencies (macOS)
+#### 4. Install external dependencies (macOS)
 ```bash
-brew install ffmpeg unar ollama
+# System tools (use brew for these)
+brew install ffmpeg unar
+
+# Ollama — use the OFFICIAL script, NOT brew (brew version is outdated)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Start the Ollama service, then pull models
+ollama serve &            # start server in background (first time only)
 ollama pull gemma4:latest
 ollama pull qwen3-embedding:8b
-# Siegfried: download from https://github.com/richardlehane/siegfried/releases, place as ./sf
 ```
 
-### 4. Place a corpus
+> **Note:** After installing Ollama via the official script, you need to start the server **before** pulling models. Run `ollama serve` in a separate terminal or background it with `&`. Once the server is running, `ollama pull` will work.
+
+#### 5. Install Siegfried (manual step)
 ```bash
-# Put your documents in a folder, e.g. data/my-corpus
+# 1. Download from https://github.com/richardlehane/siegfried/releases
+#    Choose the macOS ARM64 (Apple Silicon) or AMD64 (Intel) build
+# 2. Extract the zip, rename the binary to "sf", and place it in the project root
+# 3. Grant execute permission (macOS Gatekeeper requires this on first run)
+chmod +x ./sf
+./sf                     # first run — macOS will prompt for permission, allow it
+```
+
+> **⚠️ macOS permission:** The first time you run `./sf`, macOS may block it with a security warning. Go to **System Settings → Privacy & Security** and click **Allow Anyway**, then run `./sf` again.
+
+#### 6. Place a corpus
+```bash
+# Create the corpus directory and put your documents in it
+mkdir -p data/my-corpus
+# Copy your documents into data/my-corpus/, then:
 vault init --root ./data/my-corpus
 ```
 Creates `corpus.db` and `.rag-cache/` in the project directory.
 
-### 5. Run Pre-Flight (Part 1)
+> **Note:** The corpus directory **must exist and contain files** before running `vault init`. The default `config.example.toml` points to `./SourceData` — if you use that path, create it first: `mkdir -p SourceData`.
+
+#### 7. Run Pre-Flight (Part 1)
 ```bash
 vault run-all
 ```
 
-### 6. Run RAG Pipeline (Part 2)
+#### 8. Run RAG Pipeline (Part 2)
 ```bash
 # Extract, summarize, chunk, embed
 vault extract
@@ -91,7 +131,7 @@ vault context      # optional, slow
 vault embed
 ```
 
-### 7. Query
+#### 9. Query
 ```bash
 # CLI
 vault query "What is this corpus about?" --top-k 5
@@ -108,6 +148,65 @@ curl -X POST http://127.0.0.1:8001/query \
 # Gradio UI
 vault ui
 ```
+
+---
+
+### Option B — Quick install (one-shot script)
+
+For users who want to get up and running as fast as possible. Copy and paste the entire block:
+
+```bash
+# ── 1. System dependencies ──────────────────────────────────
+brew install uv ffmpeg unar
+
+# ── 2. Ollama (official script — NOT brew) ──────────────────
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &                          # start server in background
+sleep 3                                 # wait for server to be ready
+ollama pull gemma4:latest
+ollama pull qwen3-embedding:8b
+
+# ── 3. Python environment ───────────────────────────────────
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+
+# ── 4. Configuration ────────────────────────────────────────
+cp config.example.toml config.toml
+
+# ── 5. Siegfried (manual — download, extract, place as ./sf) 
+#    Download: https://github.com/richardlehane/siegfried/releases
+#    Then:
+chmod +x ./sf && ./sf                   # grant permission on first run
+
+# ── 6. Initialize corpus ────────────────────────────────────
+mkdir -p data/my-corpus
+# → Put your documents in data/my-corpus/ before continuing
+vault init --root ./data/my-corpus
+
+# ── 7. Run pipeline ─────────────────────────────────────────
+vault run-all                           # Part 1: pre-flight
+vault extract && vault summarize && vault chunk && vault embed  # Part 2: RAG
+
+# ── 8. Launch UI ────────────────────────────────────────────
+vault ui                                # Gradio chat interface at http://localhost:7860
+```
+
+---
+
+### Troubleshooting common issues
+
+| Problem | Solution |
+|---------|----------|
+| `ollama: command not found` after brew install | Use `curl -fsSL https://ollama.com/install.sh \| sh` instead of brew |
+| `pull model manifest: 412` when pulling models | Ollama version is too old. Reinstall with the official script above |
+| `ollama pull` hangs or connection refused | Start the server first: `ollama serve` |
+| `sf` crashes with "error opening signature file" | Run `chmod +x ./sf` and execute `./sf` once to grant macOS permission |
+| `No such file or directory: 'SourceData/...'` | Ensure the corpus directory exists and contains files before running pipeline |
+| `ModuleNotFoundError: No module named 'ui'` | Re-run `uv pip install -e ".[dev]"` to ensure editable install registers all packages |
+| DOCX files fail extraction with "no DOCX to PDF converters" | Install LibreOffice: `brew install --cask libreoffice` |
+| `RapidOCR returned empty result` | Normal for some image-based PDFs — the pipeline logs a warning and continues |
+| Folder inference fails with `ValidationError` | Ensure Ollama server is running and `gemma4:latest` model is pulled |
 
 ## Architecture
 
