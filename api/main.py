@@ -951,6 +951,59 @@ async def upload_files(files: list[UploadFile] = File(...)):
 
 
 # ---------------------------------------------------------------------------
+# POST /pipeline/sync
+# ---------------------------------------------------------------------------
+
+
+_sync_lock = threading.Lock()
+_sync_status: dict = {"running": False, "last_result": None}
+
+
+@app.post("/pipeline/sync")
+def pipeline_sync():
+    """Trigger a full incremental sync of the corpus.
+
+    Runs in a background thread to avoid blocking the request.  Returns
+    immediately with the current sync status.  If a sync is already running
+    the caller receives a 409 Conflict.
+    """
+    if _sync_status["running"]:
+        raise HTTPException(status_code=409, detail="A sync is already in progress")
+
+    def _run_sync():
+        try:
+            cfg = _load_config()
+            db = _get_db()
+            chroma_path = str(cfg.chroma_root_path)
+            chroma_client = chromadb.PersistentClient(path=chroma_path)
+
+            from rag.indexer import IncrementalIndexer
+
+            indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+            result = indexer.sync_all()
+            _sync_status["last_result"] = result
+        except Exception as exc:
+            logger.error("Pipeline sync failed: %s", exc)
+            _sync_status["last_result"] = {"error": str(exc)}
+        finally:
+            _sync_status["running"] = False
+
+    with _sync_lock:
+        if _sync_status["running"]:
+            raise HTTPException(status_code=409, detail="A sync is already in progress")
+        _sync_status["running"] = True
+
+    t = threading.Thread(target=_run_sync, daemon=True)
+    t.start()
+
+    return {
+        "status": "started",
+        "message": "Incremental sync started in background",
+        "running": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /files
 # ---------------------------------------------------------------------------
 
