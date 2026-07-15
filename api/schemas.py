@@ -105,3 +105,23 @@ class MessageItem(BaseModel):
     content: str
     created_at: str
     query_log_id: int | None = None
+
+
+class QueryLogItem(BaseModel):
+    id: int
+    asked_at: str
+    user: str | None
+    query_text: str
+    answer_text: str
+    answer_model: str
+    latency_ms: int
+    source_count: int
+    feedback: str | None = None
+    conversation_id: str | None = None
+
+
+class QueryLogPage(BaseModel):
+    items: list[QueryLogItem]
+    total: int
+    page: int
+    size: int

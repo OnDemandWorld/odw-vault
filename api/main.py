@@ -24,6 +24,8 @@ from api.schemas import (
     MessageItem,
     Metrics,
     ModelInfo,
+    QueryLogItem,
+    QueryLogPage,
     QueryRequest,
     QueryResponse,
 )
@@ -763,6 +765,86 @@ def delete_conversation_api(conversation_id: str):
             detail=f"Conversation {conversation_id} not found",
         )
     return {"status": "deleted", "conversation_id": conversation_id}
+
+
+# ---------------------------------------------------------------------------
+# Query history endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/queries", response_model=QueryLogPage)
+def query_history(
+    page: int = 1,
+    size: int = 20,
+    keyword: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+):
+    """List query history with pagination, search, and date filtering."""
+    db = _get_db()
+
+    # Build WHERE clauses
+    conditions: list[str] = []
+    params: list = []
+
+    if keyword:
+        conditions.append("query_text LIKE ?")
+        params.append(f"%{keyword}%")
+
+    if start_date:
+        conditions.append("asked_at >= ?")
+        params.append(start_date)
+
+    if end_date:
+        conditions.append("asked_at <= ?")
+        params.append(end_date)
+
+    where_clause = ""
+    if conditions:
+        where_clause = "WHERE " + " AND ".join(conditions)
+
+    # Get total count
+    count_rows = list(db.query(
+        f"SELECT COUNT(*) as total FROM query_log {where_clause}",
+        params,
+    ))
+    total = count_rows[0]["total"] if count_rows else 0
+
+    # Get paginated results
+    offset = (page - 1) * size
+    rows = list(db.query(
+        f"""SELECT id, asked_at, user, query_text, answer_text, answer_model,
+                   latency_ms, feedback, conversation_id,
+                   retrieved_chunks_json
+            FROM query_log {where_clause}
+            ORDER BY asked_at DESC
+            LIMIT ? OFFSET ?""",
+        params + [size, offset],
+    ))
+
+    items = []
+    for r in rows:
+        # Count sources from retrieved_chunks_json
+        try:
+            chunks = json.loads(r.get("retrieved_chunks_json", "[]") or "[]")
+            source_count = len(chunks)
+        except (json.JSONDecodeError, TypeError):
+            source_count = 0
+
+        items.append(QueryLogItem(
+            id=r["id"],
+            asked_at=r["asked_at"],
+            user=r.get("user"),
+            query_text=r["query_text"],
+            answer_text=r["answer_text"],
+            answer_model=r["answer_model"],
+            latency_ms=r["latency_ms"],
+            source_count=source_count,
+            feedback=r.get("feedback"),
+            conversation_id=r.get("conversation_id"),
+        ))
+
+    return QueryLogPage(items=items, total=total, page=page, size=size)
 
 
 # ---------------------------------------------------------------------------
