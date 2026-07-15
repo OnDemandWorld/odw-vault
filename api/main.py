@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import shutil
 import threading
 import time
 from pathlib import Path
 
 import chromadb
 import ollama
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
@@ -18,7 +20,10 @@ from api.schemas import (
     Citation,
     ConversationSummary,
     FeedbackRequest,
+    FileListItem,
+    FileListPage,
     FileResponse,
+    FileUploadResponse,
     FolderNode,
     HealthResponse,
     MessageItem,
@@ -845,6 +850,271 @@ def query_history(
         ))
 
     return QueryLogPage(items=items, total=total, page=page, size=size)
+
+
+# ---------------------------------------------------------------------------
+# POST /files/upload
+# ---------------------------------------------------------------------------
+
+
+@app.post("/files/upload", response_model=FileUploadResponse)
+async def upload_files(files: list[UploadFile] = File(...)):
+    """Upload files to the corpus directory."""
+    cfg = _load_config()
+    corpus_root = cfg.corpus_root_path
+    corpus_root.mkdir(parents=True, exist_ok=True)
+
+    db = _get_db()
+
+    # Ensure a root folder exists
+    root_folders = list(db.query(
+        "SELECT id FROM folder WHERE rel_path = '.' LIMIT 1"
+    ))
+    if root_folders:
+        folder_id = root_folders[0]["id"]
+    else:
+        db["folder"].insert({
+            "path": str(corpus_root),
+            "rel_path": ".",
+            "name": ".",
+            "depth": 0,
+            "excluded": 0,
+        })
+        db.conn.commit()
+        folder_id = next(iter(db.query("SELECT id FROM folder WHERE rel_path = '.'")))["id"]
+
+    uploaded = 0
+    failed: list[str] = []
+
+    for upload_file in files:
+        try:
+            filename = upload_file.filename or "unnamed"
+            dest = corpus_root / filename
+
+            # Handle filename conflicts
+            if dest.exists():
+                stem = dest.stem
+                suffix = dest.suffix
+                counter = 1
+                while dest.exists():
+                    dest = corpus_root / f"{stem} ({counter}){suffix}"
+                    counter += 1
+
+            # Save file
+            content = await upload_file.read()
+            dest.write_bytes(content)
+
+            # Get file size
+            size_bytes = dest.stat().st_size
+
+            # Determine relative path
+            rel_path = str(dest.relative_to(corpus_root))
+
+            # Get file modification time
+            mtime = datetime.datetime.fromtimestamp(
+                dest.stat().st_mtime, tz=datetime.timezone.utc
+            ).isoformat()
+
+            # Insert file record
+            db["file"].insert({
+                "folder_id": folder_id,
+                "path": str(dest),
+                "rel_path": rel_path,
+                "name": dest.name,
+                "extension": dest.suffix.lstrip("."),
+                "size_bytes": size_bytes,
+                "mtime": mtime,
+                "sha256": "",
+                "mime_type": upload_file.content_type,
+                "hash_status": "pending",
+                "identify_status": "pending",
+                "triage_status": "pending",
+                "is_dup_primary": 1,
+                "excluded": 0,
+            })
+            db.conn.commit()
+
+            # Set created_at
+            file_id = db["file"].last_rowid
+            db.execute(
+                "UPDATE file SET created_at = datetime('now') WHERE id = ?",
+                [file_id],
+            )
+            db.conn.commit()
+
+            uploaded += 1
+        except Exception as e:
+            logger.error("Failed to upload %s: %s", upload_file.filename, e)
+            failed.append(upload_file.filename or "unnamed")
+
+    return FileUploadResponse(uploaded=uploaded, failed=failed)
+
+
+# ---------------------------------------------------------------------------
+# GET /files
+# ---------------------------------------------------------------------------
+
+
+@app.get("/files", response_model=FileListPage)
+def list_files(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    folder_id: int | None = None,
+    status: str | None = None,
+):
+    """List files with pagination and optional filtering."""
+    db = _get_db()
+
+    # Build WHERE clause
+    where_clauses = []
+    params = []
+
+    if folder_id is not None:
+        where_clauses.append("f.folder_id = ?")
+        params.append(folder_id)
+
+    if status is not None:
+        if status == "indexed":
+            where_clauses.append(
+                "EXISTS (SELECT 1 FROM extraction e WHERE e.file_id = f.id AND e.succeeded = 1) "
+                "AND EXISTS (SELECT 1 FROM chunk c JOIN embedding_ref er ON er.chunk_id = c.id "
+                "WHERE c.file_id = f.id AND er.is_current = 1)"
+            )
+        elif status == "failed":
+            where_clauses.append(
+                "EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id AND fail.phase = 'extraction')"
+            )
+        elif status == "pending":
+            where_clauses.append(
+                "NOT EXISTS (SELECT 1 FROM extraction e WHERE e.file_id = f.id AND e.succeeded = 1) "
+                "AND NOT EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id AND fail.phase = 'extraction')"
+            )
+
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+
+    # Count total
+    count_sql = f"SELECT COUNT(*) as c FROM file f WHERE {where_sql}"
+    total = list(db.query(count_sql, params))[0]["c"]
+
+    # Fetch page
+    offset = (page - 1) * size
+    query_sql = f"""
+        SELECT
+            f.id,
+            f.rel_path,
+            f.name,
+            f.size_bytes,
+            f.category,
+            f.mime_type,
+            f.created_at,
+            CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM extraction e
+                    WHERE e.file_id = f.id AND e.succeeded = 1
+                ) AND EXISTS (
+                    SELECT 1 FROM chunk c
+                    JOIN embedding_ref er ON er.chunk_id = c.id
+                    WHERE c.file_id = f.id AND er.is_current = 1
+                ) THEN 'indexed'
+                WHEN EXISTS (
+                    SELECT 1 FROM failure fail
+                    WHERE fail.file_id = f.id AND fail.phase = 'extraction'
+                ) THEN 'failed'
+                ELSE 'pending'
+            END as status
+        FROM file f
+        WHERE {where_sql}
+        ORDER BY f.created_at DESC
+        LIMIT ? OFFSET ?
+    """
+    rows = list(db.query(query_sql, params + [size, offset]))
+
+    items = [
+        FileListItem(
+            id=r["id"],
+            rel_path=r["rel_path"],
+            name=r["name"],
+            size_bytes=r["size_bytes"],
+            category=r.get("category"),
+            mime_type=r.get("mime_type"),
+            is_indexed=r["status"] == "indexed",
+            status=r["status"],
+            created_at=str(r["created_at"]) if r.get("created_at") else None,
+        )
+        for r in rows
+    ]
+
+    return FileListPage(items=items, total=total, page=page, size=size)
+
+
+# ---------------------------------------------------------------------------
+# DELETE /files/{file_id}
+# ---------------------------------------------------------------------------
+
+
+@app.delete("/files/{file_id}")
+def delete_file(file_id: int):
+    """Delete a file from disk, Chroma, and database."""
+    cfg = _load_config()
+    db = _get_db()
+
+    # Get file record
+    file_rows = list(db.query(
+        "SELECT id, rel_path, path FROM file WHERE id = ?", [file_id]
+    ))
+    if not file_rows:
+        raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+
+    file_row = file_rows[0]
+    rel_path = file_row["rel_path"]
+
+    # Delete from disk
+    corpus_root = cfg.corpus_root_path
+    file_path = corpus_root / rel_path
+    if file_path.exists():
+        file_path.unlink()
+
+    # Delete from Chroma
+    try:
+        chroma_path = str(cfg.chroma_root_path)
+        chroma_client = chromadb.PersistentClient(path=chroma_path)
+
+        # Find embedding_ref entries for this file's chunks
+        embedding_refs = list(db.query(
+            """SELECT er.id, er.collection, er.external_id
+               FROM embedding_ref er
+               JOIN chunk c ON er.chunk_id = c.id
+               WHERE c.file_id = ?""",
+            [file_id],
+        ))
+
+        # Group by collection and delete
+        collections_to_delete: dict[str, list[str]] = {}
+        for ref in embedding_refs:
+            coll_name = ref.get("collection") or f"chunks__{cfg.models.embedding.collection_suffix}"
+            external_id = ref.get("external_id")
+            if external_id:
+                collections_to_delete.setdefault(coll_name, []).append(external_id)
+
+        for coll_name, ids in collections_to_delete.items():
+            try:
+                collection = chroma_client.get_collection(coll_name)
+                collection.delete(ids=ids)
+            except Exception as e:
+                logger.warning("Failed to delete from Chroma collection %s: %s", coll_name, e)
+    except Exception as e:
+        logger.warning("Failed to connect to Chroma: %s", e)
+
+    # Delete from SQLite (cascade)
+    db.execute("DELETE FROM embedding_ref WHERE chunk_id IN (SELECT id FROM chunk WHERE file_id = ?)", [file_id])
+    db.execute("DELETE FROM chunk WHERE file_id = ?", [file_id])
+    db.execute("DELETE FROM extraction WHERE file_id = ?", [file_id])
+    db.execute("DELETE FROM summary WHERE file_id = ?", [file_id])
+    db.execute("DELETE FROM failure WHERE file_id = ?", [file_id])
+    db.execute("DELETE FROM file WHERE id = ?", [file_id])
+    db.conn.commit()
+
+    return {"status": "deleted", "file_id": file_id}
 
 
 # ---------------------------------------------------------------------------

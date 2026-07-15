@@ -125,3 +125,27 @@ class QueryLogPage(BaseModel):
     total: int
     page: int
     size: int
+
+
+class FileUploadResponse(BaseModel):
+    uploaded: int
+    failed: list[str]
+
+
+class FileListItem(BaseModel):
+    id: int
+    rel_path: str
+    name: str
+    size_bytes: int
+    category: str | None
+    mime_type: str | None
+    is_indexed: bool
+    status: str
+    created_at: str | None
+
+
+class FileListPage(BaseModel):
+    items: list[FileListItem]
+    total: int
+    page: int
+    size: int
