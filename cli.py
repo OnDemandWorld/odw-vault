@@ -651,8 +651,8 @@ def query(
             click.echo("\n--- Citations ---")
             for c in result["citations"]:
                 click.echo(
-                    f"  {c['marker']} {c['rel_path']}"
-                    + (f" p.{c['page']}" if c.get("page") else "")
+                    f"  [{c['citation_number']}] {c['rel_path']}"
+                    + (f" p.{c['page_start']}" if c.get("page_start") else "")
                 )
 
 

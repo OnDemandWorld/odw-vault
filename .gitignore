@@ -39,6 +39,10 @@ build/
 # Claude Code
 .claude/
 
+# Qwen Code
+.qwen/
+
+
 # Compiled binaries (download from GitHub releases)
 sf
 
