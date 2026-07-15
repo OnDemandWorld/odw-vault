@@ -16,10 +16,12 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from api.schemas import (
     Citation,
+    ConversationSummary,
     FeedbackRequest,
     FileResponse,
     FolderNode,
     HealthResponse,
+    MessageItem,
     Metrics,
     ModelInfo,
     QueryRequest,
@@ -193,10 +195,26 @@ def query(req: QueryRequest):
         raise HTTPException(status_code=503, detail=str(e)) from None
 
     # Generate answer
+    # Handle conversation history
+    from rag.conversation import get_or_create_conversation, get_history, add_message
+
+    conversation_id = None
+    history = None
+    if req.conversation_id is not None or True:  # always support conversations
+        conversation_id = get_or_create_conversation(db, req.conversation_id, user=req.user)
+        # Save user message
+        add_message(db, conversation_id, "user", req.query)
+        # Get history for prompt injection (excluding the message we just added)
+        history = get_history(db, conversation_id)
+        # Remove the last message (the one we just added) from history
+        if history and history[-1]["role"] == "user" and history[-1]["content"] == req.query:
+            history = history[:-1]
+
     gen_result = generate_answer(
         query=req.query,
         hits=hits,
         cfg=cfg,
+        history=history,
     )
 
     total_ms = round((time.monotonic() - t0) * 1000)
@@ -250,8 +268,8 @@ def query(req: QueryRequest):
            (user, query_text, query_lang, folder_filter_json,
             retrieved_chunks_json, answer_text, answer_model,
             embedding_model, reranker_model,
-            latency_ms, retrieval_ms, generation_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            latency_ms, retrieval_ms, generation_ms, conversation_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req.user,
             req.query,
@@ -265,10 +283,15 @@ def query(req: QueryRequest):
             total_ms,
             retrieval_ms,
             generation_ms,
+            conversation_id,
         ),
     )
     db.conn.commit()
     query_log_id = cursor.lastrowid
+
+    # Save assistant response to conversation
+    if conversation_id:
+        add_message(db, conversation_id, "assistant", gen_result["answer"], query_log_id=query_log_id)
 
     return QueryResponse(
         answer=gen_result["answer"],
@@ -286,6 +309,7 @@ def query(req: QueryRequest):
             contextual_augmentation=augmentation_model,
         ),
         query_log_id=query_log_id,
+        conversation_id=conversation_id,
     )
 
 
@@ -690,6 +714,55 @@ def run_eval():
 
     result = _run_eval(db, cfg)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Conversation management endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/conversations", response_model=list[ConversationSummary])
+def list_conversations_api(user: str | None = None, limit: int = 50):
+    """List conversations, most recently updated first."""
+    from rag.conversation import list_conversations
+
+    db = _get_db()
+    return list_conversations(db, user=user, limit=limit)
+
+
+@app.get("/conversations/{conversation_id}/messages", response_model=list[MessageItem])
+def get_messages_api(conversation_id: str):
+    """Get all messages for a conversation."""
+    from rag.conversation import get_conversation_messages
+
+    db = _get_db()
+    messages = get_conversation_messages(db, conversation_id)
+    if not messages:
+        # Check if conversation exists at all
+        rows = list(db.query(
+            "SELECT id FROM conversation WHERE id = ?", [conversation_id]
+        ))
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Conversation {conversation_id} not found",
+            )
+    return messages
+
+
+@app.delete("/conversations/{conversation_id}")
+def delete_conversation_api(conversation_id: str):
+    """Delete a conversation and all its messages."""
+    from rag.conversation import delete_conversation
+
+    db = _get_db()
+    deleted = delete_conversation(db, conversation_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Conversation {conversation_id} not found",
+        )
+    return {"status": "deleted", "conversation_id": conversation_id}
 
 
 # ---------------------------------------------------------------------------

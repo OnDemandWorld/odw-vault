@@ -20,6 +20,7 @@ class QueryRequest(BaseModel):
     thinking: bool | None = None
     stream: bool | None = False
     user: str | None = None
+    conversation_id: str | None = None
 
 
 class Citation(BaseModel):
@@ -51,6 +52,7 @@ class QueryResponse(BaseModel):
     metrics: Metrics
     models: ModelInfo
     query_log_id: int
+    conversation_id: str | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -86,3 +88,20 @@ class FolderNode(BaseModel):
     inferred_category: str | None
     inferred_label: str | None
     children: list[FolderNode] = Field(default_factory=list)
+
+
+class ConversationSummary(BaseModel):
+    id: str
+    title: str | None
+    user: str | None
+    message_count: int
+    created_at: str
+    updated_at: str
+
+
+class MessageItem(BaseModel):
+    id: int
+    role: str
+    content: str
+    created_at: str
+    query_log_id: int | None = None

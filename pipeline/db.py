@@ -467,6 +467,31 @@ MIGRATIONS = [
         GROUP BY embedding_model, generation_model, contextual_augmentation;
         """,
     ),
+    (
+        3,
+        "conversation and message tables for multi-turn dialog",
+        """
+        CREATE TABLE IF NOT EXISTS conversation (
+            id          TEXT PRIMARY KEY,
+            user        TEXT,
+            title       TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS message (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+            role            TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+            content         TEXT NOT NULL,
+            query_log_id    INTEGER REFERENCES query_log(id),
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_message_conversation ON message(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_conversation_updated ON conversation(updated_at DESC);
+        """,
+    ),
 ]
 
 
@@ -504,6 +529,9 @@ def migrate(db: Database) -> None:
                     _add_column_if_missing(db, "chunk", "context_model", "TEXT")
                     _add_column_if_missing(db, "chunk", "context_prompt_hash", "TEXT")
                     _add_column_if_missing(db, "chunk", "context_generated_at", "TEXT")
+                    db.conn.commit()
+                if version == 3:
+                    _add_column_if_missing(db, "query_log", "conversation_id", "TEXT")
                     db.conn.commit()
                 db.executescript(sql)
                 db.conn.execute(

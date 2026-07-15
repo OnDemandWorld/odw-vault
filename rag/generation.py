@@ -56,8 +56,14 @@ def generate_answer(
     hits: list[Hit],
     cfg,
     prompt_template: str | None = None,
+    history: list[dict] | None = None,
 ) -> dict:
     """Generate an answer with citations.
+
+    Args:
+        history: Optional conversation history as a list of
+            {"role": "user"|"assistant", "content": "..."} dicts.
+            Injected between system message and current user prompt.
 
     Returns dict with answer, citations, generation_ms, model.
     """
@@ -99,6 +105,7 @@ def generate_answer(
         temperature=cfg.models.generation.temperature,
         top_p=cfg.models.generation.top_p,
         top_k=cfg.models.generation.top_k,
+        history=history,
     )
 
     answer_text = response.get("message", {}).get("content", "")
@@ -174,18 +181,33 @@ def _ollama_chat(
     temperature: float = 0.5,
     top_p: float = 0.95,
     top_k: int = 64,
+    history: list[dict] | None = None,
 ) -> dict:
-    """Call Ollama chat endpoint with retry logic."""
+    """Call Ollama chat endpoint with retry logic.
+
+    Args:
+        history: Optional list of prior messages in the conversation,
+            each a dict with 'role' and 'content'. These are injected
+            between the system message and the current user prompt.
+    """
     system_content = "You are a helpful assistant."
     if system_prefix:
         system_content = f"{system_prefix}\n{system_content}"
 
+    messages: list[dict] = [
+        {"role": "system", "content": system_content},
+    ]
+
+    # Inject conversation history (sliding window)
+    if history:
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+    messages.append({"role": "user", "content": prompt})
+
     response = client.chat(
         model=model,
-        messages=[
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": prompt},
-        ],
+        messages=messages,
         options={
             "temperature": temperature,
             "top_p": top_p,
