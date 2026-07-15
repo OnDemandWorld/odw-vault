@@ -151,9 +151,25 @@ def retrieve(
     reranker_enabled = (
         use_reranker if use_reranker is not None else getattr(cfg.models.reranker, "enabled", False)
     )
-    if reranker_enabled:
-        # Reranker not implemented yet; fused results pass through.
-        logger.info("Reranker requested but not yet implemented; returning fused results.")
+    if reranker_enabled and fused:
+        from rag.reranker import rerank
+
+        reranker_model = getattr(cfg.models.reranker, "name", "") or cfg.models.generation.name
+        reranker_top_n = getattr(cfg.models.reranker, "top_n_out", 8)
+        reranker_batch_size = getattr(cfg.models.reranker, "batch_size", 8)
+
+        fused = rerank(
+            query=query,
+            hits=fused,
+            model_name=reranker_model,
+            ollama_host=cfg.ollama.host,
+            top_n=reranker_top_n,
+            batch_size=reranker_batch_size,
+        )
+        metrics["reranked"] = True
+        metrics["reranker_model"] = reranker_model
+    else:
+        metrics["reranked"] = False
 
     # Truncate to top_k_chunks
     top_k = top_k_chunks if top_k_chunks is not None else cfg.retrieval.top_k_chunks

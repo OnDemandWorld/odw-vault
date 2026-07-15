@@ -128,6 +128,7 @@ class RerankerConfig(BaseModel):
     name: str = ""
     top_n_in: int = 50
     top_n_out: int = 8
+    batch_size: int = 8
 
 
 class TranscriptionConfig(BaseModel):
