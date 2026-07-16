@@ -29,10 +29,10 @@ class TestCitationsHtml:
             }
         ]
         result = fn(citations)
-        assert "[1]" in result
+        assert 'data-cite="1"' in result
         assert "doc.txt" in result
         assert "test snippet" in result
-        assert "Sources:" in result
+        assert "Sources" in result
 
     def test_citation_with_page(self):
         fn = self._import()
@@ -45,7 +45,7 @@ class TestCitationsHtml:
             }
         ]
         result = fn(citations)
-        assert "page 5" in result
+        assert "Page 5" in result
 
     def test_multiple_citations(self):
         fn = self._import()
@@ -54,8 +54,8 @@ class TestCitationsHtml:
             {"citation_number": 2, "rel_path": "b.txt", "page_start": 3, "snippet": "s2"},
         ]
         result = fn(citations)
-        assert "[1]" in result
-        assert "[2]" in result
+        assert 'data-cite="1"' in result
+        assert 'data-cite="2"' in result
         assert "a.txt" in result
         assert "b.txt" in result
 
