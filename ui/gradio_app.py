@@ -202,8 +202,9 @@ def _on_feedback(feedback_data: gr.LikeData) -> None:
         logger.warning("Failed to record feedback", exc_info=True)
 
 
-def _on_chat(message: str, history: list[dict], folder_filter: str):
+def _on_chat(message: str, history: list[dict], folder_filter: str, conversation_id: str | None = None):
     import time as _time
+    import uuid as _uuid
     query_start = _time.time()
     logger.info(f"[QUERY] message={message[:100]!r}, folder_filter={folder_filter!r}")
 
@@ -211,6 +212,15 @@ def _on_chat(message: str, history: list[dict], folder_filter: str):
         logger.warning("[QUERY] Empty message")
         yield history, _citations_html([])
         return
+
+    # Assign or create conversation ID
+    conv_id = conversation_id or str(_uuid.uuid4())
+
+    try:
+        _ensure_conv_tables()
+        _save_conversation_message(conv_id, "user", message.strip())
+    except Exception:
+        logger.warning("Failed to save user message to conversation", exc_info=True)
 
     history = [*history, {"role": "user", "content": message.strip()}]
     yield history, _citations_html([])
@@ -268,7 +278,95 @@ def _on_chat(message: str, history: list[dict], folder_filter: str):
     elapsed_total = _time.time() - query_start
     logger.info(f"[QUERY] Done in {elapsed_total:.2f}s, citations={len(citations)}, tokens={len(full_text)}")
 
+    # Save assistant response to conversation
+    try:
+        _save_conversation_message(conv_id, "assistant", full_text)
+    except Exception:
+        logger.warning("Failed to save assistant message to conversation", exc_info=True)
+
     yield history, _citations_html(citations)
+
+
+# ---------------------------------------------------------------------------
+# Conversation management
+# ---------------------------------------------------------------------------
+
+def _ensure_conv_tables():
+    """Create conversations and conversation_messages tables if needed."""
+    db = _get_db()
+    db.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'Untitled',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_conv_msgs_conv ON conversation_messages(conversation_id);
+    """)
+    db.conn.commit()
+
+
+def _save_conversation_message(conv_id: str, role: str, content: str, title: str | None = None):
+    """Save a message to a conversation, creating the conversation if needed."""
+    import uuid
+    db = _get_db()
+    existing = db.conn.execute("SELECT id FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+    if not existing:
+        if not title:
+            title = content[:50] if len(content) > 50 else content
+        db.conn.execute(
+            "INSERT INTO conversations (id, title) VALUES (?, ?)",
+            (conv_id, title),
+        )
+    else:
+        db.conn.execute(
+            "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
+            (conv_id,),
+        )
+    db.conn.execute(
+        "INSERT INTO conversation_messages (conversation_id, role, content) VALUES (?, ?, ?)",
+        (conv_id, role, content),
+    )
+    db.conn.commit()
+
+
+def _list_conversations() -> list[dict]:
+    """List all conversations, newest first."""
+    db = _get_db()
+    rows = db.conn.execute(
+        "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 50"
+    ).fetchall()
+    return [{"id": r["id"], "title": r["title"], "created_at": r["created_at"], "updated_at": r["updated_at"]} for r in rows]
+
+
+def _get_conversation_messages(conv_id: str) -> list[dict]:
+    """Get all messages for a conversation."""
+    db = _get_db()
+    rows = db.conn.execute(
+        "SELECT role, content FROM conversation_messages WHERE conversation_id = ? ORDER BY created_at",
+        (conv_id,),
+    ).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+def _delete_conversation(conv_id: str):
+    """Delete a conversation and its messages."""
+    db = _get_db()
+    db.conn.execute("DELETE FROM conversation_messages WHERE conversation_id = ?", (conv_id,))
+    db.conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+    db.conn.commit()
+
+
+def _list_conversations_api():
+    """Gradio API endpoint to list conversations."""
+    return _list_conversations()
 
 
 def _build_status_html() -> str:
@@ -356,15 +454,26 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
         citations_out = gr.HTML(visible=False)
         msg_box = gr.Textbox(visible=False)
         folder_box = gr.Dropdown(choices=folder_choices, value="All folders", visible=False)
+        conv_id_box = gr.Textbox(visible=False, value="")
         submit_btn = gr.Button(visible=False)
 
         submit_btn.click(
             fn=_on_chat,
-            inputs=[msg_box, chatbot, folder_box],
+            inputs=[msg_box, chatbot, folder_box, conv_id_box],
             outputs=[chatbot, citations_out],
             api_name="chat",
         )
         chatbot.like(fn=_on_feedback)
+
+        # List conversations endpoint
+        list_btn = gr.Button(visible=False)
+        list_out = gr.JSON(visible=False)
+        list_btn.click(
+            fn=_list_conversations_api,
+            inputs=[],
+            outputs=[list_out],
+            api_name="list_conversations",
+        )
 
     print(f"  DB path: {db_path}")
     print(f"  Folder count: {len(folders)}")
@@ -406,6 +515,24 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     @proxy_app.get("/")
     async def root():
         return HTMLResponse(content=full_html)
+
+    @proxy_app.get("/conversations/{conv_id}/messages")
+    async def get_conv_messages(conv_id: str):
+        try:
+            _ensure_conv_tables()
+            msgs = _get_conversation_messages(conv_id)
+            return {"messages": msgs}
+        except Exception as exc:
+            return {"messages": [], "error": str(exc)}
+
+    @proxy_app.delete("/conversations/{conv_id}")
+    async def delete_conv(conv_id: str):
+        try:
+            _ensure_conv_tables()
+            _delete_conversation(conv_id)
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     # Single catch-all proxy for all Gradio API requests
     async def _do_proxy(request: Request):
@@ -503,7 +630,43 @@ def _build_full_page(greeting: str, chips_json: str, folder_options: str, ollama
 html,body{height:100dvh;overflow:hidden;background:var(--bg-app);font-family:var(--font-sans);color:var(--text-primary);font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 html.theme-transition,html.theme-transition *{transition:background-color var(--duration-slow) var(--ease-default),color var(--duration-slow) var(--ease-default),border-color var(--duration-slow) var(--ease-default),box-shadow var(--duration-slow) var(--ease-default)!important}
 
-#app{display:flex;flex-direction:column;height:100dvh;max-width:768px;margin:0 auto}
+#app{display:flex;flex-direction:row;height:100dvh;width:100%}
+
+/* Sidebar */
+#sidebar{width:280px;height:100dvh;background:var(--bg-secondary);border-right:1px solid var(--border-subtle);display:flex;flex-direction:column;flex-shrink:0;transition:transform var(--duration-slow) var(--ease-default),width var(--duration-slow) var(--ease-default);overflow:hidden;z-index:100}
+#sidebar.collapsed{width:0;border-right:none;transform:translateX(-280px)}
+.sidebar-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border-subtle);min-height:52px}
+.sidebar-logo{font-size:15px;font-weight:600;color:var(--text-primary)}
+#new-chat-btn{padding:6px 12px;background:var(--accent);color:var(--accent-fg);border:none;border-radius:var(--radius-sm);font-size:12px;font-weight:500;cursor:pointer;transition:background var(--duration-fast) var(--ease-default);font-family:var(--font-sans)}
+#new-chat-btn:hover{background:var(--accent-hover)}
+.sidebar-section{padding:12px 0;border-bottom:1px solid var(--border-subtle)}
+.sidebar-section__title{padding:0 16px 8px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-tertiary)}
+#conv-list{overflow-y:auto;padding:0 8px;max-height:40vh}
+.conv-item{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:var(--radius-sm);cursor:pointer;font-size:13px;color:var(--text-secondary);transition:background var(--duration-fast) var(--ease-default);margin-bottom:2px}
+.conv-item:hover{background:var(--bg-tertiary)}
+.conv-item.active{background:var(--accent-subtle);color:var(--accent);font-weight:500}
+.conv-item__title{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv-item__delete{opacity:0;background:none;border:none;cursor:pointer;color:var(--text-tertiary);font-size:14px;padding:2px 4px;border-radius:var(--radius-xs);transition:opacity var(--duration-fast) var(--ease-default),color var(--duration-fast) var(--ease-default);font-family:var(--font-sans)}
+.conv-item:hover .conv-item__delete{opacity:1}
+.conv-item__delete:hover{color:var(--error)}
+.sidebar-footer{margin-top:auto;padding:12px 16px;border-top:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between}
+.sidebar-status{font-size:11px;color:var(--text-tertiary)}
+#sidebar-toggle{width:32px;height:32px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);background:var(--bg-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;color:var(--text-secondary);transition:background var(--duration-fast) var(--ease-default);flex-shrink:0}
+#sidebar-toggle:hover{background:var(--bg-tertiary)}
+
+/* Folder tree */
+.folder-tree-item{padding:4px 8px;font-size:12px;color:var(--text-secondary);cursor:pointer;border-radius:var(--radius-xs);transition:background var(--duration-fast) var(--ease-default);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.folder-tree-item:hover{background:var(--bg-tertiary)}
+.folder-tree-item.active{background:var(--accent-subtle);color:var(--accent);font-weight:500}
+
+/* Content area */
+#content{flex:1;display:flex;flex-direction:column;min-width:0;height:100dvh;max-width:768px;margin:0 auto;width:100%}
+
+/* Responsive */
+@media(max-width:768px){
+#sidebar{position:fixed;left:0;top:0;bottom:0;box-shadow:var(--shadow-md)}
+#sidebar.collapsed{transform:translateX(-280px)}
+}
 
 /* Topbar */
 #topbar{display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:48px;min-height:48px;flex-shrink:0;border-bottom:1px solid var(--border-subtle)}
@@ -620,13 +783,35 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
 </head>
 <body>
 <div id="app">
+<!-- Sidebar -->
+<div id="sidebar">
+<div class="sidebar-header">
+<div class="sidebar-logo">ODW.ai Vault</div>
+<button id="new-chat-btn">+ New Chat</button>
+</div>
+<div class="sidebar-section">
+<div class="sidebar-section__title">Conversations</div>
+<div id="conv-list"></div>
+</div>
+<div class="sidebar-section" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
+<div class="sidebar-section__title">Knowledge Base</div>
+<div id="folder-tree" style="padding:0 8px;overflow-y:auto;flex:1"></div>
+</div>
+<div class="sidebar-footer">
+<span class="sidebar-status">$OLLAMA_STATUS</span>
+<button id="theme-toggle-sidebar" title="Toggle theme"></button>
+</div>
+</div>
+
+<!-- Main content -->
+<div id="content">
 <div id="topbar">
 <div class="topbar-left">
-<div class="topbar-logo">ODW.ai Vault<span>The brain</span></div>
+<button id="sidebar-toggle" title="Toggle sidebar">&#9776;</button>
+<div class="topbar-logo" style="margin-left:8px">ODW.ai Vault<span>The brain</span></div>
 </div>
 <div class="topbar-right">
-<div class="topbar-status">$OLLAMA_STATUS</div>
-<button id="theme-toggle" title="Toggle theme"></button>
+<div class="topbar-status"></div>
 </div>
 </div>
 
@@ -657,6 +842,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
 </div>
 </div>
 </div>
+</div>
 
 <script>
 (function(){
@@ -671,7 +857,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
     if(d === 'system') d = window.matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', d);
     document.documentElement.setAttribute('data-theme-mode', _themeMode);
-    var btn = document.getElementById('theme-toggle');
+    var btn = document.getElementById('theme-toggle-sidebar');
     if(btn) btn.textContent = _themeIcons[_themeMode] || '\\U0001f504';
   }
   function _cycleTheme(){
@@ -724,7 +910,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
       _send();
     });
   }
-  var ttBtn = document.getElementById('theme-toggle');
+  var ttBtn = document.getElementById('theme-toggle-sidebar');
   if(ttBtn) ttBtn.addEventListener('click', _cycleTheme);
 
   /* ── Chip clicks ── */
@@ -785,10 +971,18 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
     snd.classList.add('enabled');
     snd.removeAttribute('disabled');
 
+    var _convId = window._getCurrentConvId ? window._getCurrentConvId() : null;
+    if(!_convId){
+      _convId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
+        var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+      if(window._setCurrentConvId) window._setCurrentConvId(_convId);
+    }
     fetch('/gradio_api/call/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({data:[t, _S.H, ff.value]})
+      body: JSON.stringify({data:[t, _S.H, ff.value, _convId]})
     }).then(function(r){
       if(!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
@@ -856,6 +1050,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
     snd.classList.remove('enabled');
     el.classList.remove('cursor');
     _updateSend();
+    if(window._loadConversations) window._loadConversations();
   }
 
   function _addMsg(role, text, stream){
@@ -955,6 +1150,174 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
 
   _renderChips(window._PC.slice(0, 4));
   _updateSend();
+
+  /* ── Sidebar Toggle ── */
+  var sidebarToggle = document.getElementById('sidebar-toggle');
+  if(sidebarToggle) sidebarToggle.addEventListener('click', function(){
+    var sidebar = document.getElementById('sidebar');
+    if(sidebar) sidebar.classList.toggle('collapsed');
+  });
+
+  /* ── Conversation Management ── */
+  var _currentConvId = null;
+
+  function _loadConversations(){
+    fetch('/gradio_api/call/list_conversations', {method:'POST', body:'{}'})
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      var convs = [];
+      if(data && data.data && Array.isArray(data.data[0])){
+        convs = data.data[0];
+      } else if(data && Array.isArray(data)){
+        convs = data;
+      }
+      _renderConvList(convs);
+    })
+    .catch(function(){});
+  }
+
+  function _renderConvList(conversations){
+    var list = document.getElementById('conv-list');
+    if(!list) return;
+    if(!conversations || conversations.length === 0){
+      list.innerHTML = '<div style="padding:12px;font-size:12px;color:var(--text-tertiary);text-align:center">No conversations yet</div>';
+      return;
+    }
+    var html = '';
+    for(var i = 0; i < conversations.length; i++){
+      var c = conversations[i];
+      var active = c.id === _currentConvId ? ' active' : '';
+      var title = (c.title || 'Untitled').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      html += '<div class="conv-item' + active + '" data-conv-id="' + c.id + '">' +
+              '<span class="conv-item__title">' + title + '</span>' +
+              '<button class="conv-item__delete" data-conv-id="' + c.id + '" title="Delete">&times;</button>' +
+              '</div>';
+    }
+    list.innerHTML = html;
+  }
+
+  function _newChat(){
+    _currentConvId = null;
+    _S.H = [];
+    var msgs = document.getElementById('msgs');
+    if(msgs){ msgs.innerHTML = ''; msgs.classList.remove('active'); }
+    var hero = document.getElementById('hero');
+    if(hero) hero.classList.remove('hidden');
+    var chips = document.getElementById('chips');
+    if(chips) chips.style.display = '';
+    var cit = document.getElementById('cit');
+    if(cit) cit.innerHTML = '';
+    document.querySelectorAll('.conv-item').forEach(function(el){ el.classList.remove('active'); });
+    // Collapse sidebar on mobile
+    if(window.innerWidth <= 768){
+      var sidebar = document.getElementById('sidebar');
+      if(sidebar) sidebar.classList.add('collapsed');
+    }
+  }
+
+  function _selectConversation(convId){
+    _currentConvId = convId;
+    fetch('/conversations/' + convId + '/messages')
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      var messages = data.messages || data || [];
+      _S.H = [];
+      var msgs = document.getElementById('msgs');
+      if(!msgs) return;
+      msgs.innerHTML = '';
+      msgs.classList.add('active');
+      var hero = document.getElementById('hero');
+      if(hero) hero.classList.add('hidden');
+      var chips = document.getElementById('chips');
+      if(chips) chips.style.display = 'none';
+      for(var i = 0; i < messages.length; i++){
+        var m = messages[i];
+        if(m.role === 'user'){
+          _addMsg('user', m.content);
+          _S.H.push({role:'user', content:[{text:m.content, type:'text'}]});
+        } else if(m.role === 'assistant'){
+          _addMsg('assistant', m.content);
+        }
+      }
+      msgs.scrollTop = msgs.scrollHeight;
+    })
+    .catch(function(){});
+    document.querySelectorAll('.conv-item').forEach(function(el){
+      el.classList.toggle('active', el.getAttribute('data-conv-id') === convId);
+    });
+    // Collapse sidebar on mobile
+    if(window.innerWidth <= 768){
+      var sidebar = document.getElementById('sidebar');
+      if(sidebar) sidebar.classList.add('collapsed');
+    }
+  }
+
+  function _deleteConversation(convId, event){
+    event.stopPropagation();
+    if(!confirm('Delete this conversation?')) return;
+    fetch('/conversations/' + convId, {method:'DELETE'})
+    .then(function(){
+      if(_currentConvId === convId) _newChat();
+      _loadConversations();
+    })
+    .catch(function(){});
+  }
+
+  var newChatBtn = document.getElementById('new-chat-btn');
+  if(newChatBtn) newChatBtn.addEventListener('click', _newChat);
+
+  var convList = document.getElementById('conv-list');
+  if(convList) convList.addEventListener('click', function(e){
+    var deleteBtn = e.target.closest('.conv-item__delete');
+    if(deleteBtn){
+      _deleteConversation(deleteBtn.getAttribute('data-conv-id'), e);
+      return;
+    }
+    var item = e.target.closest('.conv-item');
+    if(item){
+      _selectConversation(item.getAttribute('data-conv-id'));
+    }
+  });
+
+  /* ── Folder Tree ── */
+  function _buildFolderTree(){
+    var tree = document.getElementById('folder-tree');
+    var sel = document.getElementById('ff');
+    if(!tree || !sel) return;
+    var html = '<div class="folder-tree-item active" data-folder="All folders">All folders</div>';
+    for(var i = 0; i < sel.options.length; i++){
+      var opt = sel.options[i];
+      if(opt.value === 'All folders') continue;
+      var indent = 0;
+      var parts = opt.value.split('/');
+      if(parts.length > 1) indent = (parts.length - 1) * 12;
+      html += '<div class="folder-tree-item" data-folder="' + opt.value.replace(/"/g, '&quot;') + '" style="padding-left:' + (8 + indent) + 'px">' + opt.text + '</div>';
+    }
+    tree.innerHTML = html;
+  }
+
+  var folderTree = document.getElementById('folder-tree');
+  if(folderTree) folderTree.addEventListener('click', function(e){
+    var item = e.target.closest('.folder-tree-item');
+    if(!item) return;
+    var folder = item.getAttribute('data-folder');
+    var sel = document.getElementById('ff');
+    if(sel){
+      for(var i = 0; i < sel.options.length; i++){
+        if(sel.options[i].value === folder){ sel.selectedIndex = i; break; }
+      }
+    }
+    folderTree.querySelectorAll('.folder-tree-item').forEach(function(el){ el.classList.remove('active'); });
+    item.classList.add('active');
+  });
+
+  _buildFolderTree();
+  _loadConversations();
+
+  /* Expose _currentConvId for send function */
+  window._getCurrentConvId = function(){ return _currentConvId; };
+  window._setCurrentConvId = function(id){ _currentConvId = id; };
+  window._loadConversations = _loadConversations;
 })();
 </script>
 </body>
