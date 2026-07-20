@@ -200,6 +200,26 @@ class UiConfig(BaseModel):
     port: int = 7860
 
 
+class WatcherConfig(BaseModel):
+    """File-system watcher configuration."""
+
+    enabled: bool = False
+    debounce_seconds: float = 2.0
+    recursive: bool = True
+    startup_sync: bool = False
+    ignore_patterns: list[str] = Field(
+        default_factory=lambda: [
+            ".DS_Store",
+            "Thumbs.db",
+            "__MACOSX",
+            "*.tmp",
+            ".rag-cache",
+            "~$*",
+            ".~lock.*",
+        ]
+    )
+
+
 # ============================================================
 # Composed configs
 # ============================================================
@@ -237,6 +257,7 @@ class AppConfig(BaseModel):
     generation_runtime: GenerationRuntimeConfig = Field(default_factory=GenerationRuntimeConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     ui: UiConfig = Field(default_factory=UiConfig)
+    watcher: WatcherConfig = Field(default_factory=WatcherConfig)
 
     @property
     def corpus_root_path(self) -> Path:
@@ -428,4 +449,10 @@ port = 8765
 [ui]
 host = "127.0.0.1"
 port = 7860
+
+[watcher]
+enabled = false
+debounce_seconds = 2.0
+recursive = true
+startup_sync = false
 """

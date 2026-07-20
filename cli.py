@@ -685,6 +685,66 @@ def ui(host: str | None, port: int | None) -> None:
     launch_ui(cfg, server_name=h, server_port=p)
 
 
+@main.command()
+def sync() -> None:
+    """Run a one-shot incremental sync (detect new/modified/deleted files)."""
+    import chromadb
+
+    from rag.indexer import IncrementalIndexer
+
+    cfg = get_app_config(click.get_current_context())
+    db = open_db(get_db_path(click.get_current_context()))
+    chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
+    indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+    result = indexer.sync_all()
+    click.echo(json.dumps(result, indent=2))
+
+
+@main.command()
+@click.option("--once", is_flag=True, help="Run sync_all once and exit (no watching)")
+def watch(once: bool) -> None:
+    """Watch corpus_root for file changes and auto-update the RAG index."""
+    import time as _time
+
+    import chromadb
+
+    cfg = get_app_config(click.get_current_context())
+
+    if once:
+        # Same as vault sync
+        from rag.indexer import IncrementalIndexer
+
+        db = open_db(get_db_path(click.get_current_context()))
+        chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
+        indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+        result = indexer.sync_all()
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    if not cfg.watcher.enabled:
+        click.echo("Watcher disabled. Set [watcher] enabled = true in config.toml")
+        return
+
+    from rag.watcher import CorpusWatcher
+
+    db = open_db(get_db_path(click.get_current_context()))
+    chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
+    watcher = CorpusWatcher(cfg, db, chroma_client)
+
+    if cfg.watcher.startup_sync:
+        click.echo("Running startup sync...")
+        watcher.indexer.sync_all()
+
+    click.echo(f"Watching {cfg.corpus_root_path} (Ctrl+C to stop)...")
+    watcher.start()
+    try:
+        while True:
+            _time.sleep(1)
+    except KeyboardInterrupt:
+        watcher.stop()
+        click.echo("\nWatcher stopped.")
+
+
 @main.group()
 def eval() -> None:
     """Evaluation harness."""

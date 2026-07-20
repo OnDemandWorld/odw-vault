@@ -492,6 +492,24 @@ MIGRATIONS = [
         CREATE INDEX IF NOT EXISTS idx_conversation_updated ON conversation(updated_at DESC);
         """,
     ),
+    (
+        4,
+        "FTS5 auto-sync triggers for chunk_fts",
+        """
+        CREATE TRIGGER IF NOT EXISTS chunk_fts_ai AFTER INSERT ON chunk BEGIN
+            INSERT INTO chunk_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS chunk_fts_ad AFTER DELETE ON chunk BEGIN
+            INSERT INTO chunk_fts(chunk_fts, rowid, text) VALUES('delete', old.id, old.text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS chunk_fts_au AFTER UPDATE ON chunk BEGIN
+            INSERT INTO chunk_fts(chunk_fts, rowid, text) VALUES('delete', old.id, old.text);
+            INSERT INTO chunk_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+        """,
+    ),
 ]
 
 

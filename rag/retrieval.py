@@ -43,13 +43,6 @@ def retrieve(
     t0 = time.monotonic()
     metrics: dict = {}
 
-    # Safety: rebuild FTS to ensure index is in sync
-    try:
-        db.execute('INSERT INTO chunk_fts(chunk_fts) VALUES("rebuild")')
-        db.conn.commit()
-    except Exception:
-        pass
-
     # 1. Config assertion: verify Chroma collection exists and embedding model matches
     suffix = cfg.models.embedding.collection_suffix
     chunk_collection_name = f"chunks__{suffix}"

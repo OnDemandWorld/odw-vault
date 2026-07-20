@@ -67,6 +67,43 @@ def _load_config():
 
 app = FastAPI(title="ODW.ai Vault RAG")
 
+# ---------------------------------------------------------------------------
+# File watcher (opt-in via config [watcher] enabled = true)
+# ---------------------------------------------------------------------------
+
+_watcher = None  # CorpusWatcher instance (started on app startup if enabled)
+
+
+@app.on_event("startup")
+def _startup_watcher():
+    """Start the corpus file watcher if enabled in config."""
+    global _watcher
+    try:
+        cfg = _load_config()
+        if not cfg.watcher.enabled:
+            return
+        from rag.watcher import CorpusWatcher
+
+        db = _get_db()
+        chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
+        _watcher = CorpusWatcher(cfg, db, chroma_client)
+        if cfg.watcher.startup_sync:
+            _watcher.indexer.sync_all()
+        _watcher.start()
+        logger.info("Corpus watcher started via API server")
+    except Exception as exc:
+        logger.warning("Failed to start corpus watcher: %s", exc)
+
+
+@app.on_event("shutdown")
+def _shutdown_watcher():
+    """Stop the corpus file watcher."""
+    global _watcher
+    if _watcher is not None:
+        _watcher.stop()
+        _watcher = None
+        logger.info("Corpus watcher stopped")
+
 
 @app.get("/")
 def root():
@@ -1001,6 +1038,14 @@ def pipeline_sync():
         "message": "Incremental sync started in background",
         "running": True,
     }
+
+
+@app.get("/pipeline/watch/status")
+def watch_status():
+    """Return the file watcher status."""
+    if _watcher is None:
+        return {"enabled": False}
+    return {"enabled": True, **_watcher.status()}
 
 
 # ---------------------------------------------------------------------------

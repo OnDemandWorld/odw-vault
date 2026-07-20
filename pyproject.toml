@@ -37,6 +37,7 @@ rag = [
     "llama-index-llms-ollama>=0.3",
     "llama-index-readers-file>=0.1",
 ]
+watch = ["watchdog>=4.0"]
 dev = ["pytest>=7.4", "pytest-cov>=4.1", "datasette>=0.64", "ruff>=0.4"]
 
 [project.scripts]

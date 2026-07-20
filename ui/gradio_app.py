@@ -409,6 +409,43 @@ def _get_greeting() -> str:
         return "Good evening"
 
 
+def _get_corpus_stats() -> dict:
+    """Return corpus statistics for the hero section."""
+    try:
+        db = _get_db()
+        file_count = db.conn.execute(
+            "SELECT COUNT(*) as c FROM file WHERE excluded = 0"
+        ).fetchone()["c"]
+        folder_count = db.conn.execute(
+            "SELECT COUNT(*) as c FROM folder WHERE excluded = 0"
+        ).fetchone()["c"]
+        chunk_count = db.conn.execute(
+            "SELECT COUNT(*) as c FROM chunk"
+        ).fetchone()["c"]
+        last_indexed = db.conn.execute(
+            "SELECT MAX(started_at) as t FROM pipeline_run WHERE status = 'done'"
+        ).fetchone()["t"]
+        gen_model = _cfg.models.generation.name if _cfg else "unknown"
+        emb_model = _cfg.models.embedding.name if _cfg else "unknown"
+        return {
+            "file_count": file_count,
+            "folder_count": folder_count,
+            "chunk_count": chunk_count,
+            "last_indexed": last_indexed or "never",
+            "gen_model": gen_model,
+            "emb_model": emb_model,
+        }
+    except Exception:
+        return {
+            "file_count": 0,
+            "folder_count": 0,
+            "chunk_count": 0,
+            "last_indexed": "unknown",
+            "gen_model": "unknown",
+            "emb_model": "unknown",
+        }
+
+
 # ---------------------------------------------------------------------------
 # Full HTML page — pure custom layout, zero Gradio interference
 # ---------------------------------------------------------------------------
@@ -538,6 +575,10 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
             return {"ok": True}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    @proxy_app.get("/stats")
+    async def get_stats():
+        return _get_corpus_stats()
 
     # Single catch-all proxy for all Gradio API requests
     async def _do_proxy(request: Request):
@@ -824,6 +865,92 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--scrollbar-thumb);border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:var(--scrollbar-thumb-hover)}
+
+/* Typing dots animation */
+.typing-dots{display:inline-flex;align-items:center;gap:3px;padding:4px 0}
+.typing-dots span{width:6px;height:6px;border-radius:50%;background:var(--text-tertiary);animation:typing-bounce 1.4s ease-in-out infinite}
+.typing-dots span:nth-child(2){animation-delay:0.2s}
+.typing-dots span:nth-child(3){animation-delay:0.4s}
+@keyframes typing-bounce{0%,60%,100%{transform:translateY(0);opacity:0.4}30%{transform:translateY(-6px);opacity:1}}
+
+/* Stop button */
+#stop-btn{width:36px;height:36px;border-radius:var(--radius-full);border:1px solid var(--border-default);background:var(--bg-primary);cursor:pointer;display:none;align-items:center;justify-content:center;font-size:16px;color:var(--text-secondary);transition:all var(--duration-fast) var(--ease-default);flex-shrink:0}
+#stop-btn.visible{display:flex}
+#stop-btn:hover{background:var(--error);color:#fff;border-color:var(--error)}
+#stop-btn:active{transform:scale(0.95)}
+
+/* Message action bar */
+.msg-actions{display:flex;align-items:center;gap:2px;margin-top:6px;opacity:0;transition:opacity var(--duration-fast) var(--ease-default)}
+.msg.assistant:hover .msg-actions{opacity:1}
+.msg-action-btn{background:none;border:none;cursor:pointer;font-size:11px;color:var(--text-tertiary);padding:3px 8px;border-radius:var(--radius-xs);font-family:var(--font-sans);transition:all var(--duration-fast) var(--ease-default);display:flex;align-items:center;gap:3px}
+.msg-action-btn:hover{background:var(--bg-secondary);color:var(--text-primary)}
+.msg-action-btn.copied{color:var(--success)}
+.msg-action-btn.feedback-up.liked{color:var(--success)}
+.msg-action-btn.feedback-down.disliked{color:var(--error)}
+
+/* Error state */
+.msg-error{background:var(--error-bg)!important;border:1px solid rgba(220,53,69,0.2);border-radius:var(--radius-md);padding:12px 16px;margin:8px 0;display:flex;flex-direction:column;gap:8px}
+.msg-error__text{font-size:13px;color:var(--error)}
+.msg-error__retry{background:var(--error);color:#fff;border:none;padding:6px 14px;border-radius:var(--radius-sm);font-size:12px;font-weight:500;cursor:pointer;font-family:var(--font-sans);align-self:flex-start;transition:all var(--duration-fast) var(--ease-default)}
+.msg-error__retry:hover{opacity:0.9;transform:translateY(-1px)}
+.msg-error__retry:active{transform:translateY(0)}
+
+/* Clickable inline citations */
+.cite-link{color:var(--accent);text-decoration:none;font-weight:600;font-size:0.85em;cursor:pointer;padding:0 1px;transition:all var(--duration-fast) var(--ease-default)}
+.cite-link:hover{background:var(--accent-subtle);border-radius:2px;text-decoration:underline}
+
+/* Conversation search */
+.conv-search{padding:0 12px 8px}
+.conv-search input{width:100%;padding:6px 10px;border:1px solid var(--border-subtle);border-radius:var(--radius-sm);background:var(--bg-primary);font-size:12px;font-family:var(--font-sans);color:var(--text-primary);outline:none;transition:all var(--duration-fast) var(--ease-default)}
+.conv-search input::placeholder{color:var(--text-disabled)}
+.conv-search input:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-subtle)}
+
+/* Hero stats */
+.hero-stats{display:flex;gap:20px;margin-bottom:24px;flex-wrap:wrap;justify-content:center}
+.hero-stat{text-align:center;min-width:56px}
+.hero-stat__value{font-size:24px;font-weight:600;color:var(--text-primary);letter-spacing:-0.02em;line-height:1.2}
+.hero-stat__label{font-size:11px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:0.05em;margin-top:2px}
+.hero-stat__dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle}
+.hero-stat__dot.green{background:var(--success)}
+.hero-stat__dot.yellow{background:var(--warning)}
+
+/* Stop indicator during streaming */
+#snd.stop-mode{background:var(--error)!important;color:#fff!important;box-shadow:0 2px 8px rgba(220,53,69,0.30)!important}
+#snd.stop-mode:hover{background:#c82333!important;box-shadow:0 3px 12px rgba(220,53,69,0.40)!important}
+
+/* Composer row with stop button */
+#ca-controls{display:flex;align-items:center;gap:6px}
+
+/* Refined mobile */
+@media(max-width:768px){
+#sidebar{position:fixed;left:0;top:0;bottom:0;z-index:200;box-shadow:var(--shadow-lg)}
+#sidebar.collapsed{transform:translateX(-280px);width:280px}
+#content{max-width:100%}
+#hero{padding-top:10vh}
+.hero-stat__value{font-size:20px}
+#chips{grid-template-columns:1fr}
+#ca{padding:8px 12px 12px}
+#composer{padding:10px 14px 10px 16px}
+.msg.user{max-width:85%}
+}
+
+/* Focus visible for keyboard nav */
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* Empty state in conversations */
+.conv-empty{text-align:center;padding:20px 16px;font-size:12px;color:var(--text-tertiary);line-height:1.6}
+
+/* Message timestamp */
+.msg-time{font-size:10px;color:var(--text-tertiary);margin-top:2px;opacity:0;transition:opacity var(--duration-fast) var(--ease-default)}
+.msg.assistant:hover .msg-time{opacity:1}
+
+/* Refined message spacing */
+.msg.assistant .msg-body{flex:1;min-width:0}
+
+/* Regenerate button pulse */
+@keyframes btn-pulse{0%,100%{box-shadow:0 0 0 0 rgba(107,92,231,0.4)}50%{box-shadow:0 0 0 6px rgba(107,92,231,0)}}
+.msg-action-btn.regenerate:active{animation:btn-pulse 0.6s var(--ease-default)}
 </style>
 </head>
 <body>
@@ -836,6 +963,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
 </div>
 <div class="sidebar-section">
 <div class="sidebar-section__title">Conversations</div>
+<div class="conv-search"><input type="text" id="conv-search-input" placeholder="Search conversations..." autocomplete="off"></div>
 <div id="conv-list"><div class="conv-skeleton"><div class="conv-skeleton__line"></div><div class="conv-skeleton__line"></div></div></div>
 </div>
 <div class="sidebar-section" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
@@ -865,7 +993,12 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
 <div class="hero-icon"><svg viewBox="0 0 24 24"><path d="M12 2L3 7v6c0 5.25 3.75 10.15 9 11.25C17.25 23.15 21 18.25 21 13V7l-9-5z"/><path d="M12 8v4M12 16h.01"/></svg></div>
 <h1>$GREETING</h1>
 <p class="sub">How can I help you today?</p>
-<div class="hero-pill">\U0001f4da <span id="hero-folder-count">All folders ready</span></div>
+<div class="hero-stats" id="hero-stats">
+<div class="hero-stat"><div class="hero-stat__value" id="stat-files">--</div><div class="hero-stat__label">Files</div></div>
+<div class="hero-stat"><div class="hero-stat__value" id="stat-folders">--</div><div class="hero-stat__label">Folders</div></div>
+<div class="hero-stat"><div class="hero-stat__value" id="stat-chunks">--</div><div class="hero-stat__label">Chunks</div></div>
+</div>
+<div class="hero-pill"><span id="hero-status-dot"></span> <span id="hero-folder-count">Loading corpus...</span></div>
 </div>
 <div id="msgs"></div>
 </div>
@@ -884,7 +1017,10 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
 <textarea id="inp" placeholder="Ask anything about your knowledge base..." rows="1" autofocus></textarea>
 <div id="ca-row">
 <div class="scope-indicator"><span class="scope-indicator__dot"></span> <span id="scope-label">All folders</span></div>
+<div id="ca-controls">
+<button id="stop-btn" title="Stop generating">&#x25a0;</button>
 <button id="snd" title="Send">&#x2191;</button>
+</div>
 </div>
 </div>
 </div>
@@ -893,7 +1029,8 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
 
 <script>
 (function(){
-  var _S = {H:[], streaming:false, abortFlag:false};
+  var _S = {H:[], streaming:false, abortFlag:false, lastQuery:'', lastFolder:''};
+  var _allConvs = [];
 
   /* -- Theme -- */
   var _themeMode = localStorage.getItem('vault-theme') || 'system';
@@ -921,18 +1058,30 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
   });
   _applyTheme();
 
-  /* -- Send button state -- */
+  /* -- Send / Stop button state -- */
   function _updateSend(){
     var inp = document.getElementById('inp');
     var snd = document.getElementById('snd');
+    var stopBtn = document.getElementById('stop-btn');
     if(!inp || !snd) return;
     var v = inp.value.trim();
-    if(v.length > 0 && !_S.streaming){
+    if(_S.streaming){
       snd.classList.add('enabled');
+      snd.classList.add('stop-mode');
       snd.removeAttribute('disabled');
+      snd.innerHTML = '\u25a0';
+      if(stopBtn) stopBtn.classList.add('visible');
     } else {
-      snd.classList.remove('enabled');
-      if(!_S.streaming) snd.setAttribute('disabled', '');
+      snd.classList.remove('stop-mode');
+      snd.innerHTML = '\u2191';
+      if(stopBtn) stopBtn.classList.remove('visible');
+      if(v.length > 0){
+        snd.classList.add('enabled');
+        snd.removeAttribute('disabled');
+      } else {
+        snd.classList.remove('enabled');
+        snd.setAttribute('disabled', '');
+      }
     }
   }
 
@@ -960,16 +1109,28 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
   /* -- Event handlers -- */
   var inp = document.getElementById('inp');
   var snd = document.getElementById('snd');
+  var stopBtn = document.getElementById('stop-btn');
   if(inp){
     inp.addEventListener('input', function(){ _autoResize(this); _updateSend(); });
     inp.addEventListener('keydown', function(e){
       if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); _send(); }
+      if(e.key === 'Escape' && _S.streaming){ e.preventDefault(); _stopStreaming(); }
     });
   }
+  // Keyboard shortcuts
+  document.addEventListener('keydown', function(e){
+    if((e.ctrlKey || e.metaKey) && e.key === 'Enter'){ e.preventDefault(); _send(); }
+    if(e.key === 'Escape' && _S.streaming){ e.preventDefault(); _stopStreaming(); }
+  });
   if(snd){
     snd.addEventListener('click', function(){
-      if(_S.streaming){ _S.abortFlag = true; return; }
+      if(_S.streaming){ _stopStreaming(); return; }
       _send();
+    });
+  }
+  if(stopBtn){
+    stopBtn.addEventListener('click', function(){
+      if(_S.streaming) _stopStreaming();
     });
   }
   var ttBtn = document.getElementById('theme-toggle-sidebar');
@@ -1014,6 +1175,25 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
     }
   });
 
+  /* -- Stop streaming -- */
+  function _stopStreaming(){
+    _S.abortFlag = true;
+    _S.streaming = false;
+    _updateSend();
+    var msgs = document.getElementById('msgs');
+    var lastMsg = msgs ? msgs.lastElementChild : null;
+    if(lastMsg && lastMsg.classList.contains('assistant') && lastMsg.classList.contains('cursor')){
+      lastMsg.classList.remove('cursor');
+      var mdEl = lastMsg.querySelector('.md');
+      if(mdEl){
+        var current = mdEl.innerHTML;
+        if(!current || current.indexOf('typing-dots') !== -1){
+          mdEl.innerHTML = '<p><em>Generation stopped.</em></p>';
+        }
+      }
+    }
+  }
+
   /* -- Send message -- */
   function _send(){
     if(!inp) return;
@@ -1023,18 +1203,18 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
     var t = inp.value.trim();
     if(!t || _S.streaming) return;
 
+    _S.lastQuery = t;
+    _S.lastFolder = ff ? ff.value : 'All folders';
+
     hero.classList.add('hidden');
     chipsEl.style.display = 'none';
     _addMsg('user', t);
     _S.H.push({role:'user', content:[{text:t, type:'text'}]});
     inp.value = ''; inp.style.height = 'auto';
-    _updateSend();
 
-    var el = _addMsg('assistant', 'Thinking...', true);
+    var el = _addMsg('assistant', '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
     _S.streaming = true; _S.abortFlag = false;
-    snd.innerHTML = '\\u25a0';
-    snd.classList.add('enabled');
-    snd.removeAttribute('disabled');
+    _updateSend();
 
     var _convId = window._getCurrentConvId ? window._getCurrentConvId() : null;
     if(!_convId){
@@ -1072,7 +1252,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
                 var d = JSON.parse(line.slice(5));
                 if(d.error){
                   var mdEl = el.querySelector('.md');
-                  if(mdEl) mdEl.textContent = 'Error: ' + d.error;
+                  if(mdEl) mdEl.innerHTML = '<div class="msg-error"><div class="msg-error__text">Error: ' + _escHtml(d.error) + '</div><button class="msg-error__retry" onclick="window._retryLast()">Retry</button></div>';
                   _done(el);
                   return;
                 }
@@ -1095,7 +1275,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
         }).catch(function(err){
           if(!_S.abortFlag){
             var mdEl2 = el.querySelector('.md');
-            if(mdEl2) mdEl2.textContent = 'Error: ' + err.message;
+            if(mdEl2) mdEl2.innerHTML = '<div class="msg-error"><div class="msg-error__text">Error: ' + _escHtml(err.message) + '</div><button class="msg-error__retry" onclick="window._retryLast()">Retry</button></div>';
           }
           _done(el);
         });
@@ -1103,18 +1283,18 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
     }).catch(function(err){
       if(!_S.abortFlag){
         var mdEl3 = el.querySelector('.md');
-        if(mdEl3) mdEl3.textContent = 'Error: ' + err.message;
+        if(mdEl3) mdEl3.innerHTML = '<div class="msg-error"><div class="msg-error__text">Error: ' + _escHtml(err.message) + '</div><button class="msg-error__retry" onclick="window._retryLast()">Retry</button></div>';
       }
       _done(el);
     });
   }
 
+  function _escHtml(s){ var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
   function _done(el){
     _S.streaming = false;
-    snd.innerHTML = '\\u2191';
-    snd.classList.remove('enabled');
-    el.classList.remove('cursor');
     _updateSend();
+    el.classList.remove('cursor');
     if(window._loadConversations) window._loadConversations();
   }
 
@@ -1126,10 +1306,18 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
       avatar.className = 'msg-avatar';
       avatar.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L3 7v6c0 5.25 3.75 10.15 9 11.25C17.25 23.15 21 18.25 21 13V7l-9-5z"/></svg>';
       d.appendChild(avatar);
+      var body = document.createElement('div');
+      body.className = 'msg-body';
       var m = document.createElement('div');
       m.className = 'md';
       m.innerHTML = _md(text);
-      d.appendChild(m);
+      body.appendChild(m);
+      // Action bar
+      var actions = document.createElement('div');
+      actions.className = 'msg-actions';
+      actions.innerHTML = '<button class="msg-action-btn copy-msg" title="Copy">\u2398 Copy</button><button class="msg-action-btn regenerate" title="Regenerate">\u21bb Regenerate</button><button class="msg-action-btn feedback-up" title="Helpful">\u2191</button><button class="msg-action-btn feedback-down" title="Not helpful">\u2193</button>';
+      body.appendChild(actions);
+      d.appendChild(body);
       if(stream) d.classList.add('cursor');
     } else {
       d.textContent = text;
@@ -1176,6 +1364,15 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
     t = t.replace(/^\\d+\\. (.+)$/gm, '<li>$1</li>');
     // Links
     t = t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // Citation markers - make clickable
+    t = t.replace(/\[([\d,\s]+)\]/g, function(m, nums){
+      var parts = nums.split(/[,\s]+/).filter(Boolean);
+      var links = [];
+      for(var ci = 0; ci < parts.length; ci++){
+        links.push('<span class="cite-link" data-cite-num="' + parts[ci] + '" onclick="window._scrollToCite(' + parts[ci] + ')">[' + parts[ci] + ']</span>');
+      }
+      return links.join('');
+    });
     // Paragraphs / line breaks
     t = t.replace(/\\n\\n/g, '</p><p>');
     t = t.replace(/\\n/g, '<br>');
@@ -1276,6 +1473,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
   function _newChat(){
     _currentConvId = null;
     _S.H = [];
+    _S.lastQuery = '';
     var msgs = document.getElementById('msgs');
     if(msgs){ msgs.innerHTML = ''; msgs.classList.remove('active'); }
     var hero = document.getElementById('hero');
@@ -1289,6 +1487,7 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
       var sidebar = document.getElementById('sidebar');
       if(sidebar) sidebar.classList.add('collapsed');
     }
+    _fetchStats();
   }
 
   function _selectConversation(convId){
@@ -1395,6 +1594,96 @@ html.theme-transition,html.theme-transition *{transition:background-color var(--
   window._getCurrentConvId = function(){ return _currentConvId; };
   window._setCurrentConvId = function(id){ _currentConvId = id; };
   window._loadConversations = _loadConversations;
+
+  /* -- Action bar handlers -- */
+  var msgsContainer = document.getElementById('msgs');
+  if(msgsContainer) msgsContainer.addEventListener('click', function(e){
+    var btn = e.target.closest('.msg-action-btn');
+    if(!btn) return;
+    var msgEl = e.target.closest('.msg.assistant');
+    if(!msgEl) return;
+    var mdEl = msgEl.querySelector('.md');
+    var text = mdEl ? mdEl.textContent : '';
+
+    if(btn.classList.contains('copy-msg')){
+      navigator.clipboard.writeText(text).then(function(){
+        btn.classList.add('copied');
+        btn.innerHTML = '\u2713 Copied';
+        setTimeout(function(){ btn.classList.remove('copied'); btn.innerHTML = '\u2398 Copy'; }, 2000);
+      });
+    } else if(btn.classList.contains('regenerate')){
+      _retryLast();
+    } else if(btn.classList.contains('feedback-up')){
+      btn.classList.toggle('liked');
+      var downBtn = msgEl.querySelector('.feedback-down');
+      if(downBtn) downBtn.classList.remove('disliked');
+      // Send feedback
+      fetch('/conversations/' + (_currentConvId || 'feedback') + '/messages', {method:'POST', body:'{}'}).catch(function(){});
+    } else if(btn.classList.contains('feedback-down')){
+      btn.classList.toggle('disliked');
+      var upBtn = msgEl.querySelector('.feedback-up');
+      if(upBtn) upBtn.classList.remove('liked');
+    }
+  });
+
+  /* -- Scroll to citation -- */
+  window._scrollToCite = function(num){
+    var cit = document.getElementById('cit');
+    if(!cit) return;
+    var card = cit.querySelector('.citation-card[data-cite="' + num + '"]');
+    if(card){
+      card.scrollIntoView({behavior:'smooth',block:'center'});
+      card.style.boxShadow = '0 0 0 3px var(--accent)';
+      setTimeout(function(){ card.style.boxShadow = ''; }, 2000);
+    }
+  };
+
+  /* -- Retry last query -- */
+  window._retryLast = function(){
+    if(!_S.lastQuery) return;
+    var inp = document.getElementById('inp');
+    var ff = document.getElementById('ff');
+    if(inp) inp.value = _S.lastQuery;
+    if(ff && _S.lastFolder) ff.value = _S.lastFolder;
+    _send();
+  };
+
+  /* -- Conversation search -- */
+  var convSearchInput = document.getElementById('conv-search-input');
+  if(convSearchInput) convSearchInput.addEventListener('input', function(){
+    var q = this.value.toLowerCase();
+    var items = document.querySelectorAll('.conv-item');
+    for(var i = 0; i < items.length; i++){
+      var title = (items[i].querySelector('.conv-item__title') || {}).textContent || '';
+      items[i].style.display = title.toLowerCase().indexOf(q) !== -1 ? '' : 'none';
+    }
+  });
+
+  /* -- Fetch corpus stats -- */
+  function _fetchStats(){
+    fetch('/stats')
+    .then(function(r){ return r.json(); })
+    .then(function(s){
+      var elF = document.getElementById('stat-files');
+      var elD = document.getElementById('stat-folders');
+      var elC = document.getElementById('stat-chunks');
+      var elS = document.getElementById('hero-folder-count');
+      var elDot = document.getElementById('hero-status-dot');
+      if(elF) elF.textContent = s.file_count || 0;
+      if(elD) elD.textContent = s.folder_count || 0;
+      if(elC) elC.textContent = s.chunk_count || 0;
+      if(elS){
+        var hasData = (s.file_count || 0) > 0;
+        elS.textContent = hasData ? (s.file_count + ' files, ' + s.folder_count + ' folders indexed') : 'No documents indexed yet';
+      }
+      if(elDot){
+        var hasData2 = (s.file_count || 0) > 0;
+        elDot.innerHTML = '<span class="hero-stat__dot ' + (hasData2 ? 'green' : 'yellow') + '"></span>';
+      }
+    })
+    .catch(function(){});
+  }
+  _fetchStats();
 })();
 </script>
 </body>

@@ -305,7 +305,7 @@ class IncrementalIndexer:
     def sync_all(self) -> dict:
         """Full sync: detect all changes and process them.
 
-        1. Walk corpus_root, compute hashes for all files
+        1. Walk corpus_root, quick mtime+size scan (skip hashing unchanged)
         2. Compare with DB: find new, modified, deleted files
         3. Process new/modified files
         4. Remove deleted files
@@ -315,8 +315,20 @@ class IncrementalIndexer:
         if not corpus_root.exists():
             return {"error": f"Corpus root does not exist: {corpus_root}"}
 
-        # --- 1. Walk & hash ---
+        # --- 1. Walk & quick-scan (mtime+size first, hash only if needed) ---
+        # Load DB state for comparison
+        db_files: dict[str, dict] = {}
+        for row in self.db.query("SELECT path, sha256, mtime, size_bytes FROM file"):
+            db_files[row["path"]] = {
+                "sha256": row["sha256"],
+                "mtime": row["mtime"],
+                "size_bytes": row["size_bytes"],
+            }
+
         disk_files: dict[str, str] = {}  # absolute path -> sha256
+        hashed_count = 0
+        skipped_hash = 0
+
         for dirpath, dirnames, filenames in os.walk(str(corpus_root)):
             dp = Path(dirpath)
             # Skip hidden / cache directories
@@ -328,20 +340,45 @@ class IncrementalIndexer:
                 if fname.startswith(".") or fname in {".DS_Store", "Thumbs.db"}:
                     continue
                 fp = dp / fname
+                fp_str = str(fp)
                 try:
-                    disk_files[str(fp)] = _sha256_file(fp)
+                    stat = fp.stat()
+                except OSError:
+                    logger.warning("Cannot stat %s, skipping", fp)
+                    continue
+
+                # Quick check: if mtime and size match DB, skip hashing
+                db_row = db_files.get(fp_str)
+                if db_row:
+                    mtime_iso = datetime.fromtimestamp(
+                        stat.st_mtime, tz=UTC
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if (
+                        db_row["mtime"] == mtime_iso
+                        and db_row["size_bytes"] == stat.st_size
+                    ):
+                        # Definitely unchanged — reuse stored hash
+                        disk_files[fp_str] = db_row["sha256"]
+                        skipped_hash += 1
+                        continue
+
+                # Need to hash (new file or mtime/size changed)
+                try:
+                    disk_files[fp_str] = _sha256_file(fp)
+                    hashed_count += 1
                 except OSError:
                     logger.warning("Cannot read %s, skipping", fp)
 
-        # --- 2. Compare with DB ---
-        db_files: dict[str, str] = {}
-        for row in self.db.query("SELECT path, sha256 FROM file"):
-            db_files[row["path"]] = row["sha256"]
+        logger.debug(
+            "Sync scan: %d hashed, %d skipped (mtime match)",
+            hashed_count, skipped_hash,
+        )
 
+        # --- 2. Compare with DB ---
         new_paths = [p for p in disk_files if p not in db_files]
         modified_paths = [
             p for p in disk_files
-            if p in db_files and db_files[p] != disk_files[p]
+            if p in db_files and db_files[p]["sha256"] != disk_files[p]
         ]
         deleted_paths = [p for p in db_files if p not in disk_files]
 
@@ -616,22 +653,7 @@ class IncrementalIndexer:
         if chunks_to_insert:
             self.db["chunk"].insert_all(chunks_to_insert)
             self.db.conn.commit()
-
-            # Populate FTS5
-            inserted = list(
-                self.db.query(
-                    "SELECT id, text FROM chunk WHERE file_id = ? ORDER BY chunk_index",
-                    [file_id],
-                )
-            )
-            for ch in inserted:
-                self.db.execute(
-                    "INSERT INTO chunk_fts(rowid, text) VALUES (?, ?)",
-                    [ch["id"], ch["text"]],
-                )
-            self.db.conn.commit()
-            self.db.execute('INSERT INTO chunk_fts(chunk_fts) VALUES("rebuild")')
-            self.db.conn.commit()
+            # FTS5 is auto-populated via triggers (migration 4)
 
             logger.debug("Created %d chunks for file_id=%d", len(chunks_to_insert), file_id)
 
