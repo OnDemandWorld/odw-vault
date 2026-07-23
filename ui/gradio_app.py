@@ -54,6 +54,29 @@ def _get_db():
     return _thread_local.db
 
 
+def _check_db_write_access():
+    """Verify the database file is writable at startup; warn early if not."""
+    import os
+    db_path = _db_path
+    if not db_path or not os.path.exists(db_path):
+        return
+    try:
+        # Attempt a harmless write to verify access
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("CREATE TABLE IF NOT EXISTS _write_check (_id INTEGER)")
+        conn.execute("DROP TABLE IF EXISTS _write_check")
+        conn.close()
+    except sqlite3.OperationalError as exc:
+        if "readonly" in str(exc).lower():
+            print(
+                f"  \u26a0\ufe0f  WARNING: Database is READ-ONLY ({db_path}).\n"
+                f"      Chat will fail. Fix: ensure the file and its directory are writable.\n"
+                f"      On macOS, try: xattr -c {db_path} {db_path}-wal {db_path}-shm\n"
+                f"      Or check file permissions: chmod u+w {db_path}"
+            )
+
+
 def _ensure_db(db_path: Path) -> None:
     global _db_path
     _db_path = db_path
@@ -247,7 +270,12 @@ def _on_chat(message: str, history: list[dict], folder_filter: str, conversation
     except Exception as exc:
         elapsed = _time.time() - query_start
         logger.error(f"[QUERY] Retrieval failed in {elapsed:.2f}s: {exc}", exc_info=True)
-        history.append({"role": "assistant", "content": f"Retrieval failed: {exc}"})
+        err_msg = str(exc)
+        if "readonly" in err_msg.lower():
+            user_msg = "Database is read-only. Please restart the server with write access to corpus.db (check file permissions or macOS quarantine attributes)."
+        else:
+            user_msg = f"Retrieval failed: {exc}"
+        history.append({"role": "assistant", "content": user_msg})
         yield history, _citations_html([])
         return
 
@@ -510,6 +538,7 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     if not db_path.exists():
         db_path = Path("corpus.db")
     _ensure_db(db_path)
+    _check_db_write_access()
 
     folders = _get_folders()
     folder_choices = ["All folders", *folders]
