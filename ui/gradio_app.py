@@ -488,6 +488,18 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     from starlette.responses import Response
     import httpx
 
+    # Ensure localhost bypasses any environment HTTP proxy. Otherwise httpx
+    # (used below for the reverse proxy and by Gradio's own startup probe)
+    # would route 127.0.0.1 traffic through e.g. HTTP_PROXY and get a 502.
+    import os as _os
+    _no_proxy = _os.environ.get("NO_PROXY", _os.environ.get("no_proxy", ""))
+    _no_set = {p.strip() for p in _no_proxy.split(",") if p.strip()}
+    _need = [h for h in ("127.0.0.1", "localhost") if h not in _no_set]
+    if _need:
+        _no_proxy = ",".join(list(_no_set) + _need)
+        _os.environ["NO_PROXY"] = _no_proxy
+        _os.environ["no_proxy"] = _no_proxy
+
     global _cfg, _chroma_path, _ollama_host
 
     _cfg = cfg
@@ -558,17 +570,36 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
             if getattr(route, "path", None) == "/":
                 route.endpoint = _noop_root
 
-        gradio_app.launch(
-            server_name=server_name,
-            server_port=gradio_port,
-            share=False,
-        )
+        try:
+            gradio_app.launch(
+                server_name=server_name,
+                server_port=gradio_port,
+                share=False,
+            )
+        except Exception as exc:  # pragma: no cover - startup probe flakiness
+            # Gradio's startup probe can fail under env-proxy/timeout conditions
+            # even though the backend server is up; keep serving regardless.
+            print(f"  WARNING: Gradio launch probe failed ({exc}); backend may still be reachable.")
 
     gradio_thread = threading.Thread(target=run_gradio, daemon=True)
     gradio_thread.start()
 
-    # Wait for Gradio to start
-    time.sleep(2)
+    # Wait for Gradio backend to become ready (bypass any env HTTP proxy)
+    _gradio_ready = False
+    for _ in range(40):
+        time.sleep(0.5)
+        try:
+            _r = httpx.get(
+                f"{gradio_url}/gradio_api/startup-events",
+                trust_env=False, timeout=2.0,
+            )
+            if _r.is_success:
+                _gradio_ready = True
+                break
+        except Exception:
+            pass
+    if not _gradio_ready:
+        print("  WARNING: Gradio backend did not confirm readiness; chat may be unavailable.")
     print(f"  Gradio API backend: {gradio_url}")
 
     # Step 2: Create our proxy server on the user-facing port
@@ -576,6 +607,17 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     from starlette.middleware.base import BaseHTTPMiddleware
 
     proxy_app = FastAPI(title="ODW Vault")
+
+    # Serve brand logo assets (light/dark PNGs) from resource_img/
+    from fastapi.staticfiles import StaticFiles as _StaticFiles
+
+    _resource_img_dir = Path(__file__).resolve().parent.parent / "resource_img"
+    if _resource_img_dir.is_dir():
+        proxy_app.mount(
+            "/resource_img",
+            _StaticFiles(directory=str(_resource_img_dir)),
+            name="resource_img",
+        )
 
     @proxy_app.get("/")
     async def root():
@@ -623,7 +665,7 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
         if request.url.query:
             target += f"?{request.url.query}"
         body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             # SSE streams (GET /call/chat/{event_id}) need streaming response
             if request.method == "GET" and "/call/chat/" in path:
                 async with client.stream(
@@ -746,13 +788,12 @@ var(--bg-app)}
 #sidebar.icon-only .sidebar-header{justify-content:center;padding:12px 8px}
 
 .sidebar-header{display:flex;align-items:center;justify-content:space-between;padding:16px 14px 12px;min-height:60px}
-.sidebar-logo{font-family:var(--font-mono);font-size:13px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--sidebar-text);display:flex;align-items:center;gap:9px;text-decoration:none;transition:opacity var(--duration-fast) var(--ease-default)}
+.sidebar-logo{display:flex;align-items:center;text-decoration:none;padding:2px 2px;flex:1;min-width:0;transition:opacity var(--duration-fast) var(--ease-default)}
 .sidebar-logo:hover{opacity:0.85}
-.sidebar-logo span{color:var(--sidebar-text)}
-.sidebar-logo__icon{width:30px;height:30px;border-radius:var(--radius-sm);flex-shrink:0;overflow:hidden;position:relative}
-.sidebar-logo__icon img{width:100%;height:100%;display:block}
-.sidebar-logo__icon::after{content:'';position:absolute;inset:-3px;border-radius:calc(var(--radius-sm) + 3px);border:1px solid var(--accent);opacity:0.25;animation:brand-ring 3.2s var(--ease-default) infinite}
-@keyframes brand-ring{0%,100%{opacity:0.10;transform:scale(1)}50%{opacity:0.35;transform:scale(1.06)}}
+.sidebar-logo__img{height:30px;width:auto;max-width:100%;display:block;object-fit:contain}
+.sidebar-logo__img--dark{display:none}
+[data-theme="dark"] .sidebar-logo__img--light{display:none}
+[data-theme="dark"] .sidebar-logo__img--dark{display:block}
 #new-chat-btn{display:flex;align-items:center;gap:6px;padding:8px 13px;background:var(--accent);color:#14110F;border:none;border-radius:var(--radius-sm);font-size:12.5px;font-weight:600;cursor:pointer;transition:all var(--duration-fast) var(--ease-default);font-family:var(--font-mono);letter-spacing:0.04em;text-transform:uppercase}
 #new-chat-btn:hover{box-shadow:0 4px 16px var(--glow-accent);transform:translateY(-1px);filter:brightness(1.06)}
 #new-chat-btn:active{transform:translateY(0);box-shadow:0 1px 4px var(--glow-accent)}
@@ -797,17 +838,22 @@ var(--bg-app)}
 /* Topbar */
 #topbar{display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:54px;min-height:54px;flex-shrink:0;border-bottom:1px solid var(--border-subtle);background:transparent;backdrop-filter:blur(10px)}
 .topbar-left{display:flex;align-items:center;gap:10px}
-.topbar-logo{font-family:var(--font-display);font-size:17px;font-weight:400;letter-spacing:-0.015em;color:var(--text-primary);text-decoration:none;display:flex;align-items:center;gap:8px;transition:opacity var(--duration-fast) var(--ease-default)}
+.topbar-logo{display:none;align-items:center;text-decoration:none;transition:opacity var(--duration-fast) var(--ease-default)}
 .topbar-logo:hover{opacity:0.85}
-.topbar-logo__icon{width:22px;height:22px;border-radius:4px;overflow:hidden;flex-shrink:0}
-.topbar-logo__icon img{width:100%;height:100%;display:block}
-.topbar-logo span{color:var(--text-tertiary);font-weight:400;margin-left:2px;font-size:11px}
+.topbar-logo__img{height:26px;width:auto;display:block;object-fit:contain}
+.topbar-logo__img--dark{display:none}
+[data-theme="dark"] .topbar-logo__img--light{display:none}
+[data-theme="dark"] .topbar-logo__img--dark{display:block}
+#sidebar.collapsed ~ #content .topbar-logo{display:flex}
 .topbar-right{display:flex;align-items:center;gap:10px}
 .topbar-status{font-family:var(--font-mono);font-size:10px;color:var(--text-tertiary);letter-spacing:0.03em}
 #theme-toggle{width:32px;height:32px;border-radius:var(--radius-full);border:1px solid var(--border-subtle);background:var(--bg-primary);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;transition:all var(--duration-fast) var(--ease-default)}
 #theme-toggle:hover{background:var(--bg-tertiary);border-color:var(--border-default)}
 #theme-toggle:active{transform:scale(0.95)}
 #theme-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#theme-toggle-sidebar{width:30px;height:30px;border-radius:var(--radius-full);border:1px solid var(--sidebar-border);background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:15px;line-height:1;color:var(--sidebar-text);transition:all var(--duration-fast) var(--ease-default);flex-shrink:0}
+#theme-toggle-sidebar:hover{background:var(--bg-sidebar-hover);border-color:var(--accent);color:var(--accent)}
+#theme-toggle-sidebar:active{transform:scale(0.92)}
 
 /* Main */
 #main{flex:1 1 0;min-height:0;display:flex;flex-direction:column;overflow:hidden;position:relative}
@@ -1030,7 +1076,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 <!-- Sidebar -->
 <div id="sidebar">
 <div class="sidebar-header">
-<a class="sidebar-logo" href="https://odw.ai/" target="_blank" rel="noopener"><div class="sidebar-logo__icon"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect fill='%23FEFEFE' width='512' height='512' rx='90'/%3E%3Cpath d='M160.66 199.59h-2.92c-2.94 0-5.33 2.39-5.33 5.33s2.39 5.33 5.33 5.33h4.9a25.4 25.4 0 01-1.98-10.66zm60.3-26.08l2.52 2.52c-.21-7.43-6.27-13.4-13.75-13.4-2.16 0-4.17.54-5.99 1.42a37.7 37.7 0 0117.22 9.46zm-27.38 72.61h-49.84c-20.88 0-37.86-16.99-37.86-37.87v-63.52c0-20.88 16.98-37.86 37.86-37.86h63.52c20.88 0 37.86 16.98 37.86 37.86v52.95l19.9 19.9v-.04l3.63 3.63c.88-4.17 1.35-8.49 1.35-12.92v-63.52c0-34.65-28.09-62.74-62.74-62.74h-63.52c-34.65 0-62.74 28.09-62.74 62.74v63.52c0 34.65 28.09 62.74 62.74 62.74h63.52c3.51 0 6.93-.36 10.29-.91l-23.97-23.97zm-38.52-69.7c0 7.62-6.18 13.79-13.79 13.79s-13.79-6.17-13.79-13.79c0-7.62 6.18-13.79 13.79-13.79s13.79 6.17 13.79 13.79z' fill='%23020303'/%3E%3Cpath d='M233.45 482.5c0-.15.01-.3.01-.45v-.05H90c-33.08 0-60-26.92-60-60V90c0-33.08 26.92-60 60-60h332c33.08 0 60 26.92 60 60v86.63c3.98-1.49 8.15-2.25 12.44-2.25 6.23 0 12.24 1.62 17.56 4.69V90c0-49.71-40.29-90-90-90H90C40.3 0 0 40.29 0 90v332c0 49.71 40.3 90 90 90h159.25c-9.67-6.4-15.8-17.35-15.8-29.5z' fill='%23020303'/%3E%3Cg transform='translate(166,168)'%3E%3Cpath d='M316.02 13.88c-3.32 1.49-6.44 3.59-9.18 6.32-11.3 11.33-11.7 29.29-1.43 41.23l10.61 10.62 7.08 7.08c1.42 1.43 1.42 3.74 0 5.16-.79.8-1.85 1.11-2.88 1.01l.03.52-.62-.63c-.62-.15-1.21-.42-1.68-.9l-1.93-1.92-39.56-39.59c-11.82-8.15-28.12-7-38.63 3.51-10.31 10.33-11.64 26.2-4.04 37.98l33.5 33.53c1.42 1.41 1.42 3.74 0 5.15-1.42 1.43-3.72 1.43-5.15.01l-14.86-14.88-31.29-31.33c-11.85-11.87-31.11-11.83-42.98.04-11.86 11.87-11.86 31.12 0 42.99l37.56 37.6c1.42 1.42 1.42 3.73 0 5.15-1.42 1.42-3.73 1.43-5.16.01l-3.03-3.04-97.93-98.03v.04L51.85 8.9c-11.86-11.87-31.1-11.87-42.95 0-11.87 11.88-11.87 31.13 0 43l51.01 51.06h.03l135.74 135.87c4.93 5.79 7.84 9.22 7.87 9.26 12.64 14.86 9.09 29.02-9.25 36H103c-16.61 0-30.09 13.33-30.36 29.9-.003.17-.014.33-.014.5-.007 14.27 9.81 26.23 23.05 29.51h160.4c49.68 0 89.95-40.31 89.95-90.04V16.82c-8.84-6.29-20.29-7.3-29.98-2.94' fill='%23CD2028'/%3E%3C/g%3E%3C/svg%3E" alt="ODW.AI"></div><span>ODW Vault</span></a>
+<a class="sidebar-logo" href="https://odw.ai/" target="_blank" rel="noopener"><img class="sidebar-logo__img sidebar-logo__img--light" src="/resource_img/odwai-logo-2048x651.png" alt="ODW.AI"><img class="sidebar-logo__img sidebar-logo__img--dark" src="/resource_img/odwai-logo-dark-2048x651.png" alt="ODW.AI"></a>
 <button id="new-chat-btn"><span>+</span> <span>New Chat</span></button>
 </div>
 <div class="sidebar-section">
@@ -1056,7 +1102,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 <div id="topbar">
 <div class="topbar-left">
 <button id="sidebar-toggle" title="Toggle sidebar">&#9776;</button>
-<a class="topbar-logo" href="https://odw.ai/" target="_blank" rel="noopener" style="margin-left:4px"><div class="topbar-logo__icon"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect fill='%23FEFEFE' width='512' height='512' rx='90'/%3E%3Cpath d='M160.66 199.59h-2.92c-2.94 0-5.33 2.39-5.33 5.33s2.39 5.33 5.33 5.33h4.9a25.4 25.4 0 01-1.98-10.66zm60.3-26.08l2.52 2.52c-.21-7.43-6.27-13.4-13.75-13.4-2.16 0-4.17.54-5.99 1.42a37.7 37.7 0 0117.22 9.46zm-27.38 72.61h-49.84c-20.88 0-37.86-16.99-37.86-37.87v-63.52c0-20.88 16.98-37.86 37.86-37.86h63.52c20.88 0 37.86 16.98 37.86 37.86v52.95l19.9 19.9v-.04l3.63 3.63c.88-4.17 1.35-8.49 1.35-12.92v-63.52c0-34.65-28.09-62.74-62.74-62.74h-63.52c-34.65 0-62.74 28.09-62.74 62.74v63.52c0 34.65 28.09 62.74 62.74 62.74h63.52c3.51 0 6.93-.36 10.29-.91l-23.97-23.97zm-38.52-69.7c0 7.62-6.18 13.79-13.79 13.79s-13.79-6.17-13.79-13.79c0-7.62 6.18-13.79 13.79-13.79s13.79 6.17 13.79 13.79z' fill='%23020303'/%3E%3Cpath d='M233.45 482.5c0-.15.01-.3.01-.45v-.05H90c-33.08 0-60-26.92-60-60V90c0-33.08 26.92-60 60-60h332c33.08 0 60 26.92 60 60v86.63c3.98-1.49 8.15-2.25 12.44-2.25 6.23 0 12.24 1.62 17.56 4.69V90c0-49.71-40.29-90-90-90H90C40.3 0 0 40.29 0 90v332c0 49.71 40.3 90 90 90h159.25c-9.67-6.4-15.8-17.35-15.8-29.5z' fill='%23020303'/%3E%3Cg transform='translate(166,168)'%3E%3Cpath d='M316.02 13.88c-3.32 1.49-6.44 3.59-9.18 6.32-11.3 11.33-11.7 29.29-1.43 41.23l10.61 10.62 7.08 7.08c1.42 1.43 1.42 3.74 0 5.16-.79.8-1.85 1.11-2.88 1.01l.03.52-.62-.63c-.62-.15-1.21-.42-1.68-.9l-1.93-1.92-39.56-39.59c-11.82-8.15-28.12-7-38.63 3.51-10.31 10.33-11.64 26.2-4.04 37.98l33.5 33.53c1.42 1.41 1.42 3.74 0 5.15-1.42 1.43-3.72 1.43-5.15.01l-14.86-14.88-31.29-31.33c-11.85-11.87-31.11-11.83-42.98.04-11.86 11.87-11.86 31.12 0 42.99l37.56 37.6c1.42 1.42 1.42 3.73 0 5.15-1.42 1.42-3.73 1.43-5.16.01l-3.03-3.04-97.93-98.03v.04L51.85 8.9c-11.86-11.87-31.1-11.87-42.95 0-11.87 11.88-11.87 31.13 0 43l51.01 51.06h.03l135.74 135.87c4.93 5.79 7.84 9.22 7.87 9.26 12.64 14.86 9.09 29.02-9.25 36H103c-16.61 0-30.09 13.33-30.36 29.9-.003.17-.014.33-.014.5-.007 14.27 9.81 26.23 23.05 29.51h160.4c49.68 0 89.95-40.31 89.95-90.04V16.82c-8.84-6.29-20.29-7.3-29.98-2.94' fill='%23CD2028'/%3E%3C/g%3E%3C/svg%3E" alt="ODW.AI"></div>ODW <span style="color:var(--accent);font-weight:600">Vault</span></a>
+<a class="topbar-logo" href="https://odw.ai/" target="_blank" rel="noopener" style="margin-left:4px"><img class="topbar-logo__img topbar-logo__img--light" src="/resource_img/odwai-logo-2048x651.png" alt="ODW.AI"><img class="topbar-logo__img topbar-logo__img--dark" src="/resource_img/odwai-logo-dark-2048x651.png" alt="ODW.AI"></a>
 </div>
 <div class="topbar-right">
 <div class="topbar-status"></div>
@@ -1517,7 +1563,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     .then(function(text){
       if(!text) return;
       var convs = [];
-      var lines = text.split('\n');
+      var lines = text.split('\\n');
       for(var i = 0; i < lines.length; i++){
         var line = lines[i].trim();
         if(line.indexOf('data: ') === 0){
@@ -1675,6 +1721,12 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
   _buildFolderTree();
   _loadConversations();
   _updateScopeLabel();
+
+  /* On small screens start with the sidebar collapsed so it does not cover content */
+  if(window.innerWidth <= 768){
+    var _sb = document.getElementById('sidebar');
+    if(_sb) _sb.classList.add('collapsed');
+  }
 
   /* Expose _currentConvId for send function */
   window._getCurrentConvId = function(){ return _currentConvId; };
