@@ -1413,7 +1413,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     if(role === 'assistant'){
       var avatar = document.createElement('div');
       avatar.className = 'msg-avatar';
-      avatar.innerHTML = '<img src="/resource_img/bot.png" alt="ODW.AI">';
+      avatar.innerHTML = '<img src="/resource_img/bot_new.png" alt="ODW.AI">';
       d.appendChild(avatar);
       var body = document.createElement('div');
       body.className = 'msg-body';
