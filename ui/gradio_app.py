@@ -981,12 +981,12 @@ var(--bg-app)}
 ::-webkit-scrollbar-thumb{background:var(--scrollbar-thumb);border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:var(--scrollbar-thumb-hover)}
 
-/* Typing dots animation */
-.typing-dots{display:inline-flex;align-items:center;gap:4px;padding:6px 0}
-.typing-dots span{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:typing-bounce 1.4s ease-in-out infinite}
-.typing-dots span:nth-child(2){animation-delay:0.2s}
-.typing-dots span:nth-child(3){animation-delay:0.4s}
-@keyframes typing-bounce{0%,60%,100%{transform:translateY(0);opacity:0.35}30%{transform:translateY(-6px);opacity:1}}
+/* Thinking indicator */
+.thinking-indicator{display:inline-flex;align-items:center;gap:8px;padding:4px 0}
+.thinking-indicator__pulse{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:think-pulse 1.8s ease-in-out infinite}
+.thinking-indicator__text{font-size:13px;color:var(--text-secondary);font-style:italic;animation:think-fade 1.8s ease-in-out infinite}
+@keyframes think-pulse{0%,100%{opacity:0.4;transform:scale(0.85)}50%{opacity:1;transform:scale(1.1)}}
+@keyframes think-fade{0%,100%{opacity:0.5}50%{opacity:1}}
 
 /* Stop button */
 #stop-btn{width:36px;height:36px;border-radius:var(--radius-full);border:1px solid var(--border-default);background:var(--bg-primary);cursor:pointer;display:none;align-items:center;justify-content:center;font-size:16px;color:var(--text-secondary);transition:all var(--duration-fast) var(--ease-default);flex-shrink:0}
@@ -1294,7 +1294,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       var mdEl = lastMsg.querySelector('.md');
       if(mdEl){
         var current = mdEl.innerHTML;
-        if(!current || current.indexOf('typing-dots') !== -1){
+        if(!current || current.indexOf('thinking-indicator') !== -1){
           mdEl.innerHTML = '<p><em>Generation stopped.</em></p>';
         }
       }
@@ -1321,7 +1321,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     _S.H.push({role:'user', content:[{text:t, type:'text'}]});
     inp.value = ''; inp.style.height = 'auto';
 
-    var el = _addMsg('assistant', '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
+    var el = _addMsg('assistant', '<div class="thinking-indicator"><div class="thinking-indicator__pulse"></div><span class="thinking-indicator__text">Thinking...</span></div>', true);
     _S.streaming = true; _S.abortFlag = false;
     _updateSend();
 
@@ -1419,7 +1419,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       body.className = 'msg-body';
       var m = document.createElement('div');
       m.className = 'md';
-      m.innerHTML = _md(text);
+      m.innerHTML = stream ? text : _md(text);
       body.appendChild(m);
       // Action bar
       var actions = document.createElement('div');
