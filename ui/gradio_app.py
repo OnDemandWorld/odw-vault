@@ -895,7 +895,7 @@ var(--bg-app)}
 .msg{max-width:100%;word-wrap:break-word}
 .msg.user{align-self:flex-end;max-width:74%;background:var(--bg-user-msg);color:var(--text-inverse);border-radius:var(--radius-xl) var(--radius-xl) var(--radius-xs) var(--radius-xl);padding:12px 18px;white-space:pre-wrap;animation:message-in var(--duration-normal) var(--ease-enter);box-shadow:var(--shadow-user-msg);font-size:14.5px;line-height:1.55;font-weight:450}
 .msg.assistant{align-self:flex-start;background:transparent;padding:0;animation:message-in var(--duration-normal) var(--ease-enter);display:flex;gap:13px;align-items:flex-start;max-width:100%}
-.msg-avatar{width:36px;height:36px;border-radius:var(--radius-sm);flex-shrink:0;background:#FFFFFF;overflow:hidden;margin-top:2px;box-shadow:0 2px 10px var(--glow-accent)}
+.msg-avatar{width:36px;height:36px;border-radius:var(--radius-sm);flex-shrink:0;background:transparent;overflow:hidden;margin-top:2px}
 .msg-avatar img{width:100%;height:100%;display:block}
 .msg.assistant .md{flex:1;min-width:0}
 @keyframes message-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
