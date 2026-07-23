@@ -795,7 +795,7 @@ var(--bg-app)}
 [data-theme="dark"] .sidebar-logo__img--light{display:none}
 [data-theme="dark"] .sidebar-logo__img--dark{display:block}
 .sidebar-brand-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.sidebar-product-name{font-family:var(--font-mono);font-size:12px;font-weight:600;letter-spacing:0.04em;color:var(--sidebar-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sidebar-product-name{font-family:var(--font-sans);font-size:13px;font-weight:600;letter-spacing:-0.01em;color:var(--sidebar-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #new-chat-btn{display:flex;align-items:center;gap:6px;padding:8px 13px;background:var(--accent);color:#14110F;border:none;border-radius:var(--radius-sm);font-size:12.5px;font-weight:600;cursor:pointer;transition:all var(--duration-fast) var(--ease-default);font-family:var(--font-mono);letter-spacing:0.04em;text-transform:uppercase}
 #new-chat-btn:hover{box-shadow:0 4px 16px var(--glow-accent);transform:translateY(-1px);filter:brightness(1.06)}
 #new-chat-btn:active{transform:translateY(0);box-shadow:0 1px 4px var(--glow-accent)}
@@ -844,7 +844,7 @@ var(--bg-app)}
 .topbar-logo:hover{opacity:0.85}
 .topbar-logo__icon{width:22px;height:22px;border-radius:4px;overflow:hidden;flex-shrink:0}
 .topbar-logo__icon img{width:100%;height:100%;display:block;object-fit:contain}
-.topbar-logo__name{font-family:var(--font-mono);font-size:12px;font-weight:600;letter-spacing:0.03em;color:var(--text-primary)}
+.topbar-logo__name{font-family:var(--font-sans);font-size:13px;font-weight:600;letter-spacing:-0.01em;color:var(--text-primary)}
 #sidebar.collapsed ~ #content .topbar-logo{display:flex}
 .topbar-right{display:flex;align-items:center;gap:10px}
 .topbar-status{font-family:var(--font-mono);font-size:10px;color:var(--text-tertiary);letter-spacing:0.03em}
@@ -860,7 +860,7 @@ var(--bg-app)}
 #main{flex:1 1 0;min-height:0;display:flex;flex-direction:column;overflow:hidden;position:relative}
 
 /* Hero — command deck */
-#hero{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding-top:10vh;text-align:center;padding-left:24px;padding-right:24px;animation:hero-fade-in 600ms var(--ease-enter) both}
+#hero{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding-left:24px;padding-right:24px;animation:hero-fade-in 600ms var(--ease-enter) both}
 @keyframes hero-fade-in{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
 #hero.hidden{display:none!important}
 .hero-overline{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border:1px solid var(--border-default);border-radius:var(--radius-full);background:var(--bg-primary);font-family:var(--font-mono);font-size:10px;font-weight:500;letter-spacing:0.16em;text-transform:uppercase;color:var(--text-secondary);margin-bottom:22px;box-shadow:var(--shadow-xs);animation:hero-icon-in 500ms var(--ease-spring) 60ms both}
@@ -895,7 +895,7 @@ var(--bg-app)}
 .msg{max-width:100%;word-wrap:break-word}
 .msg.user{align-self:flex-end;max-width:74%;background:var(--bg-user-msg);color:var(--text-inverse);border-radius:var(--radius-xl) var(--radius-xl) var(--radius-xs) var(--radius-xl);padding:12px 18px;white-space:pre-wrap;animation:message-in var(--duration-normal) var(--ease-enter);box-shadow:var(--shadow-user-msg);font-size:14.5px;line-height:1.55;font-weight:450}
 .msg.assistant{align-self:flex-start;background:transparent;padding:0;animation:message-in var(--duration-normal) var(--ease-enter);display:flex;gap:13px;align-items:flex-start;max-width:100%}
-.msg-avatar{width:30px;height:30px;border-radius:var(--radius-sm);flex-shrink:0;background:#FFFFFF;overflow:hidden;margin-top:2px;box-shadow:0 2px 10px var(--glow-accent)}
+.msg-avatar{width:36px;height:36px;border-radius:var(--radius-sm);flex-shrink:0;background:#FFFFFF;overflow:hidden;margin-top:2px;box-shadow:0 2px 10px var(--glow-accent)}
 .msg-avatar img{width:100%;height:100%;display:block}
 .msg.assistant .md{flex:1;min-width:0}
 @keyframes message-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
