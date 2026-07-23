@@ -787,13 +787,15 @@ var(--bg-app)}
 #sidebar.icon-only .folder-tree-item{padding:6px 8px;text-align:center}
 #sidebar.icon-only .sidebar-header{justify-content:center;padding:12px 8px}
 
-.sidebar-header{display:flex;align-items:center;justify-content:space-between;padding:16px 14px 12px;min-height:60px}
-.sidebar-logo{display:flex;align-items:center;text-decoration:none;padding:2px 2px;flex:1;min-width:0;transition:opacity var(--duration-fast) var(--ease-default)}
+.sidebar-header{display:flex;flex-direction:column;gap:10px;padding:14px 14px 12px}
+.sidebar-logo{display:flex;align-items:center;text-decoration:none;padding:0;transition:opacity var(--duration-fast) var(--ease-default)}
 .sidebar-logo:hover{opacity:0.85}
-.sidebar-logo__img{height:30px;width:auto;max-width:100%;display:block;object-fit:contain}
+.sidebar-logo__img{height:28px;width:auto;max-width:100%;display:block;object-fit:contain}
 .sidebar-logo__img--dark{display:none}
 [data-theme="dark"] .sidebar-logo__img--light{display:none}
 [data-theme="dark"] .sidebar-logo__img--dark{display:block}
+.sidebar-brand-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.sidebar-product-name{font-family:var(--font-mono);font-size:12px;font-weight:600;letter-spacing:0.04em;color:var(--sidebar-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #new-chat-btn{display:flex;align-items:center;gap:6px;padding:8px 13px;background:var(--accent);color:#14110F;border:none;border-radius:var(--radius-sm);font-size:12.5px;font-weight:600;cursor:pointer;transition:all var(--duration-fast) var(--ease-default);font-family:var(--font-mono);letter-spacing:0.04em;text-transform:uppercase}
 #new-chat-btn:hover{box-shadow:0 4px 16px var(--glow-accent);transform:translateY(-1px);filter:brightness(1.06)}
 #new-chat-btn:active{transform:translateY(0);box-shadow:0 1px 4px var(--glow-accent)}
@@ -838,12 +840,11 @@ var(--bg-app)}
 /* Topbar */
 #topbar{display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:54px;min-height:54px;flex-shrink:0;border-bottom:1px solid var(--border-subtle);background:transparent;backdrop-filter:blur(10px)}
 .topbar-left{display:flex;align-items:center;gap:10px}
-.topbar-logo{display:none;align-items:center;text-decoration:none;transition:opacity var(--duration-fast) var(--ease-default)}
+.topbar-logo{display:none;align-items:center;gap:8px;text-decoration:none;transition:opacity var(--duration-fast) var(--ease-default)}
 .topbar-logo:hover{opacity:0.85}
-.topbar-logo__img{height:26px;width:auto;display:block;object-fit:contain}
-.topbar-logo__img--dark{display:none}
-[data-theme="dark"] .topbar-logo__img--light{display:none}
-[data-theme="dark"] .topbar-logo__img--dark{display:block}
+.topbar-logo__icon{width:22px;height:22px;border-radius:4px;overflow:hidden;flex-shrink:0}
+.topbar-logo__icon img{width:100%;height:100%;display:block;object-fit:contain}
+.topbar-logo__name{font-family:var(--font-mono);font-size:12px;font-weight:600;letter-spacing:0.03em;color:var(--text-primary)}
 #sidebar.collapsed ~ #content .topbar-logo{display:flex}
 .topbar-right{display:flex;align-items:center;gap:10px}
 .topbar-status{font-family:var(--font-mono);font-size:10px;color:var(--text-tertiary);letter-spacing:0.03em}
@@ -1077,7 +1078,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 <div id="sidebar">
 <div class="sidebar-header">
 <a class="sidebar-logo" href="https://odw.ai/" target="_blank" rel="noopener"><img class="sidebar-logo__img sidebar-logo__img--light" src="/resource_img/odwai-logo-2048x651.png" alt="ODW.AI"><img class="sidebar-logo__img sidebar-logo__img--dark" src="/resource_img/odwai-logo-dark-2048x651.png" alt="ODW.AI"></a>
-<button id="new-chat-btn"><span>+</span> <span>New Chat</span></button>
+<div class="sidebar-brand-row"><span class="sidebar-product-name">ODW Vault</span><button id="new-chat-btn"><span>+</span> <span>New Chat</span></button></div>
 </div>
 <div class="sidebar-section">
 <div class="sidebar-section__title">Conversations</div>
@@ -1102,7 +1103,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 <div id="topbar">
 <div class="topbar-left">
 <button id="sidebar-toggle" title="Toggle sidebar">&#9776;</button>
-<a class="topbar-logo" href="https://odw.ai/" target="_blank" rel="noopener" style="margin-left:4px"><img class="topbar-logo__img topbar-logo__img--light" src="/resource_img/odwai-logo-2048x651.png" alt="ODW.AI"><img class="topbar-logo__img topbar-logo__img--dark" src="/resource_img/odwai-logo-dark-2048x651.png" alt="ODW.AI"></a>
+<a class="topbar-logo" href="https://odw.ai/" target="_blank" rel="noopener" style="margin-left:4px"><div class="topbar-logo__icon"><img src="/resource_img/favicon.png" alt="ODW"></div><span class="topbar-logo__name">ODW Vault</span></a>
 </div>
 <div class="topbar-right">
 <div class="topbar-status"></div>
@@ -1111,25 +1112,16 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 
 <div id="main">
 <div id="hero">
-<div class="hero-overline"><span class="hero-overline__dot"></span> ODW.AI &middot; SOVEREIGN KNOWLEDGE COPILOT</div>
-<div class="hero-icon"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect fill='%23FEFEFE' width='512' height='512' rx='90'/%3E%3Cpath d='M160.66 199.59h-2.92c-2.94 0-5.33 2.39-5.33 5.33s2.39 5.33 5.33 5.33h4.9a25.4 25.4 0 01-1.98-10.66zm60.3-26.08l2.52 2.52c-.21-7.43-6.27-13.4-13.75-13.4-2.16 0-4.17.54-5.99 1.42a37.7 37.7 0 0117.22 9.46zm-27.38 72.61h-49.84c-20.88 0-37.86-16.99-37.86-37.87v-63.52c0-20.88 16.98-37.86 37.86-37.86h63.52c20.88 0 37.86 16.98 37.86 37.86v52.95l19.9 19.9v-.04l3.63 3.63c.88-4.17 1.35-8.49 1.35-12.92v-63.52c0-34.65-28.09-62.74-62.74-62.74h-63.52c-34.65 0-62.74 28.09-62.74 62.74v63.52c0 34.65 28.09 62.74 62.74 62.74h63.52c3.51 0 6.93-.36 10.29-.91l-23.97-23.97zm-38.52-69.7c0 7.62-6.18 13.79-13.79 13.79s-13.79-6.17-13.79-13.79c0-7.62 6.18-13.79 13.79-13.79s13.79 6.17 13.79 13.79z' fill='%23020303'/%3E%3Cpath d='M233.45 482.5c0-.15.01-.3.01-.45v-.05H90c-33.08 0-60-26.92-60-60V90c0-33.08 26.92-60 60-60h332c33.08 0 60 26.92 60 60v86.63c3.98-1.49 8.15-2.25 12.44-2.25 6.23 0 12.24 1.62 17.56 4.69V90c0-49.71-40.29-90-90-90H90C40.3 0 0 40.29 0 90v332c0 49.71 40.3 90 90 90h159.25c-9.67-6.4-15.8-17.35-15.8-29.5z' fill='%23020303'/%3E%3Cg transform='translate(166,168)'%3E%3Cpath d='M316.02 13.88c-3.32 1.49-6.44 3.59-9.18 6.32-11.3 11.33-11.7 29.29-1.43 41.23l10.61 10.62 7.08 7.08c1.42 1.43 1.42 3.74 0 5.16-.79.8-1.85 1.11-2.88 1.01l.03.52-.62-.63c-.62-.15-1.21-.42-1.68-.9l-1.93-1.92-39.56-39.59c-11.82-8.15-28.12-7-38.63 3.51-10.31 10.33-11.64 26.2-4.04 37.98l33.5 33.53c1.42 1.41 1.42 3.74 0 5.15-1.42 1.43-3.72 1.43-5.15.01l-14.86-14.88-31.29-31.33c-11.85-11.87-31.11-11.83-42.98.04-11.86 11.87-11.86 31.12 0 42.99l37.56 37.6c1.42 1.42 1.42 3.73 0 5.15-1.42 1.42-3.73 1.43-5.16.01l-3.03-3.04-97.93-98.03v.04L51.85 8.9c-11.86-11.87-31.1-11.87-42.95 0-11.87 11.88-11.87 31.13 0 43l51.01 51.06h.03l135.74 135.87c4.93 5.79 7.84 9.22 7.87 9.26 12.64 14.86 9.09 29.02-9.25 36H103c-16.61 0-30.09 13.33-30.36 29.9-.003.17-.014.33-.014.5-.007 14.27 9.81 26.23 23.05 29.51h160.4c49.68 0 89.95-40.31 89.95-90.04V16.82c-8.84-6.29-20.29-7.3-29.98-2.94' fill='%23CD2028'/%3E%3C/g%3E%3C/svg%3E" alt="ODW.AI"></div>
-<h1>$GREETING</h1>
-<p class="sub">Ask anything across your indexed documents. Your data never leaves the building.</p>
-<div class="hero-stats" id="hero-stats">
-<div class="hero-stat"><div class="hero-stat__value" id="stat-files">--</div><div class="hero-stat__label">Files</div></div>
-<div class="hero-stat"><div class="hero-stat__value" id="stat-folders">--</div><div class="hero-stat__label">Folders</div></div>
-<div class="hero-stat"><div class="hero-stat__value" id="stat-chunks">--</div><div class="hero-stat__label">Chunks</div></div>
-</div>
-<div class="hero-pill"><span id="hero-status-dot"></span> <span id="hero-folder-count">Loading corpus...</span></div>
+<h1 id="greeting-text">$GREETING</h1>
 </div>
 <div id="msgs"></div>
 </div>
 
 <div id="cit"></div>
 
-<div id="chips"><button id="chip-rf" title="Refresh suggestions">&#x21bb;</button></div>
+<div id="chips" style="display:none"><button id="chip-rf" title="Refresh suggestions">&#x21bb;</button></div>
 
-<div id="flt">
+<div id="flt" style="display:none">
 <label>Scope:</label>
 <select id="ff">$FOLDER_OPTIONS</select>
 </div>
@@ -1323,6 +1315,8 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 
     hero.classList.add('hidden');
     chipsEl.style.display = 'none';
+    var fltEl = document.getElementById('flt');
+    if(fltEl) fltEl.style.display = '';
     _addMsg('user', t);
     _S.H.push({role:'user', content:[{text:t, type:'text'}]});
     inp.value = ''; inp.style.height = 'auto';
@@ -1419,7 +1413,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     if(role === 'assistant'){
       var avatar = document.createElement('div');
       avatar.className = 'msg-avatar';
-      avatar.innerHTML = '<img src="' + _LOGO + '" alt="ODW.AI">';
+      avatar.innerHTML = '<img src="/resource_img/bot.png" alt="ODW.AI">';
       d.appendChild(avatar);
       var body = document.createElement('div');
       body.className = 'msg-body';
@@ -1611,7 +1605,9 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     var hero = document.getElementById('hero');
     if(hero) hero.classList.remove('hidden');
     var chips = document.getElementById('chips');
-    if(chips) chips.style.display = '';
+    if(chips) chips.style.display = 'none';
+    var flt = document.getElementById('flt');
+    if(flt) flt.style.display = 'none';
     var cit = document.getElementById('cit');
     if(cit) cit.innerHTML = '';
     document.querySelectorAll('.conv-item').forEach(function(el){ el.classList.remove('active'); });
@@ -1637,6 +1633,8 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       if(hero) hero.classList.add('hidden');
       var chips = document.getElementById('chips');
       if(chips) chips.style.display = 'none';
+      var flt = document.getElementById('flt');
+      if(flt) flt.style.display = '';
       for(var i = 0; i < messages.length; i++){
         var m = messages[i];
         if(m.role === 'user'){
@@ -1717,6 +1715,16 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     item.classList.add('active');
     _updateScopeLabel();
   });
+
+  /* ── Dynamic greeting based on system time ── */
+  function _updateGreeting(){
+    var el = document.getElementById('greeting-text');
+    if(!el) return;
+    var h = new Date().getHours();
+    el.textContent = h < 12 ? 'Good morning' : (h < 17 ? 'Good afternoon' : 'Good evening');
+  }
+  _updateGreeting();
+  setInterval(_updateGreeting, 60000);
 
   _buildFolderTree();
   _loadConversations();
