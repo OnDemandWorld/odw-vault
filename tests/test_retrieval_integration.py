@@ -110,22 +110,29 @@ class TestAssembleContext:
             Hit(chunk_id=2, file_id=1, folder_id=1, rel_path="doc.txt", page_start=3, text="more content"),
         ]
         _assemble_context(hits, MagicMock())
-        assert hits[0].text.startswith("[1]")
-        assert hits[1].text.startswith("[2]")
+        # _assemble_context now only sorts; text is NOT modified.
+        # Formatting is done by _format_chunks_for_prompt / _format_chunks.
+        assert hits[0].text == "content"
+        assert hits[1].text == "more content"
 
     def test_page_info_included(self):
         hits = [
             Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="doc.pdf", page_start=7, text="content"),
         ]
         _assemble_context(hits, MagicMock())
-        assert "page 7" in hits[0].text
+        # _assemble_context only sorts; page info is preserved in Hit.page_start
+        # for the caller to use when formatting.
+        assert hits[0].text == "content"
+        assert hits[0].page_start == 7
 
     def test_no_page_info(self):
         hits = [
             Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="doc.txt", page_start=None, text="content"),
         ]
         _assemble_context(hits, MagicMock())
-        assert "page" not in hits[0].text
+        # Text is unchanged; page_start is None (not appended to text).
+        assert hits[0].text == "content"
+        assert hits[0].page_start is None
 
 
 class TestRRFWithAssembleContext:
@@ -142,5 +149,9 @@ class TestRRFWithAssembleContext:
         _assemble_context(fused, MagicMock())
 
         assert len(fused) == 2
-        assert fused[0].text.startswith("[1]")
-        assert fused[1].text.startswith("[2]")
+        # _assemble_context only sorts; text is unchanged.
+        # The fused_score from RRF is preserved.
+        assert fused[0].chunk_id == 1  # file_id=1 comes first after sort
+        assert fused[1].chunk_id == 2
+        assert fused[0].fused_score is not None
+        assert fused[1].fused_score is not None

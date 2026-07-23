@@ -93,7 +93,7 @@ def retrieve(
     candidate_file_ids = None
     if cfg.retrieval.hierarchical:
         candidate_file_ids = _hierarchical_narrowing(
-            client, suffix, _query_emb, query, cfg, allowed_file_ids
+            client, suffix, _query_emb, query, cfg, db, allowed_file_ids
         )
 
     # Exclude derived/meta files from search (preflight_report.md
@@ -239,6 +239,7 @@ def _hierarchical_narrowing(
     query_embedding: list[float],
     query: str,
     cfg,
+    db,
     allowed_file_ids: set[int] | None,
 ) -> set[int] | None:
     """Narrow candidate files via folder and summary collections."""
@@ -256,8 +257,8 @@ def _hierarchical_narrowing(
             for meta in folder_results.get("metadatas", [[]])[0]:
                 if meta and "folder_id" in meta:
                     fid = int(meta["folder_id"])
-                    # Get file_ids belonging to this folder
-                    rows = _query_db_for_files_in_folder(meta.get("_db"), fid)
+                    # Get file_ids belonging to this folder from the real DB
+                    rows = _query_db_for_files_in_folder(db, fid)
                     candidate_ids.update(rows)
     except Exception:
         logger.debug("Folder collection '%s' not available, skipping", folder_coll_name)
@@ -574,15 +575,10 @@ def _bm25_retrieve(
 
 
 def _assemble_context(hits: list[Hit], db) -> None:
-    """Build numbered context with file path and page reference.
+    """Sort hits in a coherent order for the generation prompt.
 
-    Uses chunk.text (the original chunk), never chunk.context_text.
-    Orders final chunks by (file_id, ordinal).
+    Orders final chunks by (file_id, ordinal). The caller is responsible
+    for formatting the context blocks (e.g., _format_chunks_for_prompt).
     """
     # Sort by file_id then by chunk_id (ordinal within file)
     hits.sort(key=lambda h: (h.file_id, h.chunk_id))
-
-    for i, hit in enumerate(hits, start=1):
-        # Build a human-readable context entry
-        page_info = f", page {hit.page_start}" if hit.page_start else ""
-        hit.text = f"[{i}] {hit.rel_path}{page_info}\n{hit.text}"
