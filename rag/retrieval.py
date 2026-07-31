@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 import chromadb
 
+from rag.tokenization import tokenize_zh
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,7 +126,9 @@ def retrieve(
 
     # 6. BM25 chunk retrieval
     bm25_candidates = cfg.retrieval.bm25_candidates
-    bm25_hits = _bm25_retrieve(db, query, bm25_candidates, candidate_file_ids, excluded_ids)
+    bm25_hits = _bm25_retrieve(
+        db, query, bm25_candidates, candidate_file_ids, excluded_ids, query_lang=query_lang
+    )
 
     # 6b. Path-matching BM25: find chunks from files whose path contains query tokens
     # This catches cases like "kwh" which appear in file paths but not chunk text
@@ -474,14 +478,97 @@ def _path_match_retrieve(
     return hits
 
 
-def _bm25_retrieve(
+def _bm25_retrieve_zh(
     db,
     query: str,
     n_results: int,
     candidate_file_ids: set[int] | None,
     excluded_file_ids: set[int] | None = None,
 ) -> list[Hit]:
-    """Retrieve chunks via BM25 from chunk_fts FTS5 table."""
+    """Retrieve chunks via BM25 from the additive Chinese index (``chunk_fts_zh``).
+
+    Tokenizes the query with the language-aware tokenizer (jieba when
+    available, else character bigrams) and matches the segment/bigram tokens
+    stored at index time. Returns ``[]`` if the index table is absent or the
+    query yields no tokens.
+    """
+    tokens = tokenize_zh(query)
+    if not tokens:
+        return []
+    # Quote each token so FTS5 treats it as a literal term.
+    fts_query = " OR ".join('"' + t.replace('"', "") + '"' for t in tokens)
+
+    base_select = (
+        "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
+        "f.folder_id, f.rel_path, rank "
+        "FROM chunk_fts_zh "
+        "JOIN chunk c ON chunk_fts_zh.rowid = c.id "
+        "JOIN file f ON c.file_id = f.id "
+    )
+
+    try:
+        if candidate_file_ids is not None:
+            placeholders = ",".join("?" for _ in candidate_file_ids)
+            sql = (
+                base_select
+                + f"WHERE chunk_fts_zh MATCH ? AND c.file_id IN ({placeholders}) "
+                + "ORDER BY rank LIMIT ?"
+            )
+            params = [fts_query, *list(candidate_file_ids), n_results]
+        elif excluded_file_ids:
+            exc = ",".join("?" for _ in excluded_file_ids)
+            sql = (
+                base_select
+                + f"WHERE chunk_fts_zh MATCH ? AND c.file_id NOT IN ({exc}) "
+                + "ORDER BY rank LIMIT ?"
+            )
+            params = [fts_query, *list(excluded_file_ids), n_results]
+        else:
+            sql = base_select + "WHERE chunk_fts_zh MATCH ? ORDER BY rank LIMIT ?"
+            params = [fts_query, n_results]
+
+        rows = db.query(sql, params)
+    except Exception as e:
+        logger.debug("Chinese BM25 retrieval skipped: %s", e)
+        return []
+
+    hits: list[Hit] = []
+    for row in rows:
+        raw_rank = row.get("rank", 0)
+        bm25_score = max(0.0, 1.0 + raw_rank) if raw_rank is not None else None
+        hits.append(
+            Hit(
+                chunk_id=row["chunk_id"],
+                file_id=row["file_id"],
+                folder_id=row["folder_id"],
+                rel_path=row["rel_path"],
+                page_start=row["start_page"],
+                text=row["text"],
+                bm25_score=bm25_score,
+            )
+        )
+    return hits
+
+
+def _bm25_retrieve(
+    db,
+    query: str,
+    n_results: int,
+    candidate_file_ids: set[int] | None,
+    excluded_file_ids: set[int] | None = None,
+    query_lang: str | None = None,
+) -> list[Hit]:
+    """Retrieve chunks via BM25 from the FTS5 index.
+
+    The default (English / unspecified language) path queries ``chunk_fts``
+    exactly as before. A Chinese query is routed to the additive
+    ``chunk_fts_zh`` index using language-aware (jieba/bigram) tokens.
+    """
+    if query_lang and str(query_lang).lower().startswith("zh"):
+        return _bm25_retrieve_zh(
+            db, query, n_results, candidate_file_ids, excluded_file_ids
+        )
+
     import re as _re
 
     # Strip FTS5 special characters and filter stop words

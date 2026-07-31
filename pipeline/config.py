@@ -173,6 +173,16 @@ class ChunkConfig(BaseModel):
     window_size: int = 5
     target_tokens: int = 512
     chunker_version: str = "1"
+    # --- V1.2 M1 (F-Vault-1): pluggable chunking strategies ---
+    # Registry name of the chunking strategy. Default reproduces the legacy
+    # sentence-window behaviour exactly. See rag/chunk_strategies.py.
+    strategy: str = "sentence_window"
+    # Target chunk size (chars) for size-aware strategies (recursive/paragraph).
+    chunk_size: int = 2000
+    # Overlap (chars) for the recursive strategy.
+    chunk_overlap: int = 200
+    # Optional per-category strategy overrides, e.g. {"document": "paragraph"}.
+    category_strategies: dict[str, str] = Field(default_factory=dict)
 
 
 class RetrievalConfig(BaseModel):
@@ -428,6 +438,11 @@ chunker = "sentence-window"
 window_size = 5
 target_tokens = 512
 chunker_version = "1"
+# V1.2 M1: pluggable strategies (sentence_window | recursive | paragraph)
+strategy = "sentence_window"
+chunk_size = 2000
+chunk_overlap = 200
+# category_strategies = { document = "paragraph" }
 
 [retrieval]
 top_k_chunks = 8

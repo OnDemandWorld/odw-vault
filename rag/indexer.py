@@ -18,6 +18,8 @@ from pathlib import Path
 
 from pipeline.config import AppConfig, embedding_config_hash
 from pipeline.helpers import now_iso, record_failure
+from rag.chunk_strategies import get_chunker, resolve_strategy_name
+from rag.tokenization import index_zh_chunks, remove_zh_index_for_file
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +130,8 @@ def _cleanup_file_derivatives(db, file_id: int) -> None:
         "(SELECT id FROM chunk WHERE file_id = ?)",
         [file_id],
     )
+    # V1.2 M2: Chinese BM25 index (standalone table, no auto-sync trigger).
+    remove_zh_index_for_file(db, file_id)
     # Embedding refs for chunks
     db.execute(
         "DELETE FROM embedding_ref WHERE chunk_id IN "
@@ -579,7 +583,11 @@ class IncrementalIndexer:
             logger.warning("Summarization failed for file_id=%d: %s", file_id, exc)
 
     def _run_chunking(self, file_id: int) -> None:
-        """Phase 10 — sentence-window chunking."""
+        """Phase 10 — chunking via the configured strategy.
+
+        Defaults to ``sentence_window`` which reproduces the legacy
+        sentence-window behaviour exactly.
+        """
         existing = next(
             iter(self.db.query("SELECT 1 FROM chunk WHERE file_id = ? LIMIT 1", [file_id])),
             None,
@@ -600,34 +608,34 @@ class IncrementalIndexer:
 
         text = ext_row["text_extracted"]
         page_count = ext_row["page_count"]
-        window_size = self.cfg.chunk.window_size
-        sentences = _split_sentences(text)
-        if not sentences:
+
+        # Resolve the chunking strategy for this file (default: sentence_window).
+        file_row = next(
+            iter(self.db.query("SELECT category FROM file WHERE id = ?", [file_id])),
+            None,
+        )
+        category = file_row["category"] if file_row else None
+        strategy_name = resolve_strategy_name(self.cfg, category=category)
+        strategy = get_chunker(strategy_name)
+        spans = strategy.chunk(
+            text,
+            window_size=self.cfg.chunk.window_size,
+            chunk_size=getattr(self.cfg.chunk, "chunk_size", 2000),
+            chunk_overlap=getattr(self.cfg.chunk, "chunk_overlap", 200),
+        )
+        if not spans:
             return
 
-        # Pre-compute character offsets
-        offsets: list[tuple[int, int]] = []
-        pos = 0
-        for s in sentences:
-            start = text.find(s, pos)
-            if start < 0:
-                start = pos
-            end = start + len(s)
-            offsets.append((start, end))
-            pos = end
-
         chunks_to_insert = []
-        for i in range(len(sentences)):
-            lo = max(0, i - window_size)
-            hi = min(len(sentences) - 1, i + window_size)
-            window_text = " ".join(sentences[lo : hi + 1])
-            char_start = offsets[lo][0]
-            char_end = offsets[hi][1]
+        for span in spans:
+            char_start = span.start
+            char_end = span.end
 
             meta = {
                 "extraction_id": ext_row["id"],
                 "char_start": char_start,
                 "char_end": char_end,
+                "chunk_strategy": strategy.name,
             }
 
             start_page = None
@@ -640,9 +648,9 @@ class IncrementalIndexer:
             chunks_to_insert.append(
                 {
                     "file_id": file_id,
-                    "chunk_index": i,
-                    "text": window_text,
-                    "token_count": _token_estimate(window_text),
+                    "chunk_index": span.index,
+                    "text": span.text,
+                    "token_count": _token_estimate(span.text),
                     "start_page": start_page,
                     "end_page": end_page,
                     "metadata_json": json.dumps(meta, ensure_ascii=False),
@@ -655,7 +663,26 @@ class IncrementalIndexer:
             self.db.conn.commit()
             # FTS5 is auto-populated via triggers (migration 4)
 
-            logger.debug("Created %d chunks for file_id=%d", len(chunks_to_insert), file_id)
+            # V1.2 M2: populate the additive Chinese BM25 index for any Chinese
+            # chunks (English chunks skipped cheaply; default path unaffected).
+            inserted = list(
+                self.db.query(
+                    "SELECT id, text FROM chunk WHERE file_id = ?",
+                    [file_id],
+                )
+            )
+            index_zh_chunks(
+                self.db,
+                [(r["id"], r["text"]) for r in inserted],
+                model_path=self.cfg.models.language_id.model_path,
+            )
+
+            logger.debug(
+                "Created %d chunks for file_id=%d via '%s'",
+                len(chunks_to_insert),
+                file_id,
+                strategy.name,
+            )
 
     def _run_embedding(self, file_id: int) -> None:
         """Phase 11 — embed chunks into Chroma."""

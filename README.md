@@ -673,3 +673,48 @@ This repository is built to be extended with AI coding agents. Rather than a tur
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+---
+
+## V1.2 Feature Expansion (M1 + M2)
+
+> Strictly additive. The default chunking strategy and the default (English)
+> retrieval path are unchanged; existing indices and behaviour are unaffected.
+
+### M1 — Multi-chunking strategies (F-Vault-1)
+
+Chunking is now pluggable via a strategy registry (`rag/chunk_strategies.py`):
+
+| Strategy | Behaviour |
+|----------|-----------|
+| `sentence_window` | Focal sentence ± N surrounding sentences (**default**, identical to the legacy chunker) |
+| `recursive` | Split by a separator hierarchy (`\n\n` → `\n` → sentence terminators → space) respecting `chunk_size` / `chunk_overlap` |
+| `paragraph` | Split on blank lines; over-long paragraphs are further split/merged by sentence |
+
+Select a strategy in `config.toml`:
+
+```toml
+[chunk]
+strategy = "sentence_window"   # sentence_window | recursive | paragraph
+chunk_size = 2000              # target chars for recursive/paragraph
+chunk_overlap = 200            # overlap chars for recursive
+# category_strategies = { document = "paragraph" }   # optional per-category override
+```
+
+The registry is extensible: implement `ChunkStrategy` (`name` + `chunk(text, **opts)`)
+and call `get_registry().register(...)`. The CLI `vault chunk --chunker sentence-window`
+alias still maps to the default strategy.
+
+### M2 — Chinese retrieval (F-Vault-2)
+
+BM25/FTS retrieval is now language-aware (`rag/tokenization.py`):
+
+- `tokenize(text, lang)` abstraction. **English (`lang="en"`, default) is unchanged.**
+- Chinese (`lang="zh"`) uses **jieba** when installed, otherwise a dependency-free
+  **character-bigram** tokenizer (always runnable/testable offline).
+- jieba is an **optional** dependency: `pip install -e ".[chinese]"`. Without it, the
+  bigram fallback is used automatically.
+- A separate, additive FTS5 index `chunk_fts_zh` (migration 6) stores Chinese
+  segment/bigram tokens; Chinese queries are routed there, English queries keep using
+  `chunk_fts`. Language detection reuses the existing fasttext `lid` model, falling back
+  to lingua and then a CJK heuristic (default `en` on failure).
+

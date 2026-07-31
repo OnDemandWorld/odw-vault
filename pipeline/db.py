@@ -517,6 +517,19 @@ MIGRATIONS = [
         CREATE INDEX IF NOT EXISTS idx_file_workspace ON file(workspace);
         """,
     ),
+    (
+        6,
+        "Chinese BM25 FTS index (chunk_fts_zh) for V1.2 M2 Chinese retrieval",
+        """
+        -- Standalone FTS5 index holding language-aware (jieba/bigram) tokens
+        -- for Chinese chunks only. rowid matches chunk.id so it joins to the
+        -- chunk table exactly like chunk_fts. English chunks are never written
+        -- here, so the default (English) retrieval path is unaffected.
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts_zh USING fts5(
+            text, tokenize='unicode61'
+        );
+        """,
+    ),
 ]
 
 

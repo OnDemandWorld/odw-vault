@@ -38,6 +38,9 @@ rag = [
     "llama-index-llms-ollama>=0.3",
     "llama-index-readers-file>=0.1",
 ]
+# V1.2 M2 (F-Vault-2): optional Chinese word segmentation for BM25 retrieval.
+# When absent, Vault falls back to a dependency-free character-bigram tokenizer.
+chinese = ["jieba>=0.42"]
 watch = ["watchdog>=4.0"]
 dev = ["pytest>=7.4", "pytest-cov>=4.1", "datasette>=0.64", "ruff>=0.4"]
 

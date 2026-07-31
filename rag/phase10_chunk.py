@@ -14,6 +14,9 @@ import logging
 import re
 from datetime import UTC, datetime
 
+from rag.chunk_strategies import get_chunker, resolve_strategy_name
+from rag.tokenization import index_zh_chunks
+
 logger = logging.getLogger(__name__)
 
 # Regex that matches sentence boundaries. Covers English (.!?) and common
@@ -46,14 +49,9 @@ def run_chunk(
     Returns (total_chunks_created, files_processed) counts.
     """
     chunk_cfg = cfg.chunk
-    selected_chunker = chunker or chunk_cfg.chunker
     window_size = window if window is not None else chunk_cfg.window_size
-
-    if selected_chunker != "sentence-window":
-        logger.warning(
-            "Unknown chunker '%s', falling back to sentence-window",
-            selected_chunker,
-        )
+    chunk_size = getattr(chunk_cfg, "chunk_size", 2000)
+    chunk_overlap = getattr(chunk_cfg, "chunk_overlap", 200)
 
     # Select files with successful extractions that haven't been chunked yet
     if rechunk:
@@ -65,7 +63,8 @@ def run_chunk(
                        e.text_extracted,
                        e.page_count AS extraction_page_count,
                        e.char_count,
-                       e.tool
+                       e.tool,
+                       f.category AS category
                 FROM extraction e
                 JOIN file f ON f.id = e.file_id
                 WHERE e.succeeded = 1
@@ -86,7 +85,8 @@ def run_chunk(
                        e.text_extracted,
                        e.page_count AS extraction_page_count,
                        e.char_count,
-                       e.tool
+                       e.tool,
+                       f.category AS category
                 FROM extraction e
                 JOIN file f ON f.id = e.file_id
                 WHERE e.succeeded = 1
@@ -110,6 +110,16 @@ def run_chunk(
     if rechunk:
         file_ids = [r["file_id"] for r in rows]
         placeholders = ",".join("?" for _ in file_ids)
+        # V1.2 M2: clear the additive Chinese index for these files first
+        # (standalone FTS table has no auto-sync trigger). Best-effort.
+        try:
+            db.execute(
+                f"DELETE FROM chunk_fts_zh WHERE rowid IN "
+                f"(SELECT id FROM chunk WHERE file_id IN ({placeholders}))",
+                file_ids,
+            )
+        except Exception:  # pragma: no cover - table absent on unmigrated DBs
+            logger.debug("chunk_fts_zh rechunk cleanup skipped")
         db.execute(
             f"DELETE FROM chunk WHERE file_id IN ({placeholders})",
             file_ids,
@@ -126,33 +136,26 @@ def run_chunk(
         text = row["text_extracted"]
         page_count = row["extraction_page_count"]
 
-        sentences = _split_sentences(text)
-        if not sentences:
+        # Resolve the chunking strategy for this file (default: sentence_window,
+        # which reproduces the legacy behaviour exactly).
+        strategy_name = resolve_strategy_name(
+            cfg, category=row.get("category"), override=chunker
+        )
+        strategy = get_chunker(strategy_name)
+        spans = strategy.chunk(
+            text,
+            window_size=window_size,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        if not spans:
             continue
 
-        # Pre-compute character offsets for each sentence
-        offsets: list[tuple[int, int]] = []
-        pos = 0
-        for s in sentences:
-            start = text.find(s, pos)
-            if start < 0:
-                start = pos  # fallback
-            end = start + len(s)
-            offsets.append((start, end))
-            pos = end
-
         chunks_to_insert = []
-        for i, _sentence in enumerate(sentences):
-            # Window: sentences[i-window_size .. i+window_size], clamped
-            lo = max(0, i - window_size)
-            hi = min(len(sentences) - 1, i + window_size)
-
-            window_sentences = sentences[lo : hi + 1]
-            chunk_text = " ".join(window_sentences)
-
-            # Byte offsets into the extraction text
-            char_start = offsets[lo][0]
-            char_end = offsets[hi][1]
+        for span in spans:
+            # Character offsets into the extraction text (provided by strategy)
+            char_start = span.start
+            char_end = span.end
 
             # Page info from extraction metadata
             meta: dict[str, object] = {
@@ -160,6 +163,7 @@ def run_chunk(
                 "extraction_tool": row["tool"],
                 "char_start": char_start,
                 "char_end": char_end,
+                "chunk_strategy": strategy.name,
             }
 
             start_page = None
@@ -174,9 +178,9 @@ def run_chunk(
             chunks_to_insert.append(
                 {
                     "file_id": file_id,
-                    "chunk_index": i,
-                    "text": chunk_text,
-                    "token_count": _token_estimate(chunk_text),
+                    "chunk_index": span.index,
+                    "text": span.text,
+                    "token_count": _token_estimate(span.text),
                     "start_page": start_page,
                     "end_page": end_page,
                     "metadata_json": json.dumps(meta, ensure_ascii=False),
@@ -202,13 +206,22 @@ def run_chunk(
             db.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?, ?)", [ch["id"], ch["text"]])
         db.conn.commit()
 
+        # V1.2 M2: populate the additive Chinese BM25 index for any Chinese
+        # chunks (English chunks are skipped cheaply; default path unaffected).
+        index_zh_chunks(
+            db,
+            [(ch["id"], ch["text"]) for ch in inserted_chunks],
+            model_path=cfg.models.language_id.model_path,
+        )
+
         total_chunks += len(chunks_to_insert)
         files_processed += 1
         logger.debug(
-            "file_id=%d: %d chunks from %d sentences (%d chars)",
+            "file_id=%d: %d chunks via '%s' from %d spans (%d chars)",
             file_id,
             len(chunks_to_insert),
-            len(sentences),
+            strategy.name,
+            len(spans),
             row["char_count"],
         )
 
