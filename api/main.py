@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hmac
 import json
 import logging
 import os
@@ -13,9 +14,9 @@ from pathlib import Path
 
 import chromadb
 import ollama
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, RedirectResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from api.schemas import (
@@ -86,6 +87,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Optional inbound API-key authentication (additive, backward-compatible)
+# ---------------------------------------------------------------------------
+# Set VAULT_API_KEY to a non-empty value to require a matching
+# `Authorization: Bearer <VAULT_API_KEY>` header on every endpoint except the
+# health probe and the interactive API docs. When VAULT_API_KEY is unset or
+# empty the service stays fully open — preserving the no-auth integration
+# contract (INTEGRATION_CONTRACT.md §1) and the existing unauthenticated
+# callers and tests. The variable is read per-request so it can be toggled
+# without rebuilding the app (and so tests can monkeypatch it).
+
+_AUTH_EXEMPT_PATHS = {"/", "/health", "/openapi.json"}
+_AUTH_EXEMPT_PREFIXES = ("/docs", "/redoc")
+
+
+def _is_auth_exempt(path: str) -> bool:
+    """Return True for paths that never require the API key."""
+    if path in _AUTH_EXEMPT_PATHS:
+        return True
+    return any(path.startswith(prefix) for prefix in _AUTH_EXEMPT_PREFIXES)
+
+
+@app.middleware("http")
+async def _require_api_key(request: Request, call_next):
+    expected = os.environ.get("VAULT_API_KEY", "").strip()
+    if expected and request.method != "OPTIONS" and not _is_auth_exempt(request.url.path):
+        scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(
+            token.strip().encode("utf-8"), expected.encode("utf-8")
+        ):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+
 
 # ---------------------------------------------------------------------------
 # File watcher (opt-in via config [watcher] enabled = true)
@@ -189,6 +224,54 @@ def health():
         database=db_ok,
         fasttext=fasttext_ok,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics
+# ---------------------------------------------------------------------------
+
+
+@app.get("/metrics")
+def metrics():
+    """Expose a few operational gauges derived from the database.
+
+    Uses prometheus_client when it is importable; otherwise falls back to a
+    minimal Prometheus text exposition. No heavy dependency is required either
+    way.
+    """
+    db = _get_db()
+
+    def _count(sql: str) -> int:
+        try:
+            return next(iter(db.query(sql)))["c"]
+        except Exception:
+            return 0
+
+    gauges = {
+        "vault_queries_total": ("Total queries logged", _count("SELECT COUNT(*) AS c FROM query_log")),
+        "vault_files_total": ("Total files in the corpus", _count("SELECT COUNT(*) AS c FROM file")),
+        "vault_chunks_total": ("Total chunks stored", _count("SELECT COUNT(*) AS c FROM chunk")),
+    }
+
+    try:
+        from prometheus_client import (
+            CONTENT_TYPE_LATEST,
+            CollectorRegistry,
+            Gauge,
+            generate_latest,
+        )
+
+        registry = CollectorRegistry()
+        for name, (help_text, value) in gauges.items():
+            Gauge(name, help_text, registry=registry).set(value)
+        return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+    except ImportError:
+        lines = []
+        for name, (help_text, value) in gauges.items():
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
+            lines.append(f"{name} {value}")
+        return PlainTextResponse("\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------

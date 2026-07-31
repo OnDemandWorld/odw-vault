@@ -1,0 +1,43 @@
+# Virtual environment
+.venv/
+
+# Vector store / corpus data / caches (mounted at runtime, never baked in)
+chroma/
+data/
+.rag-cache/
+SourceData/
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets — config is provided via config.example.toml + runtime mount
+config.toml
+
+# Compiled binary (download from GitHub releases)
+sf
+
+# Python build/cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.coverage
+.pytest_cache/
+.ruff_cache/
+
+# VCS / OS / editor
+.git/
+.DS_Store
+.vscode/
+.idea/
+.claude/
+.qwen/
+
+# Chat logs (may contain secrets)
+chatlog*.md
