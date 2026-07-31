@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
+from api.audit import record_audit
 from api.schemas import (
     Citation,
     ConversationSummary,
@@ -120,6 +121,24 @@ async def _require_api_key(request: Request, call_next):
         ):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     return await call_next(request)
+
+
+def _resolve_actor() -> str:
+    """Resolve the audit actor for the current deployment (V1.3 F-Vault-1).
+
+    When the optional V1.0 API-key auth is active (``VAULT_API_KEY`` set) the
+    request has already passed the auth middleware, so we record an
+    authenticated principal. Otherwise the caller is anonymous. A configured
+    ``VAULT_AUDIT_ACTOR`` always wins so deployments can name their service.
+    The environment is read per-call (like the auth middleware) so it can be
+    toggled without rebuilding the app.
+    """
+    configured = os.environ.get("VAULT_AUDIT_ACTOR", "").strip()
+    if configured:
+        return configured
+    if os.environ.get("VAULT_API_KEY", "").strip():
+        return "authenticated"
+    return "anonymous"
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +459,16 @@ def query(req: QueryRequest):
     if conversation_id:
         add_message(db, conversation_id, "assistant", gen_result["answer"], query_log_id=query_log_id)
 
+    # Best-effort audit trail (V1.3 F-Vault-1) — never blocks the response.
+    record_audit(
+        db,
+        _resolve_actor(),
+        "query",
+        "query_log",
+        resource_id=query_log_id,
+        detail=req.query,
+    )
+
     return QueryResponse(
         answer=gen_result["answer"],
         citations=citations,
@@ -690,6 +719,16 @@ def feedback(req: FeedbackRequest):
         },
     )
     db.conn.commit()
+
+    # Best-effort audit trail (V1.3 F-Vault-1) — never blocks the response.
+    record_audit(
+        db,
+        _resolve_actor(),
+        "feedback",
+        "query_log",
+        resource_id=req.query_log_id,
+        detail=req.feedback,
+    )
 
     return {"status": "ok", "query_log_id": req.query_log_id}
 
@@ -1105,6 +1144,16 @@ async def upload_files(
             db.conn.commit()
 
             uploaded += 1
+
+            # Best-effort audit trail (V1.3 F-Vault-1) — one entry per file.
+            record_audit(
+                db,
+                _resolve_actor(),
+                "file.upload",
+                "file",
+                resource_id=file_id,
+                detail=dest.name,
+            )
         except Exception as e:
             logger.error("Failed to upload %s: %s", upload_file.filename, e)
             failed.append(upload_file.filename or "unnamed")
@@ -1157,6 +1206,15 @@ def pipeline_sync():
 
     t = threading.Thread(target=_run_sync, daemon=True)
     t.start()
+
+    # Best-effort audit trail (V1.3 F-Vault-1): record that a sync was triggered.
+    record_audit(
+        _get_db(),
+        _resolve_actor(),
+        "pipeline.sync",
+        "pipeline",
+        detail="incremental sync started",
+    )
 
     return {
         "status": "started",
@@ -1370,7 +1428,57 @@ def delete_file(file_id: int):
     db.execute("DELETE FROM file WHERE id = ?", [file_id])
     db.conn.commit()
 
+    # Best-effort audit trail (V1.3 F-Vault-1) — never blocks the response.
+    record_audit(
+        db,
+        _resolve_actor(),
+        "file.delete",
+        "file",
+        resource_id=file_id,
+        detail=rel_path,
+    )
+
     return {"status": "deleted", "file_id": file_id}
+
+
+# ---------------------------------------------------------------------------
+# GET /audit (V1.3 F-Vault-1)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/audit")
+def list_audit(
+    action: str | None = None,
+    limit: int = Query(100, ge=1, le=1000),
+):
+    """Return audit-log records, most recent first.
+
+    Optional filters: ``action`` (exact match, e.g. ``query`` / ``file.upload``)
+    and ``limit`` (max rows, default 100). When the optional V1.0 API-key auth
+    is active this endpoint is protected by it via the shared auth middleware;
+    otherwise it is open like the rest of the API. Additive — does not alter
+    any existing endpoint.
+    """
+    db = _get_db()
+
+    conditions: list[str] = []
+    params: list = []
+    if action:
+        conditions.append("action = ?")
+        params.append(action)
+    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+    rows = list(
+        db.query(
+            f"""SELECT id, ts, actor, action, resource_type, resource_id, detail, status
+                FROM audit_log {where_clause}
+                ORDER BY ts DESC, id DESC
+                LIMIT ?""",
+            [*params, limit],
+        )
+    )
+
+    return {"items": rows, "total": len(rows)}
 
 
 # ---------------------------------------------------------------------------

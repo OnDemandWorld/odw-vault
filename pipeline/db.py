@@ -530,6 +530,28 @@ MIGRATIONS = [
         );
         """,
     ),
+    (
+        7,
+        "audit_log table for V1.3 compliance audit trail (F-Vault-1)",
+        """
+        -- Best-effort audit trail recording who/when/what for query, file
+        -- management, pipeline sync, and feedback operations. Writes go through
+        -- api.audit.record_audit which never blocks the main request path, so
+        -- this table is strictly additive and does not affect existing responses.
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            TEXT NOT NULL DEFAULT (datetime('now')),
+            actor         TEXT,
+            action        TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id   TEXT,
+            detail        TEXT,
+            status        TEXT NOT NULL DEFAULT 'ok'
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts DESC);
+        """,
+    ),
 ]
 
 

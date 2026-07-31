@@ -718,3 +718,25 @@ BM25/FTS retrieval is now language-aware (`rag/tokenization.py`):
   `chunk_fts`. Language detection reuses the existing fasttext `lid` model, falling back
   to lingua and then a CJK heuristic (default `en` on failure).
 
+## V1.3 Audit Logging (F-Vault-1)
+
+Vault now keeps a **best-effort compliance audit trail** (who / when / what) for
+sensitive operations. It is strictly additive: no existing endpoint, response shape,
+or status code changes.
+
+- **`audit_log` table** (idempotent migration 7): `id, ts, actor, action,
+  resource_type, resource_id, detail, status`.
+- **Audited operations** (`api/audit.py` → `record_audit`): `POST /query`
+  (`query`), `POST /files/upload` (`file.upload`), `DELETE /files/{id}`
+  (`file.delete`), `POST /pipeline/sync` (`pipeline.sync`), and `POST /feedback`
+  (`feedback`).
+- **`GET /audit`** returns records most-recent-first, with optional `action`
+  (exact match) and `limit` (default 100) query filters. When the optional V1.0
+  API-key auth is active (`VAULT_API_KEY` set) this endpoint is protected by it;
+  otherwise it is open like the rest of the API.
+- **Actor resolution**: a configured `VAULT_AUDIT_ACTOR` wins; otherwise the actor
+  is `authenticated` when `VAULT_API_KEY` is active, else `anonymous`.
+- **Best-effort guarantee**: audit writes catch all errors and only log a warning —
+  a failing audit write never blocks or alters the main request (the operation still
+  returns its normal response).
+
