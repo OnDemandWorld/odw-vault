@@ -30,6 +30,7 @@ ODW Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for
 - **Hybrid retrieval** — dense vector + BM25 + Reciprocal Rank Fusion
 - **Citation-strict generation** — gemma4 answers with numbered chunk citations
 - **HTTP API** — FastAPI with 10 endpoints (query, stream, feedback, eval)
+- **Multi-workspace knowledge bases** — optional `workspace` tag for logical isolation of uploads and retrieval (V1.1, fully backward-compatible)
 - **Gradio UI** — chat interface with folder filtering and citation display
 - **Evaluation framework** — question bank, run eval, accuracy reporting
 
@@ -38,7 +39,19 @@ ODW Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for
 ### Python
 - Python 3.11+ (managed via `uv`, venv at `.venv/`)
 
-### External tools (macOS)
+### Platform Support
+
+| Platform | Status (v0.2.x) | Status (v0.3.0) |
+|----------|-----------------|------------------|
+| **macOS** (Apple Silicon / Intel) | ✅ Fully supported | ✅ Native `.dmg` installer |
+| **Linux** (Ubuntu 22.04+ / Debian 12+) | ✅ Supported (manual setup) | ✅ `.deb` + `.AppImage` installer |
+| **Windows** (10/11, x86_64) | ⚠️ WSL2 recommended | ✅ Native `.exe` / `.msi` installer |
+
+> **v0.3.0 note:** The next release will bundle all dependencies into native installers — no Python, no terminal, no manual setup required. See [Next Version Roadmap](#next-version-v030--roadmap) below.
+
+### External tools
+
+#### macOS
 
 | Tool | Purpose | Install method |
 |------|---------|---------------|
@@ -49,10 +62,36 @@ ODW Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for
 | `sf` (Siegfried) | PRONOM format identification | Manual download (see below) |
 | `LibreOffice` *(optional)* | DOCX → PDF conversion for text extraction | `brew install --cask libreoffice` |
 
+#### Linux (Ubuntu / Debian)
+
+| Tool | Purpose | Install method |
+|------|---------|---------------|
+| `uv` | Python package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| `ffmpeg` | Media duration detection | `sudo apt install ffmpeg` |
+| `unar` | Archive extraction | `sudo apt install unar` |
+| `ollama` | Local LLM server | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| `sf` (Siegfried) | PRONOM format identification | Download Linux binary from [releases](https://github.com/richardlehane/siegfried/releases) |
+| `LibreOffice` *(optional)* | DOCX → PDF conversion | `sudo apt install libreoffice` |
+
+#### Windows
+
+| Tool | Purpose | Install method |
+|------|---------|---------------|
+| `uv` | Python package manager | `powershell -c "irm https://astral.sh/uv/install.ps1 \| iex"` |
+| `ffmpeg` | Media duration detection | `winget install ffmpeg` or download from [ffmpeg.org](https://ffmpeg.org/download.html) |
+| `7-Zip` | Archive extraction | `winget install 7zip` |
+| `ollama` | Local LLM server | Download from [ollama.com/download](https://ollama.com/download) |
+| `sf` (Siegfried) | PRONOM format identification | Download Windows binary from [releases](https://github.com/richardlehane/siegfried/releases) |
+| `LibreOffice` *(optional)* | DOCX → PDF conversion | `winget install LibreOffice` |
+
+> **Windows note (v0.2.x):** Native Windows support is experimental. WSL2 (Ubuntu) is recommended for the best experience. Full native Windows support arrives with the v0.3.0 installer.
+
 > **⚠️ Ollama version notice:** `brew install ollama` installs an outdated version (0.13.x) that does **not** support the latest models (e.g. `gemma4:latest`). Use the official install script instead:
 > ```bash
 > curl -fsSL https://ollama.com/install.sh | sh
 > ```
+
+> **Cloud LLM alternative:** Don't want to install Ollama? v0.3.0 supports cloud providers (OpenAI, DeepSeek, Qwen, Gemini, etc.) via API key — no local GPU needed. See [Cloud LLM Provider Support](#1-cloud-llm-provider-support).
 
 ## Quick Start
 
@@ -151,7 +190,7 @@ vault ui
 
 ---
 
-### Option B — Quick install (one-shot script)
+### Option B — Quick install (one-shot script, macOS)
 
 For users who want to get up and running as fast as possible. Copy and paste the entire block:
 
@@ -191,6 +230,86 @@ vault extract && vault summarize && vault chunk && vault embed  # Part 2: RAG
 # ── 8. Launch UI ────────────────────────────────────────────
 vault ui                                # Gradio chat interface at http://localhost:7860
 ```
+
+---
+
+### Option C — Quick install (Linux)
+
+```bash
+# ── 1. System dependencies ──────────────────────────────────
+sudo apt update && sudo apt install -y ffmpeg unar
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.bashrc  # or restart terminal
+
+# ── 2. Ollama ───────────────────────────────────────────────
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &                          # start server in background
+sleep 3
+ollama pull gemma4:latest
+ollama pull qwen3-embedding:8b
+
+# ── 3. Python environment ───────────────────────────────────
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+
+# ── 4. Configuration ────────────────────────────────────────
+cp config.example.toml config.toml
+
+# ── 5. Siegfried ────────────────────────────────────────────
+# Download Linux binary from https://github.com/richardlehane/siegfried/releases
+# Extract and place as ./sf in project root
+chmod +x ./sf
+
+# ── 6. Initialize corpus ────────────────────────────────────
+mkdir -p data/my-corpus
+# → Put your documents in data/my-corpus/ before continuing
+vault init --root ./data/my-corpus
+
+# ── 7. Run pipeline ─────────────────────────────────────────
+vault run-all                           # Part 1: pre-flight
+vault extract && vault summarize && vault chunk && vault embed  # Part 2: RAG
+
+# ── 8. Launch UI ────────────────────────────────────────────
+vault ui                                # Gradio chat interface at http://localhost:7860
+```
+
+---
+
+### Option D — Cloud LLM (no local GPU needed)
+
+If you don't have a powerful GPU or prefer cloud models, skip Ollama entirely:
+
+```bash
+# ── 1. Set your API key ─────────────────────────────────────
+export OPENAI_API_KEY="sk-..."          # or DEEPSEEK_API_KEY, DASHSCOPE_API_KEY, etc.
+
+# ── 2. Python environment (same as above) ───────────────────
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+
+# ── 3. Configure for cloud ──────────────────────────────────
+cp config.example.toml config.toml
+# Edit config.toml:
+#   [llm_provider]
+#   backend = "openai_compatible"
+#   [llm_provider.openai_compatible]
+#   base_url = "https://api.openai.com/v1"
+#   api_key_env = "OPENAI_API_KEY"
+#   [llm_provider.models]
+#   embedding = "text-embedding-3-small"
+#   generation = "gpt-4o"
+
+# ── 4. Initialize and run ───────────────────────────────────
+mkdir -p data/my-corpus
+vault init --root ./data/my-corpus
+vault run-all
+vault extract && vault summarize && vault chunk && vault embed
+vault ui
+```
+
+> **Note:** Cloud LLM support requires v0.3.0. In v0.2.x, Ollama is required for embedding and generation.
 
 ---
 
@@ -283,6 +402,55 @@ vault ui                                # Gradio chat interface at http://localh
 | `query_log` | Query tracking with feedback |
 | `failure` | Error tracking with classification |
 
+## Multi-Workspace Knowledge Bases (V1.1)
+
+Vault supports **multiple logical knowledge bases** ("workspaces") over a single
+shared corpus. Every file carries a `workspace` label; uploads and retrieval can
+be scoped to one workspace so unrelated knowledge bases do not bleed into each
+other's answers.
+
+The feature is **strictly additive and backward-compatible**: every workspace
+parameter is optional, and when omitted Vault behaves exactly as in V1.0 (the
+whole corpus is one implicit `default` workspace). Existing databases gain the
+`file.workspace` column automatically on startup (idempotent migration; existing
+rows backfill to `default`).
+
+**Tag uploads with a workspace** (`POST /files/upload`, optional form field):
+
+```bash
+curl -X POST http://127.0.0.1:8765/files/upload \
+  -F "files=@meeting-notes.md" \
+  -F "workspace=team-a"
+```
+
+**Query a single workspace** (`POST /query` / `POST /query/stream`, optional
+`folder_filter.workspace`, composes with `path_prefix` / `folder_id`):
+
+```bash
+curl -X POST http://127.0.0.1:8765/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "what did we decide?", "folder_filter": {"workspace": "team-a"}}'
+```
+
+Omit `folder_filter.workspace` to search the entire corpus (V1.0 behavior).
+
+**List / filter by workspace:**
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /workspaces` | Distinct workspaces with per-workspace file counts |
+| `GET /files?workspace=team-a` | Files in one workspace |
+| `GET /folders?workspace=team-a` | Folders that contain files in one workspace |
+
+> **⚠️ Logical isolation only.** Workspaces are a filtering layer over one
+> shared SQLite database and one shared Chroma vector store — they are **not** a
+> security boundary or a hard multi-tenancy guarantee. There is no per-workspace
+> authentication, quota, or separate vector collection; a caller that omits the
+> `workspace` parameter (or has DB access) can still see every workspace. Use
+> workspaces to keep unrelated knowledge bases from polluting each other's
+> retrieval, not to enforce access control. Per-workspace collections /
+> databases / RBAC are deferred to a future release.
+
 ## Configuration
 
 Settings live in `config.toml` with multiple Pydantic sub-configs:
@@ -370,6 +538,122 @@ pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
 - **CLAUDE.md** — AI assistant context for this project
 - **Technical Specification Document- Local RAG Pre-Flight Pipeline.md** — Original Part 1 spec
 - **Technical Specification Document- Local RAG Pipeline (Phases 8–14).md** — Part 2 spec
+
+## Next Version (v0.3.0) — Roadmap
+
+The next major release focuses on two pillars: **cloud LLM flexibility** and **cross-platform distribution**.
+
+### 1. Cloud LLM Provider Support
+
+Vault v0.3.0 introduces a unified LLM integration layer based on the **OpenAI-compatible API standard**, allowing users to swap between local Ollama models and mainstream cloud providers by simply editing `config.toml` and setting an API key.
+
+#### Supported Providers (out of the box)
+
+| Provider | `base_url` | Recommended Models | Env Variable |
+|----------|-----------|-------------------|--------------|
+| **OpenAI** | `https://api.openai.com/v1` | `gpt-4o`, `text-embedding-3-small` | `OPENAI_API_KEY` |
+| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat`, `deepseek-reasoner` | `DEEPSEEK_API_KEY` |
+| **Qwen (DashScope)** | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-max`, `text-embedding-v3` | `DASHSCOPE_API_KEY` |
+| **Moonshot** | `https://api.moonshot.cn/v1` | `moonshot-v1-128k` | `MOONSHOT_API_KEY` |
+| **Google Gemini** | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.5-flash` | `GOOGLE_API_KEY` |
+| **Together AI** | `https://api.together.xyz/v1` | `meta-llama/Llama-4-Scout-17B` | `TOGETHER_API_KEY` |
+| **Groq** | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
+| **Ollama (local)** | `http://localhost:11434` | `gemma4:latest`, `qwen3-embedding:8b` | *(none)* |
+
+#### Configuration Example
+
+```toml
+# config.toml — Cloud LLM configuration
+
+[llm_provider]
+# Backend selector: "ollama" (local) | "openai_compatible" (cloud)
+backend = "openai_compatible"
+
+[llm_provider.openai_compatible]
+base_url = "https://api.openai.com/v1"     # Any OpenAI-compatible endpoint
+api_key_env = "OPENAI_API_KEY"             # Read key from environment variable
+# api_key = "sk-..."                       # Or set directly (not recommended)
+
+# Map each pipeline role to a cloud model
+[llm_provider.models]
+embedding = "text-embedding-3-small"       # Embedding model
+generation = "gpt-4o"                      # Answer generation
+summarization = "gpt-4o-mini"              # Document summarization
+contextual_retrieval = "gpt-4o-mini"       # Context augmentation
+reranker = ""                              # Empty = disabled
+```
+
+#### Key Design Decisions
+
+- **OpenAI SDK as unified adapter** — all providers expose an OpenAI-compatible `/v1/chat/completions` and `/v1/embeddings` endpoint; the `openai` Python SDK handles auth, retries, and streaming uniformly.
+- **Per-role model mapping** — embedding, generation, summarization, and contextual retrieval can each use a different provider/model.
+- **Environment variable for secrets** — API keys are read from env vars by default (`api_key_env`), never committed to config files.
+- **Backward compatible** — setting `backend = "ollama"` preserves the existing local-only behavior with zero changes.
+- **Embedding dimension awareness** — switching embedding models requires re-running `vault embed` to rebuild the Chroma vector store (different models produce different vector dimensions).
+
+---
+
+### 2. Cross-Platform Desktop Packaging
+
+Vault v0.3.0 will ship as **native installers** for all three major desktop platforms, so users can install and run Vault without Python, terminal, or any manual setup.
+
+#### Target Platforms
+
+| Platform | Installer Format | Architecture | Minimum OS |
+|----------|-----------------|--------------|------------|
+| **macOS** | `.dmg` (drag-to-install) | Apple Silicon (ARM64) + Intel (x86_64) | macOS 13 Ventura |
+| **Windows** | `.exe` (NSIS installer) + `.msi` | x86_64 | Windows 10 (1809+) |
+| **Linux** | `.deb` + `.AppImage` | x86_64 + ARM64 | Ubuntu 22.04 / Debian 12 |
+
+#### What's Bundled
+
+Each installer packages the complete runtime so users need **zero external dependencies**:
+
+```
+ODW Vault.app / ODW Vault.exe / odv-vault.AppImage
+├── Python 3.11 runtime (embedded, no system Python needed)
+├── All Python dependencies (pip packages frozen)
+├── Siegfried binary (format identification)
+├── ffmpeg / ffprobe (media processing)
+├── SQLite + Chroma (data layer)
+├── Gradio UI server (auto-launches browser)
+└── config.toml (first-run wizard generates this)
+```
+
+#### User Experience
+
+1. **Download** the installer for your platform from the releases page
+2. **Install** — standard OS installer flow (drag to Applications / Next-Next-Finish / `dpkg -i`)
+3. **First launch** — a setup wizard guides you through:
+   - Choose corpus folder (your document directory)
+   - Choose LLM backend: **Local (Ollama)** or **Cloud (API key)**
+   - If cloud: select provider, paste API key, pick models
+   - If local: auto-detect Ollama or offer to download it
+4. **Pipeline runs automatically** — documents are indexed in the background with a progress indicator
+5. **Chat UI opens in browser** — `http://localhost:7860`
+
+#### Technical Approach
+
+| Concern | Solution |
+|---------|----------|
+| Python bundling | [PyInstaller](https://pyinstaller.org) or [Briefcase](https://beeware.org/project/projects/tools/briefcase/) (BeeWare) |
+| macOS code signing | Apple Developer ID + notarization (required for Gatekeeper) |
+| Windows signing | EV code-signing certificate (avoids SmartScreen warnings) |
+| Auto-update | [Sparkle](https://sparkle-project.org/) (macOS) / [NSIS + GitHub Releases](https://nsis.sourceforge.io/) (Win) / AppImage self-update (Linux) |
+| Ollama bundling | Optional — installer detects existing Ollama; if absent, offers to download the official binary |
+| Data directory | `~/Library/Application Support/ODVVault/` (macOS), `%APPDATA%/ODVVault/` (Win), `~/.local/share/odv-vault/` (Linux) |
+
+#### Build Pipeline (CI/CD)
+
+```
+GitHub Actions workflow:
+├── macOS job   → build .dmg (ARM64 + x86_64 universal binary)
+├── Windows job → build .exe + .msi (x86_64)
+├── Linux job   → build .deb + .AppImage (x86_64 + ARM64)
+└── Release job → upload to GitHub Releases + auto-update manifest
+```
+
+---
 
 ## Pending Work
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import chromadb
 import ollama
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -700,13 +700,25 @@ def feedback(req: FeedbackRequest):
 
 
 @app.get("/folders", response_model=list[FolderNode])
-def list_folders():
+def list_folders(workspace: str | None = None):
     db = _get_db()
 
-    rows = list(db.query(
-        "SELECT id, rel_path, name, inferred_category, inferred_label "
-        "FROM folder WHERE excluded = 0 ORDER BY rel_path"
-    ))
+    # Optional workspace scoping (V1.1 M4, additive): when provided, keep only
+    # folders that contain at least one file in the given workspace. Omitted =>
+    # all non-excluded folders (V1.0 behavior).
+    if workspace is not None:
+        rows = list(db.query(
+            "SELECT id, rel_path, name, inferred_category, inferred_label "
+            "FROM folder WHERE excluded = 0 "
+            "AND EXISTS (SELECT 1 FROM file f WHERE f.folder_id = folder.id "
+            "AND f.workspace = ?) ORDER BY rel_path",
+            [workspace],
+        ))
+    else:
+        rows = list(db.query(
+            "SELECT id, rel_path, name, inferred_category, inferred_label "
+            "FROM folder WHERE excluded = 0 ORDER BY rel_path"
+        ))
 
     # Build tree
     node_map: dict[int, FolderNode] = {}
@@ -998,9 +1010,18 @@ def query_history(
 
 
 @app.post("/files/upload", response_model=FileUploadResponse)
-async def upload_files(files: list[UploadFile] = File(...)):
-    """Upload files to the corpus directory."""
+async def upload_files(
+    files: list[UploadFile] = File(...),
+    workspace: str | None = Form(None),
+):
+    """Upload files to the corpus directory.
+
+    The optional ``workspace`` form field tags every newly created file row
+    with a workspace label (defaulting to ``default`` when omitted). The
+    response shape is unchanged from V1.0.
+    """
     cfg = _load_config()
+    workspace_label = workspace if workspace else "default"
     corpus_root = cfg.corpus_root_path
     corpus_root.mkdir(parents=True, exist_ok=True)
 
@@ -1071,6 +1092,7 @@ async def upload_files(files: list[UploadFile] = File(...)):
                 "triage_status": "pending",
                 "is_dup_primary": 1,
                 "excluded": 0,
+                "workspace": workspace_label,
             })
             db.conn.commit()
 
@@ -1162,6 +1184,7 @@ def list_files(
     size: int = Query(20, ge=1, le=100),
     folder_id: int | None = None,
     status: str | None = None,
+    workspace: str | None = None,
 ):
     """List files with pagination and optional filtering."""
     db = _get_db()
@@ -1173,6 +1196,11 @@ def list_files(
     if folder_id is not None:
         where_clauses.append("f.folder_id = ?")
         params.append(folder_id)
+
+    # Optional workspace filter (V1.1 M4, additive). Omitted => all files.
+    if workspace is not None:
+        where_clauses.append("f.workspace = ?")
+        params.append(workspace)
 
     if status is not None:
         if status == "indexed":
@@ -1246,6 +1274,33 @@ def list_files(
     ]
 
     return FileListPage(items=items, total=total, page=page, size=size)
+
+
+# ---------------------------------------------------------------------------
+# GET /workspaces
+# ---------------------------------------------------------------------------
+
+
+@app.get("/workspaces")
+def list_workspaces():
+    """List distinct workspaces with their file counts (V1.1 M4, additive).
+
+    Workspaces are a logical isolation layer over the shared corpus: every
+    file row carries a ``workspace`` label (defaulting to ``default``). This
+    endpoint reports which labels exist and how many files each holds.
+    """
+    db = _get_db()
+
+    rows = list(db.query(
+        "SELECT workspace, COUNT(*) AS file_count "
+        "FROM file GROUP BY workspace ORDER BY workspace"
+    ))
+
+    workspaces = [
+        {"workspace": r["workspace"], "file_count": r["file_count"]}
+        for r in rows
+    ]
+    return {"workspaces": workspaces, "total": len(workspaces)}
 
 
 # ---------------------------------------------------------------------------

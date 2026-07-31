@@ -109,6 +109,30 @@ The solution is **inherently multi-tenant by design** because:
 2. The system never hard-codes any specific document content
 3. Configuration (models, thresholds, formats) lives in a single editable file
 
+### Multiple knowledge bases on one deployment (workspaces, V1.1)
+
+Beyond full per-client deployments, a single Vault instance can also host
+**multiple logical knowledge bases** ("workspaces") inside one shared corpus.
+Documents are tagged with a `workspace` label on upload (defaulting to
+`default`), and questions can be scoped to one workspace so unrelated topics do
+not bleed into each other's answers — for example, separating two internal teams
+or two product lines without standing up two servers.
+
+This is deliberately a **lightweight, logical** isolation layer, not a hard
+multi-tenancy boundary:
+
+| | Per-client deployment | Workspaces (V1.1) |
+|---|---|---|
+| Isolation strength | Physical (separate DB + vector store) | Logical (one DB, filtered by label) |
+| Access control / auth | At the deployment boundary | None — not a security boundary |
+| Setup cost | One server per client | Zero — a tag on existing data |
+| Best for | External clients, hard isolation | Internal teams, topic separation |
+
+When no workspace is specified, Vault searches the whole corpus exactly as
+before, so the feature is fully backward-compatible with existing deployments.
+Hard multi-tenancy (per-workspace collections, RBAC, quotas) is reserved for a
+future release.
+
 ### What changes per client
 
 | Item | What it means |

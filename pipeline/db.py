@@ -510,6 +510,13 @@ MIGRATIONS = [
         END;
         """,
     ),
+    (
+        5,
+        "file.workspace column for multi-workspace knowledge base isolation",
+        """
+        CREATE INDEX IF NOT EXISTS idx_file_workspace ON file(workspace);
+        """,
+    ),
 ]
 
 
@@ -550,6 +557,14 @@ def migrate(db: Database) -> None:
                     db.conn.commit()
                 if version == 3:
                     _add_column_if_missing(db, "query_log", "conversation_id", "TEXT")
+                    db.conn.commit()
+                if version == 5:
+                    # Adds file.workspace; existing rows backfill to 'default'
+                    # via the NOT NULL DEFAULT clause. Must run before the
+                    # executescript below creates idx_file_workspace on it.
+                    _add_column_if_missing(
+                        db, "file", "workspace", "TEXT NOT NULL DEFAULT 'default'"
+                    )
                     db.conn.commit()
                 db.executescript(sql)
                 db.conn.execute(

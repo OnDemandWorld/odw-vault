@@ -9,6 +9,7 @@ class FolderFilter(BaseModel):
     path_prefix: str | None = None
     folder_id: int | None = None
     inferred_category: str | None = None
+    workspace: str | None = None
 
 
 class QueryRequest(BaseModel):
