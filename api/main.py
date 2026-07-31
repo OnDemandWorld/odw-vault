@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 import chromadb
 import ollama
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
@@ -66,6 +68,24 @@ def _load_config():
 
 
 app = FastAPI(title="ODW.ai Vault RAG")
+
+# ---------------------------------------------------------------------------
+# CORS (browser clients such as the Loop canvas call Vault cross-origin)
+# ---------------------------------------------------------------------------
+# Origins are configurable via VAULT_CORS_ORIGINS (comma-separated list, or "*"
+# to allow any origin). Defaults to "*" for local single-host deployments.
+_cors_origins_env = os.environ.get("VAULT_CORS_ORIGINS", "*").strip()
+if _cors_origins_env == "*":
+    _cors_allow_origins = ["*"]
+else:
+    _cors_allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allow_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # File watcher (opt-in via config [watcher] enabled = true)
