@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 import datetime
 import hmac
+import io
 import json
 import logging
 import os
@@ -19,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
-from api.audit import record_audit
+from api.audit import query_audit_records, record_audit
 from api.schemas import (
     Citation,
     ConversationSummary,
@@ -1460,25 +1462,80 @@ def list_audit(
     any existing endpoint.
     """
     db = _get_db()
-
-    conditions: list[str] = []
-    params: list = []
-    if action:
-        conditions.append("action = ?")
-        params.append(action)
-    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
-
-    rows = list(
-        db.query(
-            f"""SELECT id, ts, actor, action, resource_type, resource_id, detail, status
-                FROM audit_log {where_clause}
-                ORDER BY ts DESC, id DESC
-                LIMIT ?""",
-            [*params, limit],
-        )
-    )
-
+    rows = query_audit_records(db, action=action, limit=limit)
     return {"items": rows, "total": len(rows)}
+
+
+# ---------------------------------------------------------------------------
+# GET /audit/export (V1.4 F-3')
+# ---------------------------------------------------------------------------
+
+# CSV column order for the compliance audit report export.
+_AUDIT_EXPORT_COLUMNS = [
+    "id",
+    "ts",
+    "actor",
+    "action",
+    "resource_type",
+    "resource_id",
+    "detail",
+    "status",
+]
+
+
+@app.get("/audit/export")
+def export_audit(
+    fmt: str = Query("json", alias="format"),
+    start: str | None = None,
+    end: str | None = None,
+    actor: str | None = None,
+    action: str | None = None,
+    limit: int = Query(1000, ge=1, le=10000),
+):
+    """Export audit-log records as a compliance report (V1.4 F-3').
+
+    Strictly additive — ``GET /audit`` is unchanged. Query params:
+
+    - ``format``: ``json`` (default) or ``csv``.
+    - ``start`` / ``end``: inclusive ISO-8601 time bounds on ``ts``.
+    - ``actor`` / ``action``: exact-match filters.
+    - ``limit``: max rows (default 1000).
+
+    JSON returns ``{items, total, filters}``. CSV is built with the stdlib
+    ``csv`` module (columns ``id,ts,actor,action,resource_type,resource_id,
+    detail,status``) and served as an attachment (``Content-Type: text/csv`` +
+    ``Content-Disposition: attachment``). Protected by the shared API-key auth
+    middleware exactly like ``GET /audit`` (protected when ``VAULT_API_KEY`` is
+    active, otherwise open).
+    """
+    if fmt not in ("csv", "json"):
+        raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
+
+    db = _get_db()
+    rows = query_audit_records(
+        db, start=start, end=end, actor=actor, action=action, limit=limit
+    )
+    filters = {
+        "start": start,
+        "end": end,
+        "actor": actor,
+        "action": action,
+        "limit": limit,
+    }
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(_AUDIT_EXPORT_COLUMNS)
+        for row in rows:
+            writer.writerow([row[col] for col in _AUDIT_EXPORT_COLUMNS])
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="audit_export.csv"'},
+        )
+
+    return {"items": rows, "total": len(rows), "filters": filters}
 
 
 # ---------------------------------------------------------------------------

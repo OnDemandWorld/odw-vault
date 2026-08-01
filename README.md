@@ -740,3 +740,38 @@ or status code changes.
   a failing audit write never blocks or alters the main request (the operation still
   returns its normal response).
 
+## V1.4 Audit Report Export (F-3')
+
+Vault can now **export the compliance audit trail** as a machine-readable report
+for SOC2 / GDPR evidence. The feature is strictly additive: `GET /audit` is
+unchanged, and the export reuses the same audit read path (same columns and
+most-recent-first ordering), extended with time-range and actor filtering.
+
+- **`GET /audit/export`** query parameters:
+  - `format=csv|json` (default `json`)
+  - `start` / `end` — inclusive ISO-8601 time bounds on `ts`
+    (e.g. `2026-01-01` or `2026-01-01T00:00:00`)
+  - `actor` — exact-match actor filter
+  - `action` — exact-match action filter (e.g. `query`, `file.upload`)
+  - `limit` — max rows (default `1000`)
+- **JSON** returns `{items, total, filters}` where `filters` echoes the applied
+  filters.
+- **CSV** is built with the Python standard library (`csv` / `io.StringIO`) with
+  columns `id,ts,actor,action,resource_type,resource_id,detail,status`, served as
+  a download (`Content-Type: text/csv` + `Content-Disposition: attachment`). No new
+  dependencies are introduced.
+- **Auth**: protected by the same shared API-key middleware as `GET /audit` —
+  required when `VAULT_API_KEY` is active, otherwise open.
+
+```bash
+# JSON report for January 2026, actor=alice
+curl "http://127.0.0.1:8765/audit/export?format=json&start=2026-01-01&end=2026-02-01&actor=alice"
+
+# CSV download of all file.upload events (saved to audit.csv)
+curl -o audit.csv "http://127.0.0.1:8765/audit/export?format=csv&action=file.upload"
+
+# With API-key auth active
+curl -H "Authorization: Bearer $VAULT_API_KEY" \
+  "http://127.0.0.1:8765/audit/export?format=csv"
+```
+
