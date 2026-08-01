@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import datetime
 import hmac
@@ -40,6 +41,7 @@ from api.schemas import (
     QueryRequest,
     QueryResponse,
 )
+from api.tracing import TRACE_HEADER, install_trace_id_filter, new_trace_id, trace_id_var
 from pipeline.config import load_app_config
 from pipeline.db import migrate, open_db
 from rag.filters import resolve_folder_filter
@@ -123,6 +125,35 @@ async def _require_api_key(request: Request, call_next):
         ):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Distributed tracing (V1.5 F-3) — additive, best-effort
+# ---------------------------------------------------------------------------
+# Reads an inbound ``X-Trace-Id`` header (generating a UUID4 when absent),
+# echoes it back on the response so callers can correlate, and binds it into
+# the logging context for the request lifetime (VT1 + VT2). It never alters a
+# business response body or status code — only the extra response header and
+# the ``trace_id`` log field are added. Defined after the API-key middleware
+# so it is the outermost user middleware and the trace id is bound before auth
+# runs. The filter is attached to this module's logger so existing endpoint
+# logs (``logger.*``) carry ``trace_id`` with no per-call changes.
+
+install_trace_id_filter(logger)
+
+
+@app.middleware("http")
+async def _bind_trace_id(request: Request, call_next):
+    trace_id = request.headers.get(TRACE_HEADER) or new_trace_id()
+    token = trace_id_var.set(trace_id)
+    try:
+        response = await call_next(request)
+        # Best-effort header echo — never break the response.
+        with contextlib.suppress(Exception):
+            response.headers[TRACE_HEADER] = trace_id
+        return response
+    finally:
+        trace_id_var.reset(token)
 
 
 def _resolve_actor() -> str:

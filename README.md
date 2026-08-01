@@ -775,3 +775,33 @@ curl -H "Authorization: Bearer $VAULT_API_KEY" \
   "http://127.0.0.1:8765/audit/export?format=csv"
 ```
 
+## V1.5 Distributed Tracing (F-3)
+
+Vault now participates in **cross-service distributed tracing**. The feature is
+strictly additive and best-effort: no business response body or status code is
+changed — only an extra response header and a `trace_id` log field are added.
+
+- **`X-Trace-Id` request header**: callers (Desk, Loop, Recap, or any client)
+  may send an `X-Trace-Id` header to correlate a request across services. When
+  the header is absent, Vault generates a fresh UUID4 for the request.
+- **`X-Trace-Id` response header**: the same id is echoed back on every
+  response so callers can associate their logs with Vault's.
+- **Log correlation**: the id is bound into the logging context for the request
+  lifetime (via a `contextvars.ContextVar` + a `logging.Filter` — the stdlib
+  equivalent of `structlog.contextvars.bind_contextvars`). Existing endpoint
+  logs emitted by the API service carry a `trace_id` field automatically, with
+  no per-call code changes. Add `%(trace_id)s` to a log formatter to surface it.
+
+The tracing middleware is the outermost user middleware (it runs before the
+optional V1.0 API-key auth), mirrors the existing middleware mechanism, and
+never breaks a request: trace handling failures are suppressed so the business
+response is always returned.
+
+```bash
+# Send a trace id; the same id is echoed back in the response header
+curl -i -H "X-Trace-Id: my-request-123" "http://127.0.0.1:8765/health"
+
+# Omit the header; Vault generates a UUID4 and returns it in the header
+curl -i "http://127.0.0.1:8765/health"
+```
+
