@@ -41,6 +41,7 @@ from api.schemas import (
     QueryRequest,
     QueryResponse,
 )
+from api.spans import get_current_span, span
 from api.tracing import TRACE_HEADER, install_trace_id_filter, new_trace_id, trace_id_var
 from pipeline.config import load_app_config
 from pipeline.db import migrate, open_db
@@ -333,6 +334,16 @@ def metrics():
 
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest):
+    # V1.6 F-2 (VS3): best-effort root span around the whole handler. The
+    # context manager records status="error" and re-raises on failure, so no
+    # business response body or status code is ever changed.
+    with span("vault.query") as query_span:
+        query_span.set_attr("user", req.user)
+        query_span.set_attr("has_folder_filter", req.folder_filter is not None)
+        return _query_impl(req)
+
+
+def _query_impl(req: QueryRequest):
     cfg = _load_config()
     db = _get_db()
 
@@ -378,20 +389,24 @@ def query(req: QueryRequest):
 
     # Retrieve
     t0 = time.monotonic()
-    try:
-        hits, retrieval_metrics = retrieve(
-            query=req.query,
-            db=db,
-            chroma_client=None,  # retrieve() opens its own client from chroma_path
-            chroma_path=chroma_path,
-            cfg=cfg,
-            folder_filter=folder_filter_dict,
-            top_k_chunks=req.top_k_chunks,
-            use_reranker=req.use_reranker,
-            use_augmentation=req.use_augmentation,
-        )
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from None
+    with span("vault.query.retrieve") as retrieve_span:
+        try:
+            hits, retrieval_metrics = retrieve(
+                query=req.query,
+                db=db,
+                chroma_client=None,  # retrieve() opens its own client from chroma_path
+                chroma_path=chroma_path,
+                cfg=cfg,
+                folder_filter=folder_filter_dict,
+                top_k_chunks=req.top_k_chunks,
+                use_reranker=req.use_reranker,
+                use_augmentation=req.use_augmentation,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from None
+        retrieve_span.set_attr("n_chunks", len(hits))
+        retrieve_span.set_attr("retrieval_ms", retrieval_metrics.get("retrieval_ms"))
+        retrieve_span.set_attr("query_lang", retrieval_metrics.get("query_lang"))
 
     # Generate answer
     # Handle conversation history
@@ -409,16 +424,25 @@ def query(req: QueryRequest):
         if history and history[-1]["role"] == "user" and history[-1]["content"] == req.query:
             history = history[:-1]
 
-    gen_result = generate_answer(
-        query=req.query,
-        hits=hits,
-        cfg=cfg,
-        history=history,
-    )
+    with span("vault.query.generate") as generate_span:
+        gen_result = generate_answer(
+            query=req.query,
+            hits=hits,
+            cfg=cfg,
+            history=history,
+        )
+        generate_span.set_attr("generation_ms", gen_result.get("generation_ms"))
+        generate_span.set_attr("model", gen_result.get("model"))
+        generate_span.set_attr("refused", gen_result.get("refused", False))
 
     total_ms = round((time.monotonic() - t0) * 1000)
     retrieval_ms = retrieval_metrics.get("retrieval_ms", None)
     generation_ms = gen_result.get("generation_ms", None)
+
+    # Record the overall latency on the root handler span (best-effort).
+    root_span = get_current_span()
+    if root_span is not None:
+        root_span.set_attr("total_ms", total_ms)
 
     # Build citations
     citations = []
@@ -1092,6 +1116,19 @@ async def upload_files(
     with a workspace label (defaulting to ``default`` when omitted). The
     response shape is unchanged from V1.0.
     """
+    # V1.6 F-2 (VS3): best-effort root span around the whole handler. The
+    # context manager records status="error" and re-raises on failure, so no
+    # business response body or status code is ever changed.
+    with span("vault.files.upload") as upload_span:
+        upload_span.set_attr("n_files", len(files))
+        upload_span.set_attr("workspace", workspace if workspace else "default")
+        return await _upload_files_impl(files, workspace)
+
+
+async def _upload_files_impl(
+    files: list[UploadFile],
+    workspace: str | None,
+):
     cfg = _load_config()
     workspace_label = workspace if workspace else "default"
     corpus_root = cfg.corpus_root_path
@@ -1190,6 +1227,12 @@ async def upload_files(
         except Exception as e:
             logger.error("Failed to upload %s: %s", upload_file.filename, e)
             failed.append(upload_file.filename or "unnamed")
+
+    # Record the outcome on the root handler span (best-effort).
+    upload_span = get_current_span()
+    if upload_span is not None:
+        upload_span.set_attr("uploaded", uploaded)
+        upload_span.set_attr("failed", len(failed))
 
     return FileUploadResponse(uploaded=uploaded, failed=failed)
 

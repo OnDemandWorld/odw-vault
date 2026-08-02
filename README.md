@@ -805,3 +805,46 @@ curl -i -H "X-Trace-Id: my-request-123" "http://127.0.0.1:8765/health"
 curl -i "http://127.0.0.1:8765/health"
 ```
 
+## V1.6 Distributed Tracing Spans (F-2)
+
+Building on the V1.5 `X-Trace-Id` propagation, Vault now records **lightweight
+tracing spans** for request handling. The feature is strictly additive and
+best-effort: no business response body or status code is changed — spans are
+recorded and exported alongside the normal response, and any tracing/export
+failure is suppressed so it can never break a request.
+
+- **Span model** (`api/spans.py`): each span carries
+  `name / trace_id / span_id / parent_span_id / start_ms / duration_ms / attrs / status`.
+  A `contextvars` span stack gives automatic parent/child nesting — child spans
+  reuse the current `trace_id` (the V1.5 `trace_id_var`) and auto-parent to the
+  innermost active span.
+- **Instrumented endpoints**: `POST /query` (root span `vault.query` with child
+  spans `vault.query.retrieve` and `vault.query.generate`, recording
+  retrieval/generation attributes such as `n_chunks`, `retrieval_ms`,
+  `generation_ms`, `model`, `total_ms`) and `POST /files/upload` (root span
+  `vault.files.upload`, recording `n_files`, `workspace`, `uploaded`, `failed`).
+- **Sampling**: `TRACE_SAMPLE_RATE` (env, default `1.0`, clamped to `[0, 1]`).
+  An unsampled root span is a no-op and its children inherit the no-op decision,
+  so nothing is recorded or exported for an unsampled trace.
+- **Exporters**: `TRACE_EXPORTER` (env, default `console`):
+  - `console` — logs each span dict via the `api.spans` logger (default).
+  - `otlp` — best-effort OTLP/HTTP POST to `OTLP_ENDPOINT` (short timeout,
+    standard-library `urllib` only); any failure degrades silently.
+  - `none` — disables export.
+
+| Env variable | Default | Purpose |
+|--------------|---------|---------|
+| `TRACE_SAMPLE_RATE` | `1.0` | Fraction of root traces to sample (`0`–`1`) |
+| `TRACE_EXPORTER` | `console` | `console` \| `otlp` \| `none` |
+| `OTLP_ENDPOINT` | *(empty)* | OTLP/HTTP collector URL (used when `TRACE_EXPORTER=otlp`) |
+
+Defaults are backward-compatible (full sampling, console export). To forward
+spans to an OTLP collector (Jaeger/Tempo), set:
+
+```bash
+export TRACE_EXPORTER=otlp
+export OTLP_ENDPOINT="http://localhost:4318/v1/traces"
+# Optional: sample 10% of traces
+export TRACE_SAMPLE_RATE=0.1
+```
+
