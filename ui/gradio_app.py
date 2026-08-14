@@ -21,13 +21,19 @@ File organization:
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
+import time
+import uuid
 from pathlib import Path
 
 import gradio as gr
 import ollama
+from fastapi import Request  # module-level on purpose: FastAPI resolves the string
+# annotation `request: Request` (PEP 563) of routes defined inside launch_ui()
+# from module globals — a local-only import makes every such route 422.
 
 from pipeline.config import load_app_config
 from pipeline.db import open_db
@@ -108,6 +114,289 @@ def _check_ollama() -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Multi-provider LLM registry — user-configurable models via Settings UI
+#
+# Provider entries live in llm_providers.json (project root, gitignored —
+# holds API keys). Three wire protocols are supported:
+#   "ollama"    — native Ollama /api/chat (NDJSON streaming)
+#   "openai"    — OpenAI-compatible /chat/completions (covers OpenAI, DeepSeek,
+#                  Qwen/DashScope, Moonshot, GLM, Gemini-compat, Groq, Together,
+#                  Mistral, xAI, vLLM, LM Studio, Ollama Cloud, ...)
+#   "anthropic" — native Claude /v1/messages API
+# All calls use httpx directly, so no extra SDK dependencies are needed.
+# ---------------------------------------------------------------------------
+
+_PROVIDERS_FILE = Path(__file__).resolve().parent.parent / "llm_providers.json"
+
+_PROVIDER_PROTOCOLS = [
+    {"value": "openai", "label": "OpenAI-compatible"},
+    {"value": "ollama", "label": "Ollama (local)"},
+    {"value": "anthropic", "label": "Anthropic (Claude)"},
+]
+
+_PROVIDER_PRESETS = [
+    {"key": "openai", "label": "OpenAI", "protocol": "openai",
+     "base_url": "https://api.openai.com/v1", "model": "gpt-4o"},
+    {"key": "deepseek", "label": "DeepSeek", "protocol": "openai",
+     "base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
+    {"key": "qwen", "label": "Qwen · DashScope", "protocol": "openai",
+     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-max"},
+    {"key": "moonshot", "label": "Moonshot Kimi", "protocol": "openai",
+     "base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-128k"},
+    {"key": "zhipu", "label": "Zhipu GLM", "protocol": "openai",
+     "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-plus"},
+    {"key": "gemini", "label": "Google Gemini", "protocol": "openai",
+     "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-2.5-flash"},
+    {"key": "groq", "label": "Groq", "protocol": "openai",
+     "base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile"},
+    {"key": "together", "label": "Together AI", "protocol": "openai",
+     "base_url": "https://api.together.xyz/v1", "model": "meta-llama/Llama-4-Scout-17B-16E-Instruct"},
+    {"key": "mistral", "label": "Mistral", "protocol": "openai",
+     "base_url": "https://api.mistral.ai/v1", "model": "mistral-large-latest"},
+    {"key": "xai", "label": "xAI Grok", "protocol": "openai",
+     "base_url": "https://api.x.ai/v1", "model": "grok-3"},
+    {"key": "anthropic", "label": "Anthropic Claude", "protocol": "anthropic",
+     "base_url": "https://api.anthropic.com", "model": "claude-sonnet-4-20250514"},
+    {"key": "ollama", "label": "Ollama (local)", "protocol": "ollama",
+     "base_url": "http://localhost:11434", "model": "gemma4:latest"},
+    {"key": "lmstudio", "label": "LM Studio (local)", "protocol": "openai",
+     "base_url": "http://localhost:1234/v1", "model": ""},
+    {"key": "custom", "label": "Custom / Self-hosted", "protocol": "openai",
+     "base_url": "", "model": ""},
+]
+
+
+def _load_provider_registry() -> dict:
+    """Load (or seed) the provider registry from llm_providers.json."""
+    if _PROVIDERS_FILE.exists():
+        try:
+            data = json.loads(_PROVIDERS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("providers"), list):
+                return data
+        except Exception:
+            logger.warning("Failed to parse llm_providers.json; reseeding", exc_info=True)
+    return _seed_default_registry()
+
+
+def _seed_default_registry() -> dict:
+    """Create the default registry from config.toml generation settings."""
+    entry = {
+        "id": str(uuid.uuid4())[:8],
+        "name": "Local Ollama",
+        "protocol": "ollama",
+        "base_url": _ollama_host,
+        "api_key": "",
+        "model": "gemma4:latest",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if _cfg is not None:
+        gen = getattr(_cfg.models, "generation", None)
+        ep = getattr(gen, "endpoint", None)
+        if ep and getattr(ep, "host", ""):
+            entry["base_url"] = ep.host
+            entry["api_key"] = getattr(ep, "api_key", "") or ""
+            if "ollama.com" in ep.host:
+                entry["name"] = "Ollama Cloud"
+        if gen and getattr(gen, "name", ""):
+            entry["model"] = gen.name
+    reg = {"version": 1, "active_id": entry["id"], "providers": [entry]}
+    _save_provider_registry(reg)
+    return reg
+
+
+def _save_provider_registry(reg: dict) -> None:
+    try:
+        _PROVIDERS_FILE.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+    except Exception:
+        logger.error("Failed to write llm_providers.json", exc_info=True)
+
+
+def _mask_key(key: str) -> str:
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "\u2022\u2022\u2022"
+    return key[:4] + "\u2022\u2022\u2022" + key[-2:]
+
+
+def _get_active_provider() -> dict | None:
+    """Resolve the currently active provider entry (or None on misconfig)."""
+    reg = _load_provider_registry()
+    active_id = reg.get("active_id")
+    for p in reg.get("providers", []):
+        if p.get("id") == active_id:
+            return p
+    providers = reg.get("providers", [])
+    return providers[0] if providers else None
+
+
+def _provider_is_local(base_url: str) -> bool:
+    host = (base_url or "").lower()
+    return "://127.0.0.1" in host or "://localhost" in host or host.startswith("http://192.168.")
+
+
+def _provider_request_args(entry: dict) -> tuple:
+    """Return (base_url, headers) for registry/health calls per protocol."""
+    protocol = entry.get("protocol", "ollama")
+    base = (entry.get("base_url") or "").rstrip("/")
+    api_key = entry.get("api_key") or ""
+    headers = {"Content-Type": "application/json"}
+    if protocol == "anthropic":
+        if api_key:
+            headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return base, headers
+
+
+def _provider_chat_stream(
+    entry: dict,
+    messages: list[dict],
+    *,
+    temperature: float = 0.5,
+    top_p: float = 0.95,
+    top_k: int = 64,
+):
+    """Stream chat tokens from any supported protocol. Yields token strings."""
+    import httpx
+
+    protocol = entry.get("protocol", "ollama")
+    base, headers = _provider_request_args(entry)
+    model = entry["model"]
+
+    if protocol == "ollama":
+        url = f"{base}/api/chat"
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": {"temperature": temperature, "top_p": top_p, "top_k": top_k},
+        }
+    elif protocol == "anthropic":
+        url = f"{base}/v1/messages"
+        system_text = "\n".join(m["content"] for m in messages if m["role"] == "system")
+        chat_msgs = [m for m in messages if m["role"] != "system"]
+        payload = {
+            "model": model,
+            "messages": chat_msgs,
+            "stream": True,
+            "max_tokens": 8192,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if system_text:
+            payload["system"] = system_text
+    else:  # openai-compatible
+        url = f"{base}/chat/completions"
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+
+    timeout = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
+    with httpx.Client(trust_env=not _provider_is_local(base), timeout=timeout) as client:
+        with client.stream("POST", url, headers=headers, json=payload) as resp:
+            if resp.status_code >= 400:
+                body = resp.read().decode("utf-8", "replace")[:300]
+                raise RuntimeError(f"Provider HTTP {resp.status_code}: {body}")
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                if protocol == "ollama":
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    tok = (obj.get("message") or {}).get("content") or ""
+                    if tok:
+                        yield tok
+                else:
+                    if not line.startswith("data:"):
+                        continue  # skip "event:" lines etc.
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except Exception:
+                        continue
+                    if protocol == "anthropic":
+                        if obj.get("type") == "content_block_delta":
+                            tok = (obj.get("delta") or {}).get("text") or ""
+                            if tok:
+                                yield tok
+                    else:
+                        choices = obj.get("choices") or [{}]
+                        tok = ((choices[0].get("delta") or {}).get("content")) or ""
+                        if tok:
+                            yield tok
+
+
+def _provider_test(entry: dict) -> tuple[bool, str]:
+    """Health-check a provider entry. Returns (ok, human-readable detail)."""
+    import httpx
+
+    protocol = entry.get("protocol", "ollama")
+    base, headers = _provider_request_args(entry)
+    if not base:
+        return False, "Base URL is empty"
+    url = {
+        "ollama": f"{base}/api/tags",
+        "anthropic": f"{base}/v1/models?limit=20",
+    }.get(protocol, f"{base}/models")
+    started = time.time()
+    try:
+        with httpx.Client(trust_env=not _provider_is_local(base), timeout=15.0) as client:
+            r = client.get(url, headers=headers)
+        latency = int((time.time() - started) * 1000)
+        if r.status_code >= 400:
+            return False, f"HTTP {r.status_code}: {r.text[:200]}"
+        models = _parse_model_list(protocol, r.text)
+        n = len(models)
+        hint = f", {n} models visible" if n else ""
+        return True, f"Connected in {latency} ms{hint}"
+    except Exception as exc:
+        return False, str(exc)[:200]
+
+
+def _parse_model_list(protocol: str, body: str) -> list[str]:
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return []
+    if protocol == "ollama":
+        return [m.get("name", "") for m in obj.get("models", []) if m.get("name")]
+    data = obj.get("data", [])
+    return [m.get("id", "") for m in data if m.get("id")]
+
+
+def _provider_list_models(entry: dict) -> list[str]:
+    """List model IDs advertised by a provider endpoint."""
+    import httpx
+
+    protocol = entry.get("protocol", "ollama")
+    base, headers = _provider_request_args(entry)
+    if not base:
+        return []
+    url = {
+        "ollama": f"{base}/api/tags",
+        "anthropic": f"{base}/v1/models?limit=100",
+    }.get(protocol, f"{base}/models")
+    try:
+        with httpx.Client(trust_env=not _provider_is_local(base), timeout=15.0) as client:
+            r = client.get(url, headers=headers)
+        if r.status_code >= 400:
+            return []
+        return _parse_model_list(protocol, r.text)
+    except Exception:
+        return []
+
+
 def _check_chroma() -> tuple[bool, str]:
     try:
         import chromadb
@@ -140,24 +429,23 @@ def _stream_tokens(query: str, hits: list[Hit]):
     if system_prefix:
         system_content = f"{system_prefix}\n{system_content}"
 
-    model_name = _cfg.models.generation.name
-    client = _make_client()
+    provider = _get_active_provider()
+    if provider is None:
+        raise RuntimeError("No model provider configured. Open Settings to add one.")
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": prompt},
+    ]
 
     full_text = ""
-    for chunk in client.chat(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": prompt},
-        ],
-        options={
-            "temperature": _cfg.models.generation.temperature,
-            "top_p": _cfg.models.generation.top_p,
-            "top_k": _cfg.models.generation.top_k,
-        },
-        stream=True,
+    for token in _provider_chat_stream(
+        provider,
+        messages,
+        temperature=_cfg.models.generation.temperature,
+        top_p=_cfg.models.generation.top_p,
+        top_k=_cfg.models.generation.top_k,
     ):
-        token = chunk.get("message", {}).get("content", "")
         full_text += token
         yield full_text
 
@@ -650,7 +938,9 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
 
     @proxy_app.get("/")
     async def root():
-        return HTMLResponse(content=full_html)
+        # no-store: the UI HTML embeds app JS; a stale cached page after an
+        # upgrade keeps talking to old endpoints and breaks in confusing ways.
+        return HTMLResponse(content=full_html, headers={"Cache-Control": "no-store"})
 
     @proxy_app.get("/conversations/{conv_id}/messages")
     async def get_conv_messages(conv_id: str):
@@ -687,35 +977,200 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     async def get_stats():
         return _get_corpus_stats()
 
+    # ---- Settings: multi-provider model management -------------------------
+    from starlette.concurrency import run_in_threadpool
+
+    def _public_provider(p: dict) -> dict:
+        """Provider entry safe to send to the browser (keys masked)."""
+        return {
+            "id": p.get("id"),
+            "name": p.get("name", ""),
+            "protocol": p.get("protocol", "ollama"),
+            "base_url": p.get("base_url", ""),
+            "model": p.get("model", ""),
+            "has_key": bool(p.get("api_key")),
+            "key_hint": _mask_key(p.get("api_key") or ""),
+            "created_at": p.get("created_at", ""),
+        }
+
+    def _settings_payload() -> dict:
+        reg = _load_provider_registry()
+        cfg_summary = {}
+        if _cfg is not None:
+            cfg_summary = {
+                "corpus_root": getattr(_cfg.paths, "corpus_root", ""),
+                "chroma_root": getattr(_cfg.paths, "chroma_root", ""),
+                "ollama_host": getattr(_cfg.ollama, "host", ""),
+                "embedding_model": getattr(_cfg.models.embedding, "name", ""),
+                "generation_model": getattr(_cfg.models.generation, "name", ""),
+                "temperature": getattr(_cfg.models.generation, "temperature", ""),
+                "require_citations": getattr(
+                    getattr(_cfg, "generation_runtime", None), "require_citations", True
+                ),
+            }
+        return {
+            "providers": [_public_provider(p) for p in reg.get("providers", [])],
+            "active_id": reg.get("active_id"),
+            "protocols": _PROVIDER_PROTOCOLS,
+            "presets": _PROVIDER_PRESETS,
+            "config": cfg_summary,
+        }
+
+    @proxy_app.get("/api/settings")
+    async def get_settings():
+        return _settings_payload()
+
+    @proxy_app.post("/api/settings/providers")
+    async def upsert_provider(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return {"ok": False, "error": "invalid JSON body"}
+        name = str(payload.get("name") or "").strip()
+        protocol = str(payload.get("protocol") or "").strip()
+        base_url = str(payload.get("base_url") or "").strip().rstrip("/")
+        model = str(payload.get("model") or "").strip()
+        api_key = str(payload.get("api_key") or "")
+        if not name or not model:
+            return {"ok": False, "error": "Name and model are required"}
+        if protocol not in {p["value"] for p in _PROVIDER_PROTOCOLS}:
+            return {"ok": False, "error": f"Unsupported protocol: {protocol!r}"}
+        if not base_url:
+            return {"ok": False, "error": "Base URL is required"}
+
+        reg = _load_provider_registry()
+        pid = str(payload.get("id") or "").strip()
+        existing = next((p for p in reg["providers"] if p.get("id") == pid), None)
+        if existing:
+            existing.update({
+                "name": name, "protocol": protocol, "base_url": base_url,
+                "model": model,
+            })
+            # Empty key on edit = keep the stored one
+            if api_key:
+                existing["api_key"] = api_key
+        else:
+            reg["providers"].append({
+                "id": str(uuid.uuid4())[:8],
+                "name": name, "protocol": protocol, "base_url": base_url,
+                "api_key": api_key, "model": model,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+        _save_provider_registry(reg)
+        return {"ok": True, "settings": _settings_payload()}
+
+    @proxy_app.delete("/api/settings/providers/{pid}")
+    async def delete_provider(pid: str):
+        reg = _load_provider_registry()
+        before = len(reg["providers"])
+        reg["providers"] = [p for p in reg["providers"] if p.get("id") != pid]
+        if len(reg["providers"]) == before:
+            return {"ok": False, "error": "not found"}
+        if reg.get("active_id") == pid:
+            reg["active_id"] = reg["providers"][0]["id"] if reg["providers"] else None
+        _save_provider_registry(reg)
+        return {"ok": True, "settings": _settings_payload()}
+
+    @proxy_app.post("/api/settings/providers/{pid}/activate")
+    async def activate_provider(pid: str):
+        reg = _load_provider_registry()
+        if not any(p.get("id") == pid for p in reg["providers"]):
+            return {"ok": False, "error": "not found"}
+        reg["active_id"] = pid
+        _save_provider_registry(reg)
+        return {"ok": True, "settings": _settings_payload()}
+
+    @proxy_app.post("/api/settings/providers/test")
+    async def test_provider(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return {"ok": False, "error": "invalid JSON body"}
+        entry = {
+            "protocol": str(payload.get("protocol") or "ollama"),
+            "base_url": str(payload.get("base_url") or "").rstrip("/"),
+            "api_key": str(payload.get("api_key") or ""),
+            "model": str(payload.get("model") or ""),
+        }
+        # Blank key with an existing id = reuse the stored key
+        pid = str(payload.get("id") or "").strip()
+        if pid and not entry["api_key"]:
+            reg = _load_provider_registry()
+            stored = next((p for p in reg["providers"] if p.get("id") == pid), None)
+            if stored:
+                entry["api_key"] = stored.get("api_key") or ""
+        ok, detail = await run_in_threadpool(_provider_test, entry)
+        return {"ok": ok, "detail": detail}
+
+    @proxy_app.post("/api/settings/providers/models")
+    async def fetch_provider_models(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return {"ok": False, "error": "invalid JSON body", "models": []}
+        entry = {
+            "protocol": str(payload.get("protocol") or "ollama"),
+            "base_url": str(payload.get("base_url") or "").rstrip("/"),
+            "api_key": str(payload.get("api_key") or ""),
+            "model": str(payload.get("model") or ""),
+        }
+        pid = str(payload.get("id") or "").strip()
+        if pid and not entry["api_key"]:
+            reg = _load_provider_registry()
+            stored = next((p for p in reg["providers"] if p.get("id") == pid), None)
+            if stored:
+                entry["api_key"] = stored.get("api_key") or ""
+        models = await run_in_threadpool(_provider_list_models, entry)
+        return {"ok": bool(models), "models": models}
+
     # Single catch-all proxy for all Gradio API requests
+    # Long-lived upstream client. Shared (not per-request) so streamed
+    # responses keep their connection for the whole body; per-request clients
+    # would close the pool when the handler returns, killing the stream.
+    _proxy_client = httpx.AsyncClient(trust_env=False, timeout=None)
+
+    # Hop-by-hop / framing headers that must never be forwarded verbatim:
+    # upstream content-length/transfer-encoding describe the UPSTREAM body,
+    # and content-encoding has already been decoded by httpx. Forwarding them
+    # produced malformed responses (content-length + transfer-encoding together)
+    # that browsers truncate nondeterministically, cutting SSE streams mid-token.
+    _REQ_DROP = ("host", "content-length", "connection", "keep-alive", "accept-encoding")
+    _RESP_DROP = ("content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding")
+
     async def _do_proxy(request: Request):
         path = request.url.path[len("/gradio_api/"):]
         target = f"{gradio_url}/gradio_api/{path}"
         if request.url.query:
             target += f"?{request.url.query}"
         body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
-        async with httpx.AsyncClient(trust_env=False) as client:
-            # SSE streams (GET /call/chat/{event_id}) need streaming response
-            if request.method == "GET" and "/call/chat/" in path:
-                async with client.stream(
-                    method=request.method, url=target,
-                    headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
-                    timeout=None,
-                ) as r:
-                    headers_out = {k: v for k, v in r.headers.items() if k.lower() not in ("content-length", "transfer-encoding")}
-                    async def body_iter():
-                        async for chunk in r.aiter_bytes():
-                            yield chunk
-                    return StreamingResponse(body_iter(), status_code=r.status_code, headers=headers_out)
-            else:
-                r = await client.request(
-                    method=request.method, url=target,
-                    content=body,
-                    headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
-                    timeout=None,
-                )
-                return Response(content=r.content, status_code=r.status_code,
-                              headers={k: v for k, v in r.headers.items()})
+        req_headers = {k: v for k, v in request.headers.items() if k.lower() not in _REQ_DROP}
+        # SSE streams (GET /call/chat/{event_id}) need a streaming response.
+        # NOTE: `path` has the leading "/" stripped, so match without it —
+        # the old check `"/call/chat/" in path` never matched and every SSE
+        # stream was buffered instead, breaking incremental token streaming.
+        if request.method == "GET" and path.startswith("call/chat/"):
+            upstream = await _proxy_client.send(
+                _proxy_client.build_request("GET", target, headers=req_headers),
+                stream=True,
+            )
+            headers_out = {k: v for k, v in upstream.headers.items() if k.lower() not in _RESP_DROP}
+
+            async def body_iter():
+                try:
+                    async for chunk in upstream.aiter_bytes():
+                        yield chunk
+                finally:
+                    await upstream.aclose()
+
+            return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=headers_out)
+        else:
+            r = await _proxy_client.request(
+                method=request.method, url=target,
+                content=body,
+                headers=req_headers,
+            )
+            return Response(content=r.content, status_code=r.status_code,
+                            headers={k: v for k, v in r.headers.items() if k.lower() not in _RESP_DROP})
 
     # Register using Starlette Route to avoid FastAPI path parameter issues
     from starlette.routing import Route as StarletteRoute
@@ -1099,6 +1554,88 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 /* Regenerate button pulse */
 @keyframes btn-pulse{0%,100%{box-shadow:0 0 0 0 var(--glow-accent)}50%{box-shadow:0 0 0 6px transparent}}
 .msg-action-btn.regenerate:active{animation:btn-pulse 0.6s var(--ease-default)}
+
+/* Settings button (sidebar footer) */
+#settings-btn{width:30px;height:30px;border-radius:var(--radius-full);border:1px solid var(--sidebar-border);background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;line-height:1;color:var(--sidebar-text);transition:all var(--duration-fast) var(--ease-default);flex-shrink:0}
+#settings-btn:hover{background:var(--bg-sidebar-hover);border-color:var(--accent);color:var(--accent)}
+#settings-btn:active{transform:scale(0.92) rotate(30deg)}
+
+/* Model badge (composer) */
+.model-badge{display:inline-flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:10px;letter-spacing:0.03em;color:var(--text-tertiary);background:var(--bg-primary);border:1px solid var(--border-subtle);border-radius:var(--radius-full);padding:4px 12px;cursor:pointer;transition:all var(--duration-fast) var(--ease-default);white-space:nowrap;max-width:260px;overflow:hidden}
+.model-badge:hover{border-color:var(--accent);color:var(--accent);box-shadow:0 2px 10px var(--glow-accent)}
+.model-badge__dot{width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 6px var(--success);flex-shrink:0}
+.model-badge__name{overflow:hidden;text-overflow:ellipsis}
+.model-badge__caret{opacity:0.55;font-size:8px}
+
+/* Settings modal */
+#settings-overlay{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;background:rgba(20,17,15,0.48);backdrop-filter:blur(7px);padding:22px}
+#settings-overlay.open{display:flex;animation:settings-fade 200ms var(--ease-enter) both}
+@keyframes settings-fade{from{opacity:0}to{opacity:1}}
+.settings-modal{width:100%;max-width:660px;max-height:88vh;display:flex;flex-direction:column;background:var(--bg-primary);border:1px solid var(--border-default);border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);overflow:hidden;animation:settings-in 260ms var(--ease-spring) both}
+@keyframes settings-in{from{opacity:0;transform:translateY(18px) scale(0.97)}to{opacity:1;transform:translateY(0) scale(1)}}
+.settings-modal__header{display:flex;align-items:center;justify-content:space-between;padding:15px 20px;border-bottom:1px solid var(--border-subtle);flex-shrink:0}
+.settings-modal__title{font-family:var(--font-display);font-size:19px;letter-spacing:-0.01em;color:var(--text-primary)}
+.settings-modal__subtitle{font-family:var(--font-mono);font-size:9.5px;text-transform:uppercase;letter-spacing:0.14em;color:var(--text-tertiary);margin-top:2px}
+.settings-modal__close{width:32px;height:32px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);background:transparent;cursor:pointer;font-size:13px;color:var(--text-tertiary);transition:all var(--duration-fast) var(--ease-default);flex-shrink:0}
+.settings-modal__close:hover{background:rgba(220,75,92,0.08);color:var(--error);border-color:var(--error)}
+.settings-modal__body{overflow-y:auto;padding:18px 20px 20px;display:flex;flex-direction:column;gap:24px}
+
+.settings-block__head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.settings-block__title{font-family:var(--font-mono);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.16em;color:var(--text-tertiary);display:flex;align-items:center;gap:6px}
+.settings-block__title::before{content:'';width:4px;height:14px;border-radius:1px;background:var(--accent)}
+.settings-hint{font-size:12px;color:var(--text-tertiary);line-height:1.55;margin:-4px 0 10px}
+
+.settings-btn{font-family:var(--font-mono);font-size:11px;font-weight:500;letter-spacing:0.03em;padding:6px 13px;border-radius:var(--radius-sm);cursor:pointer;transition:all var(--duration-fast) var(--ease-default);border:1px solid var(--border-default);background:var(--bg-primary);color:var(--text-secondary)}
+.settings-btn:hover{border-color:var(--accent);color:var(--accent)}
+.settings-btn:active{transform:scale(0.97)}
+.settings-btn--primary{background:var(--accent);border-color:var(--accent);color:#14110F;font-weight:600}
+.settings-btn--primary:hover{filter:brightness(1.06);box-shadow:0 4px 16px var(--glow-accent);color:#14110F}
+.settings-btn--danger{color:var(--error)}
+.settings-btn--danger:hover{border-color:var(--error);background:rgba(220,75,92,0.08);color:var(--error)}
+.settings-btn--mini{padding:4px 10px;font-size:10px}
+.settings-btn[disabled]{opacity:0.5;cursor:not-allowed;pointer-events:none}
+
+.provider-list{display:flex;flex-direction:column;gap:9px}
+.provider-card{border:1px solid var(--border-default);border-radius:var(--radius-lg);padding:12px 14px;background:var(--bg-primary);display:flex;flex-direction:column;gap:7px;transition:all var(--duration-fast) var(--ease-default)}
+.provider-card:hover{border-color:var(--border-strong)}
+.provider-card.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 4px 18px var(--glow-accent)}
+.provider-card__row1{display:flex;align-items:center;gap:8px;min-width:0}
+.provider-card__name{font-size:13.5px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.provider-card__badges{display:flex;align-items:center;gap:5px;flex-shrink:0;margin-left:auto}
+.badge{font-family:var(--font-mono);font-size:8.5px;font-weight:600;text-transform:uppercase;letter-spacing:0.09em;padding:3px 8px;border-radius:var(--radius-full);border:1px solid var(--border-subtle);background:var(--bg-secondary);color:var(--text-tertiary);white-space:nowrap}
+.badge--active{background:var(--accent);border-color:var(--accent);color:#14110F}
+.badge--key{color:var(--success);border-color:rgba(31,122,77,0.3)}
+[data-theme="dark"] .badge--key{border-color:rgba(52,211,153,0.3)}
+.provider-card__model{font-family:var(--font-mono);font-size:11.5px;color:var(--accent);word-break:break-all}
+.provider-card__url{font-family:var(--font-mono);font-size:10px;color:var(--text-tertiary);word-break:break-all;opacity:0.85}
+.provider-card__actions{display:flex;align-items:center;gap:6px;margin-top:3px;flex-wrap:wrap}
+
+.provider-form{border:1px dashed var(--border-default);border-radius:var(--radius-lg);padding:16px;display:none;flex-direction:column;gap:11px;background:var(--bg-secondary);margin-top:11px}
+.provider-form.open{display:flex}
+.provider-form__title{font-family:var(--font-mono);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.14em;color:var(--text-secondary)}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+@media(max-width:560px){.form-grid{grid-template-columns:1fr}}
+.form-field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.form-field--full{grid-column:1 / -1}
+.form-field label{font-family:var(--font-mono);font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-tertiary)}
+.form-field input,.form-field select{border:1px solid var(--border-default);border-radius:var(--radius-sm);background:var(--bg-primary);color:var(--text-primary);font-size:12.5px;font-family:var(--font-sans);padding:8px 11px;outline:none;transition:all var(--duration-fast) var(--ease-default);width:100%}
+.form-field input:focus,.form-field select:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-subtle)}
+.form-field input::placeholder{color:var(--text-disabled)}
+.form-field .field-hint{font-size:10px;color:var(--text-tertiary);font-family:var(--font-mono)}
+.model-input-row{display:flex;gap:6px}
+.model-input-row input{flex:1;min-width:0}
+.provider-form__actions{display:flex;align-items:center;gap:8px;justify-content:flex-end;margin-top:2px}
+
+.sysinfo-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+@media(max-width:560px){.sysinfo-grid{grid-template-columns:1fr}}
+.sysinfo-item{border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:9px 12px;background:var(--bg-secondary);display:flex;flex-direction:column;gap:2px;min-width:0}
+.sysinfo-item__k{font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:0.12em;color:var(--text-tertiary)}
+.sysinfo-item__v{font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);word-break:break-all}
+
+#settings-toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(16px);opacity:0;z-index:1100;font-family:var(--font-mono);font-size:11.5px;padding:10px 18px;border-radius:var(--radius-full);background:var(--bg-primary);border:1px solid var(--border-default);box-shadow:var(--shadow-lg);color:var(--text-primary);pointer-events:none;transition:all var(--duration-normal) var(--ease-spring);max-width:80vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#settings-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#settings-toast.ok{border-color:var(--success)}
+#settings-toast.err{border-color:var(--error)}
 </style>
 </head>
 <body>
@@ -1120,7 +1657,10 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 </div>
 <div class="sidebar-footer">
 <span class="sidebar-status">$OLLAMA_STATUS</span>
+<div style="display:flex;align-items:center;gap:6px">
+<button id="settings-btn" title="Vault settings">&#9881;&#65038;</button>
 <button id="theme-toggle-sidebar" title="Toggle theme"></button>
+</div>
 </div>
 <div style="padding:8px 14px 12px;border-top:1px solid var(--sidebar-border)">
 <a href="https://odw.ai/" target="_blank" rel="noopener" style="font-family:var(--font-mono);font-size:9px;letter-spacing:0.12em;text-transform:uppercase;color:var(--sidebar-text-muted);text-decoration:none;transition:color 150ms">odw.ai &nearr;</a>
@@ -1159,7 +1699,10 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 <div id="composer">
 <textarea id="inp" placeholder="Ask anything about your knowledge base..." rows="1" autofocus></textarea>
 <div id="ca-row">
+<div style="display:flex;align-items:center;gap:10px;min-width:0;overflow:hidden">
 <div class="scope-indicator"><span class="scope-indicator__dot"></span> <span id="scope-label">All folders</span></div>
+<button id="model-badge" class="model-badge" title="Switch model"><span class="model-badge__dot"></span><span class="model-badge__name" id="model-badge-name">model</span><span class="model-badge__caret">&#9662;</span></button>
+</div>
 <div id="ca-controls">
 <button id="stop-btn" title="Stop generating">&#x25a0;</button>
 <button id="snd" title="Send">&#x2191;</button>
@@ -1376,39 +1919,67 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       if(!r.ok) throw new Error('HTTP ' + r.status);
       var reader = r.body.getReader();
       var buf = '';
+      var _handleLines = function(lines){
+        for(var i = 0; i < lines.length; i++){
+          var line = lines[i];
+          if(line.startsWith('data:')){
+            try {
+              var d = JSON.parse(line.slice(5));
+              // Gradio heartbeat frames are `data: null` — guard before use.
+              if(d && d.error){
+                var mdEl = el.querySelector('.md');
+                if(mdEl) mdEl.innerHTML = '<div class="msg-error"><div class="msg-error__text">Error: ' + _escHtml(d.error) + '</div><button class="msg-error__retry" onclick="window._retryLast()">Retry</button></div>';
+                _done(el);
+                return true;
+              }
+              if(d && d[0] && d[0].length){
+                var h = d[0];
+                var last = h[h.length - 1];
+                // Citations first: an exception later in this block (e.g. the
+                // markdown renderer choking on some generated text) must
+                // never swallow the citations payload of the final frames.
+                if(d[1]){
+                  var citEl = document.getElementById('cit');
+                  if(citEl) citEl.innerHTML = d[1];
+                }
+                if(last && last.content && last.content.length){
+                  var text = last.content[0].text || '';
+                  var mdEl = el.querySelector('.md');
+                  if(mdEl){
+                    // Render defensively: fall back to escaped plain text
+                    // instead of letting a renderer error kill the frame.
+                    try {
+                      mdEl.innerHTML = _md(text);
+                    } catch(e){
+                      mdEl.innerHTML = '<p>' + _escHtml(text).replace(/\\n/g,'<br>') + '</p>';
+                    }
+                  }
+                }
+                var msgs = document.getElementById('msgs');
+                msgs.scrollTop = msgs.scrollHeight;
+              }
+            } catch(e) {}
+          }
+        }
+        return false;
+      };
       (function pump(){
         reader.read().then(function(res){
           if(_S.abortFlag){ reader.cancel(); _done(el); return; }
-          if(res.done){ _done(el); return; }
+          if(res.done){
+            // The stream may close without a trailing newline; flush the
+            // final unterminated line or the last data: event (citations
+            // panel) is silently dropped.
+            if(buf){
+              var tail = buf; buf = '';
+              if(_handleLines([tail])) return;
+            }
+            _done(el); return;
+          }
           buf += new TextDecoder().decode(res.value);
           var lines = buf.split('\\n');
           buf = lines.pop() || '';
-          for(var i = 0; i < lines.length; i++){
-            var line = lines[i];
-            if(line.startsWith('data:')){
-              try {
-                var d = JSON.parse(line.slice(5));
-                if(d.error){
-                  var mdEl = el.querySelector('.md');
-                  if(mdEl) mdEl.innerHTML = '<div class="msg-error"><div class="msg-error__text">Error: ' + _escHtml(d.error) + '</div><button class="msg-error__retry" onclick="window._retryLast()">Retry</button></div>';
-                  _done(el);
-                  return;
-                }
-                if(d[0] && d[0].length){
-                  var h = d[0];
-                  var last = h[h.length - 1];
-                  if(last && last.content && last.content.length){
-                    var text = last.content[0].text || '';
-                    var mdEl = el.querySelector('.md');
-                    if(mdEl) mdEl.innerHTML = _md(text);
-                  }
-                  var msgs = document.getElementById('msgs');
-                  msgs.scrollTop = msgs.scrollHeight;
-                  if(d[1]) document.getElementById('cit').innerHTML = d[1];
-                }
-              } catch(e) {}
-            }
-          }
+          if(_handleLines(lines)) return;
           pump();
         }).catch(function(err){
           if(!_S.abortFlag){
@@ -1868,6 +2439,415 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     .catch(function(){});
   }
   _fetchStats();
+})();
+</script>
+
+<!-- Settings modal -->
+<div id="settings-overlay">
+<div class="settings-modal" role="dialog" aria-modal="true" aria-label="Vault settings">
+<div class="settings-modal__header">
+<div>
+<div class="settings-modal__title">Vault Settings</div>
+<div class="settings-modal__subtitle">Models &amp; Providers</div>
+</div>
+<button class="settings-modal__close" id="settings-close" title="Close (Esc)">\u2715</button>
+</div>
+<div class="settings-modal__body">
+
+<div class="settings-block">
+<div class="settings-block__head">
+<span class="settings-block__title">Model Providers</span>
+<button id="provider-add-btn" class="settings-btn settings-btn--primary">+ Add Provider</button>
+</div>
+<p class="settings-hint">The <b>active</b> model generates every answer. Supports OpenAI-compatible, Ollama and Anthropic (Claude) protocols across all major platforms. Retrieval embeddings always stay on the local embedding model.</p>
+<div id="provider-list" class="provider-list"></div>
+
+<form id="provider-form" class="provider-form" autocomplete="off">
+<div class="provider-form__title" id="pf-form-title">Add Provider</div>
+<div class="form-grid">
+<div class="form-field">
+<label for="pf-preset">Platform preset</label>
+<select id="pf-preset"></select>
+</div>
+<div class="form-field">
+<label for="pf-protocol">Protocol</label>
+<select id="pf-protocol"></select>
+</div>
+<div class="form-field">
+<label for="pf-name">Display name</label>
+<input type="text" id="pf-name" placeholder="e.g. My GPT-4o" maxlength="60">
+</div>
+<div class="form-field">
+<label for="pf-baseurl">Base URL</label>
+<input type="text" id="pf-baseurl" placeholder="https://api.openai.com/v1">
+</div>
+<div class="form-field form-field--full">
+<label for="pf-key">API key</label>
+<input type="password" id="pf-key" placeholder="sk-... (leave blank for local)">
+<span class="field-hint" id="pf-key-hint"></span>
+</div>
+<div class="form-field form-field--full">
+<label for="pf-model">Model ID</label>
+<div class="model-input-row">
+<input type="text" id="pf-model" list="pf-model-list" placeholder="gpt-4o / deepseek-chat / gemma4:latest ...">
+<button type="button" id="pf-fetch" class="settings-btn settings-btn--mini" title="Fetch available models from the endpoint">Fetch</button>
+</div>
+<datalist id="pf-model-list"></datalist>
+</div>
+</div>
+<div class="provider-form__actions">
+<button type="button" id="pf-test" class="settings-btn">Test connection</button>
+<button type="button" id="pf-cancel" class="settings-btn">Cancel</button>
+<button type="submit" id="pf-save" class="settings-btn settings-btn--primary">Save provider</button>
+</div>
+</form>
+</div>
+
+<div class="settings-block">
+<div class="settings-block__head"><span class="settings-block__title">System</span></div>
+<div id="settings-sysinfo" class="sysinfo-grid"></div>
+</div>
+
+</div>
+</div>
+</div>
+<div id="settings-toast"></div>
+
+<script>
+(function(){
+  var _ST = {providers:[], activeId:null, presets:[], protocols:[], config:{}, editingId:null};
+  var _toastTimer = null;
+
+  function _q(id){ return document.getElementById(id); }
+  function _esc(s){ var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
+  function _toast(msg, kind){
+    var t = _q('settings-toast');
+    if(!t) return;
+    t.textContent = msg;
+    t.className = 'show ' + (kind || '');
+    clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(function(){ t.className = ''; }, 3200);
+  }
+
+  function _api(method, url, body){
+    var opts = {method: method, headers: {}};
+    if(body !== undefined){
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(url, opts).then(function(r){
+      return r.json().then(function(data){
+        // FastAPI validation errors arrive as {"detail": [...]} — flatten to text
+        // so toasts never render "[object Object]".
+        if(data && Array.isArray(data.detail)){
+          data.ok = false;
+          data.detail = data.detail.map(function(d){
+            var loc = (d && d.loc) ? ' (' + d.loc.join('.') + ')' : '';
+            var msg = (d && (d.msg || d.type)) ? (d.msg || d.type) : String(d);
+            return msg + loc;
+          }).join('; ');
+        }
+        return data;
+      }).catch(function(){ return {ok: false, error: 'HTTP ' + r.status}; });
+    });
+  }
+
+  function _applySettings(data){
+    if(!data) return;
+    if(data.providers) _ST.providers = data.providers;
+    if(data.active_id !== undefined) _ST.activeId = data.active_id;
+    if(data.presets) _ST.presets = data.presets;
+    if(data.protocols) _ST.protocols = data.protocols;
+    if(data.config) _ST.config = data.config;
+    _renderProviders();
+    _renderSysinfo();
+    _renderFormOptions();
+    _updateBadge();
+  }
+
+  function _activeProvider(){
+    for(var i = 0; i < _ST.providers.length; i++){
+      if(_ST.providers[i].id === _ST.activeId) return _ST.providers[i];
+    }
+    return _ST.providers[0] || null;
+  }
+
+  function _updateBadge(){
+    var el = _q('model-badge-name');
+    var p = _activeProvider();
+    if(el) el.textContent = p ? (p.model || 'no model') : 'no provider';
+  }
+
+  function _protocolLabel(v){
+    for(var i = 0; i < _ST.protocols.length; i++){
+      if(_ST.protocols[i].value === v) return _ST.protocols[i].label;
+    }
+    return v;
+  }
+
+  function _renderProviders(){
+    var list = _q('provider-list');
+    if(!list) return;
+    if(!_ST.providers.length){
+      list.innerHTML = '<div class="settings-hint" style="text-align:center;padding:12px 0">No providers yet — add one to get started.</div>';
+      return;
+    }
+    var html = '';
+    for(var i = 0; i < _ST.providers.length; i++){
+      var p = _ST.providers[i];
+      var isActive = p.id === _ST.activeId;
+      html += '<div class="provider-card' + (isActive ? ' active' : '') + '" data-pid="' + _esc(p.id) + '">' +
+        '<div class="provider-card__row1">' +
+        '<span class="provider-card__name">' + _esc(p.name) + '</span>' +
+        '<span class="provider-card__badges">' +
+        '<span class="badge">' + _esc(_protocolLabel(p.protocol)) + '</span>' +
+        (p.has_key ? '<span class="badge badge--key" title="API key stored">key ' + _esc(p.key_hint) + '</span>' : '') +
+        (isActive ? '<span class="badge badge--active">Active</span>' : '') +
+        '</span></div>' +
+        '<div class="provider-card__model">' + _esc(p.model) + '</div>' +
+        '<div class="provider-card__url">' + _esc(p.base_url) + '</div>' +
+        '<div class="provider-card__actions">' +
+        (isActive ? '' : '<button class="settings-btn settings-btn--mini settings-btn--primary" data-act="use">Use</button>') +
+        '<button class="settings-btn settings-btn--mini" data-act="test">Test</button>' +
+        '<button class="settings-btn settings-btn--mini" data-act="edit">Edit</button>' +
+        '<button class="settings-btn settings-btn--mini settings-btn--danger" data-act="del">Delete</button>' +
+        '</div></div>';
+    }
+    list.innerHTML = html;
+  }
+
+  var _SYS_LABELS = [
+    ['corpus_root', 'Corpus root'],
+    ['chroma_root', 'Vector store'],
+    ['ollama_host', 'Embedding host'],
+    ['embedding_model', 'Embedding model'],
+    ['generation_model', 'Config default gen'],
+    ['temperature', 'Temperature'],
+    ['require_citations', 'Citation-strict']
+  ];
+  function _renderSysinfo(){
+    var el = _q('settings-sysinfo');
+    if(!el) return;
+    var html = '';
+    for(var i = 0; i < _SYS_LABELS.length; i++){
+      var k = _SYS_LABELS[i][0], lbl = _SYS_LABELS[i][1];
+      var v = _ST.config[k];
+      if(v === undefined || v === null || v === '') v = '\u2014';
+      if(typeof v === 'boolean') v = v ? 'on' : 'off';
+      html += '<div class="sysinfo-item"><span class="sysinfo-item__k">' + _esc(lbl) + '</span><span class="sysinfo-item__v">' + _esc(v) + '</span></div>';
+    }
+    el.innerHTML = html;
+  }
+
+  function _renderFormOptions(){
+    var presetSel = _q('pf-preset');
+    var protoSel = _q('pf-protocol');
+    if(presetSel && !presetSel.options.length){
+      var h = '';
+      for(var i = 0; i < _ST.presets.length; i++){
+        h += '<option value="' + _esc(_ST.presets[i].key) + '">' + _esc(_ST.presets[i].label) + '</option>';
+      }
+      presetSel.innerHTML = h;
+    }
+    if(protoSel && !protoSel.options.length){
+      var h2 = '';
+      for(var j = 0; j < _ST.protocols.length; j++){
+        h2 += '<option value="' + _esc(_ST.protocols[j].value) + '">' + _esc(_ST.protocols[j].label) + '</option>';
+      }
+      protoSel.innerHTML = h2;
+    }
+  }
+
+  function _openSettings(){
+    _api('GET', '/api/settings').then(_applySettings).catch(function(){});
+    var o = _q('settings-overlay');
+    if(o){ o.classList.add('open'); }
+  }
+  function _closeSettings(){
+    var o = _q('settings-overlay');
+    if(o) o.classList.remove('open');
+    _hideForm();
+  }
+
+  function _showForm(entry){
+    _ST.editingId = entry ? entry.id : null;
+    var f = _q('provider-form');
+    _q('pf-form-title').textContent = entry ? 'Edit Provider' : 'Add Provider';
+    _q('pf-name').value = entry ? entry.name : '';
+    _q('pf-protocol').value = entry ? entry.protocol : 'openai';
+    _q('pf-baseurl').value = entry ? entry.base_url : '';
+    _q('pf-model').value = entry ? entry.model : '';
+    _q('pf-key').value = '';
+    _q('pf-key-hint').textContent = entry && entry.has_key ? 'A key is stored (' + entry.key_hint + ') — leave blank to keep it.' : '';
+    _q('pf-preset').value = 'custom';
+    if(f) f.classList.add('open');
+    _q('pf-name').focus();
+  }
+  function _hideForm(){
+    var f = _q('provider-form');
+    if(f) f.classList.remove('open');
+    _ST.editingId = null;
+  }
+
+  function _applyPreset(){
+    var key = _q('pf-preset').value;
+    for(var i = 0; i < _ST.presets.length; i++){
+      if(_ST.presets[i].key === key){
+        var p = _ST.presets[i];
+        _q('pf-protocol').value = p.protocol;
+        if(p.base_url) _q('pf-baseurl').value = p.base_url;
+        if(p.model) _q('pf-model').value = p.model;
+        if(!_q('pf-name').value || _q('pf-name').value === '') _q('pf-name').value = p.label;
+        return;
+      }
+    }
+  }
+
+  function _formPayload(includeKey){
+    var payload = {
+      id: _ST.editingId || '',
+      name: _q('pf-name').value.trim(),
+      protocol: _q('pf-protocol').value,
+      base_url: _q('pf-baseurl').value.trim(),
+      model: _q('pf-model').value.trim()
+    };
+    if(includeKey) payload.api_key = _q('pf-key').value;
+    return payload;
+  }
+
+  /* -- wire events -- */
+  var settingsBtn = _q('settings-btn');
+  if(settingsBtn) settingsBtn.addEventListener('click', _openSettings);
+  var modelBadge = _q('model-badge');
+  if(modelBadge) modelBadge.addEventListener('click', _openSettings);
+  var closeBtn = _q('settings-close');
+  if(closeBtn) closeBtn.addEventListener('click', _closeSettings);
+  var overlay = _q('settings-overlay');
+  if(overlay) overlay.addEventListener('click', function(e){ if(e.target === overlay) _closeSettings(); });
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape' && overlay && overlay.classList.contains('open')) _closeSettings();
+  });
+
+  var addBtn = _q('provider-add-btn');
+  if(addBtn) addBtn.addEventListener('click', function(){ _showForm(null); });
+  var cancelBtn = _q('pf-cancel');
+  if(cancelBtn) cancelBtn.addEventListener('click', _hideForm);
+  var presetSel2 = _q('pf-preset');
+  if(presetSel2) presetSel2.addEventListener('change', _applyPreset);
+
+  var form = _q('provider-form');
+  if(form) form.addEventListener('submit', function(e){
+    e.preventDefault();
+    var payload = _formPayload(true);
+    if(!payload.name || !payload.model || !payload.base_url){
+      _toast('Name, Base URL and Model are required', 'err');
+      return;
+    }
+    var saveBtn = _q('pf-save');
+    if(saveBtn) saveBtn.setAttribute('disabled', '');
+    _api('POST', '/api/settings/providers', payload)
+      .then(function(resp){
+        if(saveBtn) saveBtn.removeAttribute('disabled');
+        if(resp.ok){
+          _toast('Provider saved', 'ok');
+          _hideForm();
+          _applySettings(resp.settings);
+        } else {
+          _toast(resp.error || 'Save failed', 'err');
+        }
+      })
+      .catch(function(){
+        if(saveBtn) saveBtn.removeAttribute('disabled');
+        _toast('Network error', 'err');
+      });
+  });
+
+  var fetchBtn = _q('pf-fetch');
+  if(fetchBtn) fetchBtn.addEventListener('click', function(){
+    var btn = fetchBtn;
+    btn.setAttribute('disabled', '');
+    btn.textContent = '...';
+    _api('POST', '/api/settings/providers/models', _formPayload(true))
+      .then(function(resp){
+        btn.removeAttribute('disabled');
+        btn.textContent = 'Fetch';
+        if(resp.ok && resp.models && resp.models.length){
+          var dl = _q('pf-model-list');
+          var h = '';
+          for(var i = 0; i < resp.models.length; i++){
+            h += '<option value="' + _esc(resp.models[i]) + '"></option>';
+          }
+          dl.innerHTML = h;
+          _toast(resp.models.length + ' models found — pick one in the Model ID field', 'ok');
+        } else {
+          _toast('No models returned (check URL / key)', 'err');
+        }
+      })
+      .catch(function(){
+        btn.removeAttribute('disabled');
+        btn.textContent = 'Fetch';
+        _toast('Network error', 'err');
+      });
+  });
+
+  var testBtn = _q('pf-test');
+  if(testBtn) testBtn.addEventListener('click', function(){
+    testBtn.setAttribute('disabled', '');
+    testBtn.textContent = 'Testing...';
+    _api('POST', '/api/settings/providers/test', _formPayload(true))
+      .then(function(resp){
+        testBtn.removeAttribute('disabled');
+        testBtn.textContent = 'Test connection';
+        _toast((resp.ok ? '\u2713 ' : '\u2717 ') + (resp.detail || (resp.ok ? 'OK' : 'failed')), resp.ok ? 'ok' : 'err');
+      })
+      .catch(function(){
+        testBtn.removeAttribute('disabled');
+        testBtn.textContent = 'Test connection';
+        _toast('Network error', 'err');
+      });
+  });
+
+  var plist = _q('provider-list');
+  if(plist) plist.addEventListener('click', function(e){
+    var btn = e.target.closest('[data-act]');
+    if(!btn) return;
+    var card = btn.closest('.provider-card');
+    if(!card) return;
+    var pid = card.getAttribute('data-pid');
+    var act = btn.getAttribute('data-act');
+    var entry = null;
+    for(var i = 0; i < _ST.providers.length; i++){
+      if(_ST.providers[i].id === pid) entry = _ST.providers[i];
+    }
+    if(act === 'edit'){
+      _showForm(entry);
+    } else if(act === 'use'){
+      _api('POST', '/api/settings/providers/' + encodeURIComponent(pid) + '/activate', {})
+        .then(function(resp){
+          if(resp.ok){ _applySettings(resp.settings); _toast('Switched to ' + (entry ? entry.name : pid), 'ok'); }
+          else _toast(resp.error || 'Failed', 'err');
+        }).catch(function(){ _toast('Network error', 'err'); });
+    } else if(act === 'test'){
+      btn.setAttribute('disabled', ''); btn.textContent = '...';
+      _api('POST', '/api/settings/providers/test', {
+        id: pid, protocol: entry.protocol, base_url: entry.base_url, model: entry.model, api_key: ''
+      }).then(function(resp){
+        btn.removeAttribute('disabled'); btn.textContent = 'Test';
+        _toast((resp.ok ? '\u2713 ' : '\u2717 ') + (resp.detail || ''), resp.ok ? 'ok' : 'err');
+      }).catch(function(){ btn.removeAttribute('disabled'); btn.textContent = 'Test'; _toast('Network error', 'err'); });
+    } else if(act === 'del'){
+      if(!confirm('Delete provider \u201c' + (entry ? entry.name : '') + '\u201d?')) return;
+      _api('DELETE', '/api/settings/providers/' + encodeURIComponent(pid))
+        .then(function(resp){
+          if(resp.ok){ _applySettings(resp.settings); _toast('Provider deleted', 'ok'); }
+          else _toast(resp.error || 'Failed', 'err');
+        }).catch(function(){ _toast('Network error', 'err'); });
+    }
+  });
+
+  /* -- initial state (badge + data warm-up) -- */
+  _api('GET', '/api/settings').then(_applySettings).catch(function(){});
 })();
 </script>
 </body>

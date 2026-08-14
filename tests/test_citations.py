@@ -35,6 +35,21 @@ class TestParseCitations:
     def test_non_numeric_brackets_ignored(self):
         assert parse_citations("[abc] not a citation [1]") == [1]
 
+    def test_comma_list_citation(self):
+        assert parse_citations("covers phases [4, 5, 6]") == [4, 5, 6]
+
+    def test_comma_list_no_spaces(self):
+        assert parse_citations("requires LibreOffice [1,2]") == [1, 2]
+
+    def test_comma_list_dedup_across_styles(self):
+        assert parse_citations("see [1, 2] and [2] and [3]") == [1, 2, 3]
+
+    def test_comma_list_order_preserved(self):
+        assert parse_citations("[5, 1] then [2]") == [5, 1, 2]
+
+    def test_mixed_markers(self):
+        assert parse_citations("[1] and [2, 3] together [4]") == [1, 2, 3, 4]
+
 
 class TestResolveCitations:
     def _make_hits(self, n: int) -> list[Hit]:

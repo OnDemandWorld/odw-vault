@@ -1,5 +1,6 @@
 # Secrets and credentials
 config.toml
+llm_providers.json
 
 # Database
 *.db

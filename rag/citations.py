@@ -6,18 +6,23 @@ import re
 
 from rag.retrieval import Hit
 
-CITATION_RE = re.compile(r"\[(\d+)\]")
+# Matches [4], [4, 5], [4,5,6] — models emit both compact and comma-list markers.
+CITATION_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
 def parse_citations(answer_text: str) -> list[int]:
-    """Extract citation numbers [N] from answer text, preserving order, deduplicated."""
+    """Extract citation numbers [N] from answer text, preserving order, deduplicated.
+
+    Handles both compact markers (``[4]``) and comma lists (``[4, 5, 6]``).
+    """
     seen: set[int] = set()
     result: list[int] = []
     for m in CITATION_RE.finditer(answer_text):
-        n = int(m.group(1))
-        if n not in seen:
-            seen.add(n)
-            result.append(n)
+        for part in m.group(1).split(","):
+            n = int(part.strip())
+            if n not in seen:
+                seen.add(n)
+                result.append(n)
     return result
 
 
