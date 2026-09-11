@@ -43,6 +43,9 @@ class Database:
         self._db.conn.execute("PRAGMA foreign_keys = ON")
         self._db.conn.execute("PRAGMA journal_mode = WAL")
         self._db.conn.execute("PRAGMA synchronous = NORMAL")
+        # Wait instead of failing immediately when another process (CLI
+        # phase, API server, UI) holds the write lock.
+        self._db.conn.execute("PRAGMA busy_timeout = 5000")
 
     def __getitem__(self, table: str):
         return self._db[table]
@@ -421,12 +424,15 @@ MIGRATIONS = [
         -- New views (DROP + CREATE for idempotency)
         DROP VIEW IF EXISTS v_extraction_status;
         CREATE VIEW v_extraction_status AS
-        SELECT f.category, COUNT(*) AS total,
-               SUM(CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END) AS extracted,
-               SUM(CASE WHEN f.extract_status='failed' THEN 1 ELSE 0 END) AS failed,
-               SUM(CASE WHEN f.extract_status='pending' THEN 1 ELSE 0 END) AS pending
+        -- Status derived from extraction/failure rows; file has no
+        -- extract_status column (see phase8_extract).
+        SELECT f.category, COUNT(DISTINCT f.id) AS total,
+               COUNT(DISTINCT CASE WHEN e.succeeded = 1 THEN f.id END) AS extracted,
+               COUNT(DISTINCT CASE WHEN fail.id IS NOT NULL THEN f.id END) AS failed,
+               COUNT(DISTINCT CASE WHEN e.succeeded IS NULL AND fail.id IS NULL THEN f.id END) AS pending
         FROM file f
         LEFT JOIN extraction e ON e.file_id = f.id
+        LEFT JOIN failure fail ON fail.file_id = f.id AND fail.phase = 'extract'
         WHERE f.is_dup_primary=1 AND f.excluded=0
         GROUP BY f.category;
 
@@ -550,6 +556,23 @@ MIGRATIONS = [
         );
         CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, ts DESC);
         CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts DESC);
+        """,
+    ),
+    (
+        8,
+        "repair v_extraction_status view (referenced nonexistent file.extract_status)",
+        """
+        DROP VIEW IF EXISTS v_extraction_status;
+        CREATE VIEW v_extraction_status AS
+        SELECT f.category, COUNT(DISTINCT f.id) AS total,
+               COUNT(DISTINCT CASE WHEN e.succeeded = 1 THEN f.id END) AS extracted,
+               COUNT(DISTINCT CASE WHEN fail.id IS NOT NULL THEN f.id END) AS failed,
+               COUNT(DISTINCT CASE WHEN e.succeeded IS NULL AND fail.id IS NULL THEN f.id END) AS pending
+        FROM file f
+        LEFT JOIN extraction e ON e.file_id = f.id
+        LEFT JOIN failure fail ON fail.file_id = f.id AND fail.phase = 'extract'
+        WHERE f.is_dup_primary=1 AND f.excluded=0
+        GROUP BY f.category;
         """,
     ),
 ]

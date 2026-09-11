@@ -10,7 +10,6 @@ import io
 import json
 import logging
 import os
-import shutil
 import threading
 import time
 from pathlib import Path
@@ -18,6 +17,7 @@ from pathlib import Path
 import chromadb
 import ollama
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -42,7 +42,13 @@ from api.schemas import (
     QueryResponse,
 )
 from api.spans import get_current_span, span
-from api.tracing import TRACE_HEADER, install_trace_id_filter, new_trace_id, trace_id_var
+from api.tracing import (
+    TRACE_HEADER,
+    get_trace_id,
+    install_trace_id_filter,
+    new_trace_id,
+    trace_id_var,
+)
 from pipeline.config import load_app_config
 from pipeline.db import migrate, open_db
 from rag.filters import resolve_folder_filter
@@ -231,7 +237,7 @@ def health():
     # Ollama check
     ollama_ok = False
     try:
-        client = ollama.Client(host=cfg.ollama.host)
+        client = ollama.Client(host=cfg.ollama.host, timeout=10)
         client.list()
         ollama_ok = True
     except Exception:
@@ -262,10 +268,10 @@ def health():
 
     # fastText check
     fasttext_ok = False
+    model_path = cfg.models.language_id.model_path
     try:
         import fasttext
 
-        model_path = cfg.models.language_id.model_path
         fasttext.load_model(model_path)
         fasttext_ok = True
     except Exception:
@@ -349,7 +355,7 @@ def _query_impl(req: QueryRequest):
 
     # Check Ollama reachability
     try:
-        ollama.Client(host=cfg.ollama.host).list()
+        ollama.Client(host=cfg.ollama.host, timeout=10).list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
 
@@ -410,19 +416,18 @@ def _query_impl(req: QueryRequest):
 
     # Generate answer
     # Handle conversation history
-    from rag.conversation import get_or_create_conversation, get_history, add_message
+    from rag.conversation import add_message, get_history, get_or_create_conversation
 
-    conversation_id = None
-    history = None
-    if req.conversation_id is not None or True:  # always support conversations
-        conversation_id = get_or_create_conversation(db, req.conversation_id, user=req.user)
-        # Save user message
-        add_message(db, conversation_id, "user", req.query)
-        # Get history for prompt injection (excluding the message we just added)
-        history = get_history(db, conversation_id)
-        # Remove the last message (the one we just added) from history
-        if history and history[-1]["role"] == "user" and history[-1]["content"] == req.query:
-            history = history[:-1]
+    # Conversations are always on: every query gets a conversation row so the
+    # history panel works even for callers that don't pass conversation_id.
+    conversation_id = get_or_create_conversation(db, req.conversation_id, user=req.user)
+    # Save user message
+    add_message(db, conversation_id, "user", req.query)
+    # Get history for prompt injection (excluding the message we just added)
+    history = get_history(db, conversation_id)
+    # Remove the last message (the one we just added) from history
+    if history and history[-1]["role"] == "user" and history[-1]["content"] == req.query:
+        history = history[:-1]
 
     with span("vault.query.generate") as generate_span:
         gen_result = generate_answer(
@@ -558,7 +563,7 @@ def query_stream(req: QueryRequest):
 
     # Check Ollama
     try:
-        ollama.Client(host=cfg.ollama.host).list()
+        ollama.Client(host=cfg.ollama.host, timeout=10).list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
 
@@ -626,7 +631,66 @@ def query_stream(req: QueryRequest):
 
     prompt = DEFAULT_PROMPT.format(numbered_chunks=numbered_chunks, query=req.query)
 
-    oclient = ollama.Client(host=cfg.ollama.host)
+    # Async client + configured timeout so a wedged Ollama cannot block the
+    # event loop (and with it every other in-flight request).
+    oclient = ollama.AsyncClient(host=cfg.ollama.host, timeout=cfg.ollama.timeout_seconds)
+
+    # Persisted once the answer is complete — must run on a worker thread,
+    # because the generator iterates on the event-loop thread and the
+    # thread-local sqlite connection cannot cross threads.
+    retrieved_chunks = [
+        {
+            "rank": i,
+            "chunk_id": hit.chunk_id,
+            "file_id": hit.file_id,
+            "folder_id": hit.folder_id,
+            "rel_path": hit.rel_path,
+            "page_start": hit.page_start,
+            "dense_score": hit.dense_score,
+            "bm25_score": hit.bm25_score,
+            "fused_score": hit.fused_score,
+        }
+        for i, hit in enumerate(hits, start=1)
+    ]
+
+    def _persist_stream_query(answer_text: str, total_ms: int, gen_ms: int) -> int:
+        pdb = _get_db()
+        reranker_model = (
+            cfg.models.reranker.name if getattr(cfg.models.reranker, "enabled", False) else None
+        )
+        cursor = pdb.conn.execute(
+            """INSERT INTO query_log
+               (user, query_text, query_lang, folder_filter_json,
+                retrieved_chunks_json, answer_text, answer_model,
+                embedding_model, reranker_model,
+                latency_ms, retrieval_ms, generation_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                req.user,
+                req.query,
+                retrieval_metrics.get("query_lang", "unknown"),
+                json.dumps(folder_filter_dict) if folder_filter_dict else None,
+                json.dumps(retrieved_chunks),
+                answer_text,
+                model_name,
+                cfg.models.embedding.name,
+                reranker_model,
+                total_ms,
+                retrieval_ms,
+                gen_ms,
+            ),
+        )
+        pdb.conn.commit()
+        query_log_id = cursor.lastrowid
+        record_audit(
+            pdb,
+            _resolve_actor(),
+            "query",
+            "query_log",
+            resource_id=query_log_id,
+            detail=req.query,
+        )
+        return query_log_id
 
     async def event_generator():
         nonlocal t0
@@ -645,7 +709,7 @@ def query_stream(req: QueryRequest):
 
             # Event: streaming tokens
             answer_parts: list[str] = []
-            stream_resp = oclient.chat(
+            stream_resp = await oclient.chat(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": system_content},
@@ -659,7 +723,7 @@ def query_stream(req: QueryRequest):
                 stream=True,
             )
 
-            for chunk in stream_resp:
+            async for chunk in stream_resp:
                 token = chunk.get("message", {}).get("content", "")
                 if token:
                     answer_parts.append(token)
@@ -694,34 +758,10 @@ def query_stream(req: QueryRequest):
 
             total_ms = round((time.monotonic() - t0) * 1000)
 
-            # Log query
-            reranker_model = (
-                cfg.models.reranker.name if getattr(cfg.models.reranker, "enabled", False) else None
+            # Log query (worker thread — event loop cannot touch sqlite)
+            query_log_id = await run_in_threadpool(
+                _persist_stream_query, answer_text, total_ms, gen_ms
             )
-            cursor = db.conn.execute(
-                """INSERT INTO query_log
-                   (user, query_text, query_lang, folder_filter_json,
-                    retrieved_chunks_json, answer_text, answer_model,
-                    embedding_model, reranker_model,
-                    latency_ms, retrieval_ms, generation_ms)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    req.user,
-                    req.query,
-                    retrieval_metrics.get("query_lang", "unknown"),
-                    json.dumps(folder_filter_dict) if folder_filter_dict else None,
-                    json.dumps([]),
-                    answer_text,
-                    model_name,
-                    cfg.models.embedding.name,
-                    reranker_model,
-                    total_ms,
-                    retrieval_ms,
-                    gen_ms,
-                ),
-            )
-            db.conn.commit()
-            query_log_id = cursor.lastrowid
 
             # Event: done
             yield ServerSentEvent(
@@ -738,10 +778,11 @@ def query_stream(req: QueryRequest):
                 ),
             )
 
-        except Exception as e:
+        except Exception:
+            logger.exception("Streamed query failed (trace_id=%s)", get_trace_id())
             yield ServerSentEvent(
                 event="error",
-                data=json.dumps({"error": str(e)}),
+                data=json.dumps({"error": "Internal error while generating the answer"}),
             )
 
     return EventSourceResponse(event_generator())
@@ -977,7 +1018,10 @@ def run_eval():
 
 
 @app.get("/conversations", response_model=list[ConversationSummary])
-def list_conversations_api(user: str | None = None, limit: int = 50):
+def list_conversations_api(
+    user: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+):
     """List conversations, most recently updated first."""
     from rag.conversation import list_conversations
 
@@ -1027,8 +1071,8 @@ def delete_conversation_api(conversation_id: str):
 
 @app.get("/queries", response_model=QueryLogPage)
 def query_history(
-    page: int = 1,
-    size: int = 20,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
     keyword: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
@@ -1158,8 +1202,17 @@ async def _upload_files_impl(
 
     for upload_file in files:
         try:
-            filename = upload_file.filename or "unnamed"
+            # Sanitize: keep only the basename — reject absolute paths, ".."
+            # segments and empty names so uploads cannot escape the corpus.
+            raw_name = upload_file.filename or ""
+            filename = Path(raw_name).name
+            if not filename or filename in {".", ".."}:
+                failed.append(raw_name or "unnamed")
+                continue
             dest = corpus_root / filename
+            if not dest.resolve().is_relative_to(corpus_root.resolve()):
+                failed.append(raw_name)
+                continue
 
             # Handle filename conflicts
             if dest.exists():
@@ -1182,7 +1235,7 @@ async def _upload_files_impl(
 
             # Get file modification time
             mtime = datetime.datetime.fromtimestamp(
-                dest.stat().st_mtime, tz=datetime.timezone.utc
+                dest.stat().st_mtime, tz=datetime.UTC
             ).isoformat()
 
             # Insert file record
@@ -1458,10 +1511,14 @@ def delete_file(file_id: int):
     file_row = file_rows[0]
     rel_path = file_row["rel_path"]
 
-    # Delete from disk
+    # Delete from disk — containment check so a tampered rel_path
+    # cannot unlink files outside the corpus root.
     corpus_root = cfg.corpus_root_path
     file_path = corpus_root / rel_path
-    if file_path.exists():
+    if (
+        file_path.exists()
+        and file_path.resolve().is_relative_to(corpus_root.resolve())
+    ):
         file_path.unlink()
 
     # Delete from Chroma

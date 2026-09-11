@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -143,7 +143,7 @@ def _run_phase(ctx: click.Context, phase_name: str, phase_fn, **kwargs):
             run_id,
             {
                 "status": "done",
-                "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "finished_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "files_processed": result.get("files_processed") if result else None,
                 "files_failed": result.get("files_failed") if result else None,
             },
@@ -154,7 +154,7 @@ def _run_phase(ctx: click.Context, phase_name: str, phase_fn, **kwargs):
             run_id,
             {
                 "status": "failed",
-                "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "finished_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "notes": str(e),
             },
         )
@@ -660,7 +660,7 @@ def query(
 @click.option("--host", default=None, help="Override API host")
 @click.option("--port", type=int, default=None, help="Override API port")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development)")
-def serve(host: str | None, port: int | None, reload: bool) -> None:  # noqa: F811
+def serve(host: str | None, port: int | None, reload: bool) -> None:
     """Phase 13: Start the FastAPI server."""
     import uvicorn
 

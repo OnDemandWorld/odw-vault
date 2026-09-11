@@ -21,6 +21,8 @@ File organization:
 
 from __future__ import annotations
 
+import contextlib
+import html
 import json
 import logging
 import sqlite3
@@ -32,9 +34,9 @@ from pathlib import Path
 import gradio as gr
 import ollama
 from fastapi import Request  # module-level on purpose: FastAPI resolves the string
+
 # annotation `request: Request` (PEP 563) of routes defined inside launch_ui()
 # from module globals — a local-only import makes every such route 422.
-
 from pipeline.config import load_app_config
 from pipeline.db import open_db
 from rag.citations import parse_citations, resolve_citations
@@ -463,15 +465,18 @@ def _citations_html(citations: list[dict]) -> str:
     cards = []
     for c in citations:
         page_str = f'<span class="citation-card__meta-item">\U0001f4c4 Page {c["page_start"]}</span>' if c.get("page_start") else ""
-        snippet = c.get("snippet", "")
-        if len(snippet) > 150:
-            snippet = snippet[:150] + "..."
+        # Snippets are raw corpus text and rel_path comes from the filesystem —
+        # escape both so document content can't inject HTML into the page.
+        snippet = html.escape(str(c.get("snippet", ""))[:150], quote=False)
+        if len(c.get("snippet", "")) > 150:
+            snippet += "..."
+        rel_path = html.escape(str(c.get("rel_path", "")), quote=True)
         cards.append(
             f'<div class="citation-card" data-cite="{c["citation_number"]}">'
             f'<div class="citation-card__relevance"></div>'
             f'<div class="citation-card__number">{c["citation_number"]}</div>'
             f'<div class="citation-card__content">'
-            f'<div class="citation-card__title">{c["rel_path"]}</div>'
+            f'<div class="citation-card__title">{rel_path}</div>'
             f'<div class="citation-card__snippet">{snippet}</div>'
             f'<div class="citation-card__meta">{page_str}</div>'
             f'</div></div>'
@@ -645,7 +650,6 @@ def _ensure_conv_tables():
 
 def _save_conversation_message(conv_id: str, role: str, content: str, title: str | None = None):
     """Save a message to a conversation, creating the conversation if needed."""
-    import uuid
     db = _get_db()
     existing = db.conn.execute("SELECT id FROM conversation WHERE id = ?", (conv_id,)).fetchone()
     if not existing:
@@ -796,18 +800,18 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     A lightweight proxy server runs on the user-facing port,
     serving our custom HTML at / and proxying /gradio_api to Gradio.
     """
-    import threading
-    import time
-    import uvicorn
-    from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, StreamingResponse
-    from starlette.responses import Response
-    import httpx
-
     # Ensure localhost bypasses any environment HTTP proxy. Otherwise httpx
     # (used below for the reverse proxy and by Gradio's own startup probe)
     # would route 127.0.0.1 traffic through e.g. HTTP_PROXY and get a 502.
     import os as _os
+    import threading
+    import time
+
+    import httpx
+    import uvicorn
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse, StreamingResponse
+    from starlette.responses import Response
     _no_proxy = _os.environ.get("NO_PROXY", _os.environ.get("no_proxy", ""))
     _no_set = {p.strip() for p in _no_proxy.split(",") if p.strip()}
     _need = [h for h in ("127.0.0.1", "localhost") if h not in _no_set]
@@ -836,7 +840,12 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     ollama_status = '\U0001f7e2 Ollama OK' if ollama_ok else '\U0001f534 Ollama down'
 
     chips_json = str([{"icon": c["icon"], "text": c["text"]} for c in _PROMPT_CHIPS[:4]]).replace("'", '"')
-    folder_options = "".join(f'<option value="{f}">{f}</option>' for f in folder_choices)
+    # Folder names come from the filesystem — escape so a '<' or '"' in a
+    # directory name can't inject HTML into the page shell.
+    folder_options = "".join(
+        f'<option value="{html.escape(f, quote=True)}">{html.escape(f, quote=False)}</option>'
+        for f in folder_choices
+    )
 
     full_html = _build_full_page(greeting, chips_json, folder_options, ollama_status)
 
@@ -921,7 +930,6 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
 
     # Step 2: Create our proxy server on the user-facing port
     # Use httpx reverse proxy to forward /gradio_api/* to Gradio backend
-    from starlette.middleware.base import BaseHTTPMiddleware
 
     proxy_app = FastAPI(title="ODW Vault")
 
@@ -1122,6 +1130,189 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
                 entry["api_key"] = stored.get("api_key") or ""
         models = await run_in_threadpool(_provider_list_models, entry)
         return {"ok": bool(models), "models": models}
+
+    # ---- Indexing / vectorization status -----------------------------------
+
+    _sync_lock_ui = threading.Lock()
+    _sync_status_ui: dict = {"running": False, "last_result": None, "started_at": None, "finished_at": None}
+
+    def _get_indexing_status() -> dict:
+        """Compute comprehensive indexing/vectorization status from the DB."""
+        try:
+            db = _get_db()
+
+            # Total non-excluded files
+            total_files = db.conn.execute(
+                "SELECT COUNT(*) as c FROM file WHERE excluded = 0 AND is_dup_primary = 1"
+            ).fetchone()["c"]
+
+            # Files with embeddings (fully indexed) — takes precedence over
+            # every other state, so an old failure row on a since-fixed file
+            # doesn't misclassify it.
+            embedded_files = db.conn.execute(
+                "SELECT COUNT(DISTINCT c.file_id) as c FROM chunk c "
+                "JOIN embedding_ref er ON er.chunk_id = c.id "
+                "JOIN file f ON f.id = c.file_id "
+                "WHERE f.excluded = 0 AND f.is_dup_primary = 1 AND er.is_current = 1"
+            ).fetchone()["c"]
+
+            # Files whose latest pipeline state is a failure — extraction,
+            # embedding, or summarization can all record failures.
+            failed_files = db.conn.execute(
+                "SELECT COUNT(DISTINCT f.id) as c FROM file f "
+                "JOIN failure fail ON fail.file_id = f.id "
+                "WHERE f.excluded = 0 AND f.is_dup_primary = 1 "
+                "AND fail.phase IN ('extract', 'indexer', 'embed', 'summarize') "
+                "AND f.id NOT IN ("
+                "  SELECT c.file_id FROM chunk c"
+                "  JOIN embedding_ref er ON er.chunk_id = c.id AND er.is_current = 1"
+                ")"
+            ).fetchone()["c"]
+
+            # Files with successful extraction but no embeddings yet
+            extracted_files = db.conn.execute(
+                "SELECT COUNT(DISTINCT f.id) as c FROM file f "
+                "JOIN extraction e ON e.file_id = f.id "
+                "WHERE f.excluded = 0 AND f.is_dup_primary = 1 AND e.succeeded = 1 "
+                "AND f.id NOT IN ("
+                "  SELECT c.file_id FROM chunk c"
+                "  JOIN embedding_ref er ON er.chunk_id = c.id AND er.is_current = 1"
+                ") "
+                "AND f.id NOT IN ("
+                "  SELECT fail.file_id FROM failure fail"
+                "  WHERE fail.phase IN ('extract', 'indexer', 'embed', 'summarize')"
+                ")"
+            ).fetchone()["c"]
+
+            # Total chunks
+            total_chunks = db.conn.execute(
+                "SELECT COUNT(*) as c FROM chunk"
+            ).fetchone()["c"]
+
+            # Embedded chunks
+            embedded_chunks = db.conn.execute(
+                "SELECT COUNT(DISTINCT chunk_id) as c FROM embedding_ref WHERE is_current = 1"
+            ).fetchone()["c"]
+
+            # Whatever remains is waiting to be processed
+            pending_files = total_files - embedded_files - failed_files - extracted_files
+
+            # Per-folder breakdown — "embedded" uses the same
+            # embedding_ref.is_current=1 definition as the totals above.
+            folder_rows = db.conn.execute(
+                """SELECT fo.id, fo.rel_path, fo.name,
+                          COUNT(DISTINCT f.id) AS total_files,
+                          COUNT(DISTINCT CASE WHEN e.id IS NOT NULL AND e.succeeded = 1 THEN f.id END) AS extracted,
+                          COUNT(DISTINCT CASE WHEN er.chunk_id IS NOT NULL THEN f.id END) AS embedded
+                   FROM folder fo
+                   LEFT JOIN file f ON f.folder_id = fo.id AND f.excluded = 0 AND f.is_dup_primary = 1
+                   LEFT JOIN extraction e ON e.file_id = f.id AND e.succeeded = 1
+                   LEFT JOIN chunk c ON c.file_id = f.id
+                   LEFT JOIN embedding_ref er ON er.chunk_id = c.id AND er.is_current = 1
+                   WHERE fo.excluded = 0
+                   GROUP BY fo.id
+                   HAVING total_files > 0
+                   ORDER BY fo.rel_path"""
+            ).fetchall()
+
+            folders = []
+            for r in folder_rows:
+                f_total = r["total_files"]
+                f_extracted = r["extracted"]
+                f_embedded = r["embedded"]
+                if f_total > 0:
+                    status = "complete" if f_embedded >= f_total else ("partial" if f_extracted > 0 or f_embedded > 0 else "pending")
+                else:
+                    status = "empty"
+                folders.append({
+                    "id": r["id"],
+                    "rel_path": r["rel_path"],
+                    "name": r["name"] or r["rel_path"],
+                    "total_files": f_total,
+                    "extracted": f_extracted,
+                    "embedded": f_embedded,
+                    "status": status,
+                })
+
+            # Last UI-triggered sync (the indexer doesn't write run rows,
+            # so CLI syncs are not reflected here).
+            last_sync = _sync_status_ui.get("finished_at")
+            last_error = None
+            last_result = _sync_status_ui.get("last_result")
+            if isinstance(last_result, dict) and last_result.get("error"):
+                last_error = last_result["error"]
+
+            # Overall completion percentage
+            progress_pct = round((embedded_files / total_files * 100), 1) if total_files > 0 else 0
+
+            return {
+                "total_files": total_files,
+                "extracted_files": extracted_files,
+                "embedded_files": embedded_files,
+                "failed_files": failed_files,
+                "pending_files": max(0, pending_files),
+                "total_chunks": total_chunks,
+                "embedded_chunks": embedded_chunks,
+                "progress_pct": progress_pct,
+                "last_sync": last_sync,
+                "last_error": last_error,
+                "folders": folders,
+                "sync_running": _sync_status_ui["running"],
+                "sync_started_at": _sync_status_ui.get("started_at"),
+            }
+        except Exception as exc:
+            logger.warning("Failed to get indexing status: %s", exc)
+            return {
+                "total_files": 0, "extracted_files": 0, "embedded_files": 0,
+                "failed_files": 0, "pending_files": 0, "total_chunks": 0,
+                "embedded_chunks": 0, "progress_pct": 0, "last_sync": None,
+                "folders": [], "sync_running": False, "error": str(exc),
+            }
+
+    @proxy_app.get("/api/indexing/status")
+    async def indexing_status():
+        return await run_in_threadpool(_get_indexing_status)
+
+    @proxy_app.post("/api/indexing/sync")
+    async def trigger_indexing_sync():
+        """Trigger a full incremental sync in background."""
+        if _sync_status_ui["running"]:
+            return {"ok": False, "error": "A sync is already in progress"}
+
+        def _run_sync():
+            db = None
+            try:
+                # Reuse the config this UI instance was launched with —
+                # reloading config.toml from disk could target a different
+                # corpus/chroma than retrieval uses.
+                db = _get_db()
+                import chromadb
+                chroma_client = chromadb.PersistentClient(path=str(_chroma_path))
+                from rag.indexer import IncrementalIndexer
+                indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+                result = indexer.sync_all()
+                _sync_status_ui["last_result"] = result
+            except Exception as exc:
+                logger.error("Indexing sync failed: %s", exc)
+                _sync_status_ui["last_result"] = {"error": str(exc)}
+            finally:
+                _sync_status_ui["running"] = False
+                _sync_status_ui["started_at"] = None
+                _sync_status_ui["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                if db is not None:
+                    with contextlib.suppress(Exception):
+                        db.conn.close()
+
+        with _sync_lock_ui:
+            if _sync_status_ui["running"]:
+                return {"ok": False, "error": "A sync is already in progress"}
+            _sync_status_ui["running"] = True
+            _sync_status_ui["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        t = threading.Thread(target=_run_sync, daemon=True)
+        t.start()
+
+        return {"ok": True, "message": "Sync started in background"}
 
     # Single catch-all proxy for all Gradio API requests
     # Long-lived upstream client. Shared (not per-request) so streamed
@@ -1636,6 +1827,45 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 #settings-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #settings-toast.ok{border-color:var(--success)}
 #settings-toast.err{border-color:var(--error)}
+
+/* Knowledge Base Status */
+.kb-status-overview{border:1px solid var(--border-default);border-radius:var(--radius-lg);padding:16px;background:var(--bg-secondary);display:flex;flex-direction:column;gap:14px}
+.kb-status-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.kb-status-row__label{font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-tertiary);font-weight:600}
+.kb-status-row__value{font-family:var(--font-mono);font-size:13px;color:var(--text-primary);font-weight:600}
+.kb-status-row__value--success{color:var(--success)}
+.kb-status-row__value--warning{color:var(--warning)}
+.kb-status-row__value--error{color:var(--error)}
+.kb-progress-bar{width:100%;height:8px;border-radius:var(--radius-full);background:var(--bg-tertiary);overflow:hidden;position:relative}
+.kb-progress-bar__fill{height:100%;border-radius:var(--radius-full);background:linear-gradient(90deg,var(--accent),var(--success));transition:width 600ms var(--ease-default);position:relative}
+.kb-progress-bar__fill--partial{background:linear-gradient(90deg,var(--accent),var(--warning))}
+.kb-progress-bar__fill--error{background:var(--error)}
+.kb-status-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+@media(max-width:560px){.kb-status-stats{grid-template-columns:repeat(2,1fr)}}
+.kb-stat{display:flex;flex-direction:column;align-items:center;padding:10px 8px;border:1px solid var(--border-subtle);border-radius:var(--radius-md);background:var(--bg-primary);gap:2px}
+.kb-stat__value{font-family:var(--font-mono);font-size:18px;font-weight:700;color:var(--accent);line-height:1.1}
+.kb-stat__label{font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-tertiary)}
+.kb-stat__value--success{color:var(--success)}
+.kb-stat__value--warning{color:var(--warning)}
+.kb-stat__value--error{color:var(--error)}
+.kb-folder-list{display:flex;flex-direction:column;gap:6px;max-height:240px;overflow-y:auto;padding:4px 0}
+.kb-folder-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--border-subtle);border-radius:var(--radius-md);background:var(--bg-primary);transition:all var(--duration-fast) var(--ease-default)}
+.kb-folder-item:hover{border-color:var(--border-default)}
+.kb-folder-item__icon{font-size:14px;flex-shrink:0}
+.kb-folder-item__name{font-size:12px;font-weight:500;color:var(--text-primary);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kb-folder-item__stats{font-family:var(--font-mono);font-size:10px;color:var(--text-tertiary);white-space:nowrap}
+.kb-folder-item__dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.kb-folder-item__dot--complete{background:var(--success);box-shadow:0 0 4px var(--success)}
+.kb-folder-item__dot--partial{background:var(--warning);box-shadow:0 0 4px var(--warning)}
+.kb-folder-item__dot--pending{background:var(--text-disabled)}
+.kb-folder-item__dot--syncing{background:var(--accent);animation:kb-pulse 1.2s ease-in-out infinite}
+@keyframes kb-pulse{0%,100%{opacity:0.4;transform:scale(0.8)}50%{opacity:1;transform:scale(1.2)}}
+.kb-status-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px}
+.kb-sync-indicator{display:inline-flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:10px;color:var(--accent);padding:4px 10px;border:1px solid rgba(255,90,31,0.2);border-radius:var(--radius-full);background:var(--accent-subtle)}
+.kb-sync-indicator__spinner{width:10px;height:10px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:kb-spin 0.8s linear infinite}
+@keyframes kb-spin{to{transform:rotate(360deg)}}
+.kb-last-sync{font-family:var(--font-mono);font-size:10px;color:var(--text-tertiary);margin-top:2px}
+.kb-sync-error{display:none;font-family:var(--font-mono);font-size:10.5px;color:var(--error);background:rgba(255,59,48,0.08);border:1px solid rgba(255,59,48,0.25);border-radius:var(--radius-md);padding:8px 10px;margin-top:8px;word-break:break-word}
 </style>
 </head>
 <body>
@@ -1722,7 +1952,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
   /* -- Theme -- */
   var _themeMode = localStorage.getItem('vault-theme') || 'light';
   var _themeIcons = {light:'\u2600\ufe0f', dark:'\\ud83c\\udf19'};
-  
+
   function _applyTheme(){
     document.documentElement.setAttribute('data-theme', _themeMode);
     var btn = document.getElementById('theme-toggle-sidebar');
@@ -1998,7 +2228,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     });
   }
 
-  function _escHtml(s){ var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  function _escHtml(s){ var d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
   function _done(el){
     _S.streaming = false;
@@ -2074,8 +2304,8 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     // Links
     t = t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
     // Citation markers - make clickable
-    t = t.replace(/\[([\d,\s]+)\]/g, function(m, nums){
-      var parts = nums.split(/[,\s]+/).filter(Boolean);
+    t = t.replace(/\\[([\\d,\\s]+)\\]/g, function(m, nums){
+      var parts = nums.split(/[,\\s]+/).filter(Boolean);
       var links = [];
       for(var ci = 0; ci < parts.length; ci++){
         links.push('<span class="cite-link" data-cite-num="' + parts[ci] + '" onclick="window._scrollToCite(' + parts[ci] + ')">[' + parts[ci] + ']</span>');
@@ -2448,7 +2678,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 <div class="settings-modal__header">
 <div>
 <div class="settings-modal__title">Vault Settings</div>
-<div class="settings-modal__subtitle">Models &amp; Providers</div>
+<div class="settings-modal__subtitle">Models, Providers &amp; Knowledge Base</div>
 </div>
 <button class="settings-modal__close" id="settings-close" title="Close (Esc)">\u2715</button>
 </div>
@@ -2504,6 +2734,73 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 </div>
 
 <div class="settings-block">
+<div class="settings-block__head"><span class="settings-block__title">Knowledge Base</span>
+<div style="display:flex;gap:6px">
+<button id="kb-refresh-btn" class="settings-btn settings-btn--mini" title="Refresh status">&#x21bb; Refresh</button>
+<button id="kb-sync-btn" class="settings-btn settings-btn--mini settings-btn--primary" title="Start incremental sync">&#x26a1; Sync Now</button>
+</div>
+</div>
+<p class="settings-hint">Vectorization status of your corpus. Shows extraction, chunking, and embedding progress across all folders. New files added to the corpus need to be synced before they appear in search results.</p>
+
+<div class="kb-status-overview">
+<div>
+<div class="kb-status-row">
+<span class="kb-status-row__label">Overall Progress</span>
+<span class="kb-status-row__value" id="kb-progress-text">--</span>
+</div>
+<div class="kb-progress-bar" style="margin-top:8px">
+<div class="kb-progress-bar__fill" id="kb-progress-fill" style="width:0%"></div>
+</div>
+</div>
+
+<div class="kb-status-stats">
+<div class="kb-stat">
+<span class="kb-stat__value" id="kb-stat-total">--</span>
+<span class="kb-stat__label">Files</span>
+</div>
+<div class="kb-stat">
+<span class="kb-stat__value kb-stat__value--success" id="kb-stat-embedded">--</span>
+<span class="kb-stat__label">Embedded</span>
+</div>
+<div class="kb-stat">
+<span class="kb-stat__value kb-stat__value--warning" id="kb-stat-pending">--</span>
+<span class="kb-stat__label">Pending</span>
+</div>
+<div class="kb-stat">
+<span class="kb-stat__value" id="kb-stat-chunks">--</span>
+<span class="kb-stat__label">Chunks</span>
+</div>
+<div class="kb-stat">
+<span class="kb-stat__value kb-stat__value--error" id="kb-stat-failed">--</span>
+<span class="kb-stat__label">Failed</span>
+</div>
+<div class="kb-stat">
+<span class="kb-stat__value" id="kb-stat-folders">--</span>
+<span class="kb-stat__label">Folders</span>
+</div>
+</div>
+
+<div>
+<div class="kb-status-row" style="margin-bottom:6px">
+<span class="kb-status-row__label">Per-Folder Status</span>
+</div>
+<div class="kb-folder-list" id="kb-folder-list">
+<div style="padding:12px;text-align:center;font-size:11px;color:var(--text-tertiary)">Loading...</div>
+</div>
+</div>
+
+<div class="kb-status-actions">
+<div id="kb-sync-indicator" style="display:none" class="kb-sync-indicator">
+<div class="kb-sync-indicator__spinner"></div>
+<span>Syncing...</span>
+</div>
+<span class="kb-last-sync" id="kb-last-sync"></span>
+</div>
+<div id="kb-sync-error" style="display:none" class="kb-sync-error"></div>
+</div>
+</div>
+
+<div class="settings-block">
 <div class="settings-block__head"><span class="settings-block__title">System</span></div>
 <div id="settings-sysinfo" class="sysinfo-grid"></div>
 </div>
@@ -2519,7 +2816,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
   var _toastTimer = null;
 
   function _q(id){ return document.getElementById(id); }
-  function _esc(s){ var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+  function _esc(s){ var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
   function _toast(msg, kind){
     var t = _q('settings-toast');
@@ -2718,11 +3015,14 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 
   /* -- wire events -- */
   var settingsBtn = _q('settings-btn');
-  if(settingsBtn) settingsBtn.addEventListener('click', _openSettings);
+  // Call-through wrappers: _openSettings is re-wrapped further below to add
+  // the KB status auto-fetch, and addEventListener would otherwise capture
+  // the pre-wrap function value.
+  if(settingsBtn) settingsBtn.addEventListener('click', function(){ _openSettings(); });
   var modelBadge = _q('model-badge');
-  if(modelBadge) modelBadge.addEventListener('click', _openSettings);
+  if(modelBadge) modelBadge.addEventListener('click', function(){ _openSettings(); });
   var closeBtn = _q('settings-close');
-  if(closeBtn) closeBtn.addEventListener('click', _closeSettings);
+  if(closeBtn) closeBtn.addEventListener('click', function(){ _closeSettings(); });
   var overlay = _q('settings-overlay');
   if(overlay) overlay.addEventListener('click', function(e){ if(e.target === overlay) _closeSettings(); });
   document.addEventListener('keydown', function(e){
@@ -2848,6 +3148,202 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 
   /* -- initial state (badge + data warm-up) -- */
   _api('GET', '/api/settings').then(_applySettings).catch(function(){});
+
+  /* -- Knowledge Base Status -- */
+  var _kbRefreshTimer = null;
+  var _kbSyncPollTimer = null;
+
+  function _renderKbStatus(data){
+    if(!data) return;
+    // Partial payloads (e.g. {sync_running:true}) only carry sync state —
+    // skip the data sections when the status fields are absent.
+    var full = (data.progress_pct != null);
+
+    // Progress text
+    var pctText = data.progress_pct + '%';
+    var progressEl = _q('kb-progress-text');
+    if(progressEl && full){
+      if(data.sync_running){
+        progressEl.textContent = 'Syncing...';
+        progressEl.className = 'kb-status-row__value kb-status-row__value--warning';
+      } else if(data.progress_pct >= 100){
+        progressEl.textContent = 'Complete (' + pctText + ')';
+        progressEl.className = 'kb-status-row__value kb-status-row__value--success';
+      } else if(data.failed_files > 0){
+        progressEl.textContent = pctText + ' (' + data.failed_files + ' failed)';
+        progressEl.className = 'kb-status-row__value kb-status-row__value--error';
+      } else if(data.pending_files > 0){
+        progressEl.textContent = pctText + ' (' + data.pending_files + ' pending)';
+        progressEl.className = 'kb-status-row__value kb-status-row__value--warning';
+      } else {
+        progressEl.textContent = pctText;
+        progressEl.className = 'kb-status-row__value';
+      }
+    }
+
+    // Progress bar
+    var fillEl = _q('kb-progress-fill');
+    if(fillEl && full){
+      fillEl.style.width = Math.min(data.progress_pct, 100) + '%';
+      fillEl.className = 'kb-progress-bar__fill';
+      if(data.failed_files > 0 && data.progress_pct < 100) fillEl.classList.add('kb-progress-bar__fill--error');
+      else if(data.pending_files > 0 && data.progress_pct < 100) fillEl.classList.add('kb-progress-bar__fill--partial');
+    }
+
+    // Stats
+    if(!full) return _renderKbSyncState(data);
+    var statMap = {
+      'kb-stat-total': data.total_files,
+      'kb-stat-embedded': data.embedded_files,
+      'kb-stat-pending': data.pending_files,
+      'kb-stat-chunks': data.total_chunks,
+      'kb-stat-failed': data.failed_files,
+      'kb-stat-folders': data.folders ? data.folders.length : 0,
+    };
+    for(var key in statMap){
+      var el = _q(key);
+      if(el) el.textContent = statMap[key] != null ? statMap[key] : '--';
+    }
+
+    // Folder list
+    var listEl = _q('kb-folder-list');
+    if(listEl){
+      if(data.folders && !data.folders.length){
+        listEl.innerHTML = '<div style="padding:12px;text-align:center;font-size:11px;color:var(--text-tertiary)">No folders found. Add documents to your corpus to get started.</div>';
+      } else {
+        var html = '';
+        for(var i = 0; i < data.folders.length; i++){
+          var f = data.folders[i];
+          var dotClass = 'kb-folder-item__dot--' + f.status;
+          if(data.sync_running && f.status !== 'complete') dotClass = 'kb-folder-item__dot--syncing';
+          var icon = f.status === 'complete' ? '\\u2705' : (f.status === 'partial' ? '\\u23f3' : '\\u2b55');
+          var statsText = f.embedded + '/' + f.total_files + ' embedded';
+          html += '<div class="kb-folder-item" title="' + _esc(f.rel_path) + '">' +
+            '<span class="kb-folder-item__dot ' + dotClass + '"></span>' +
+            '<span class="kb-folder-item__icon">' + icon + '</span>' +
+            '<span class="kb-folder-item__name">' + _esc(f.name || f.rel_path) + '</span>' +
+            '<span class="kb-folder-item__stats">' + statsText + '</span>' +
+            '</div>';
+        }
+        listEl.innerHTML = html;
+      }
+    }
+
+    // Last sync
+    var lastSyncEl = _q('kb-last-sync');
+    if(lastSyncEl && data.last_sync != null){
+      if(data.last_sync){
+        lastSyncEl.textContent = 'Last sync: ' + data.last_sync;
+      } else {
+        lastSyncEl.textContent = 'Never synced';
+      }
+    }
+
+    // Error banner from the last sync, if any
+    var errEl = _q('kb-sync-error');
+    if(errEl){
+      if(data.last_error){
+        errEl.textContent = 'Last sync failed: ' + data.last_error;
+        errEl.style.display = '';
+      } else {
+        errEl.style.display = 'none';
+      }
+    }
+
+    return _renderKbSyncState(data);
+  }
+
+  function _renderKbSyncState(data){
+    // Sync indicator
+    var indicatorEl = _q('kb-sync-indicator');
+    if(indicatorEl) indicatorEl.style.display = data.sync_running ? '' : 'none';
+
+    // Sync button state
+    var syncBtn = _q('kb-sync-btn');
+    if(syncBtn){
+      if(data.sync_running){
+        syncBtn.setAttribute('disabled', '');
+        syncBtn.innerHTML = '\\u23f3 Syncing...';
+      } else {
+        syncBtn.removeAttribute('disabled');
+        syncBtn.innerHTML = '\\u26a1 Sync Now';
+      }
+    }
+  }
+
+  function _fetchKbStatus(){
+    _api('GET', '/api/indexing/status')
+      .then(_renderKbStatus)
+      .catch(function(){});
+  }
+
+  function _triggerKbSync(){
+    _api('POST', '/api/indexing/sync', {})
+      .then(function(resp){
+        if(resp.ok){
+          _toast('Sync started — processing new/modified files', 'ok');
+          _renderKbSyncState({sync_running: true});
+          _fetchKbStatus();
+          // Poll for completion
+          _startSyncPolling();
+        } else {
+          _toast(resp.error || 'Sync failed', 'err');
+        }
+      })
+      .catch(function(){ _toast('Network error', 'err'); });
+  }
+
+  function _startSyncPolling(){
+    if(_kbSyncPollTimer) clearInterval(_kbSyncPollTimer);
+    var pollsLeft = 600; // 30 min cap — never poll forever
+    _kbSyncPollTimer = setInterval(function(){
+      if(pollsLeft-- <= 0){
+        clearInterval(_kbSyncPollTimer);
+        _kbSyncPollTimer = null;
+        _toast('Sync is taking unusually long — refresh to check status', 'err');
+        return;
+      }
+      _api('GET', '/api/indexing/status')
+        .then(function(data){
+          _renderKbStatus(data);
+          if(!data.sync_running){
+            clearInterval(_kbSyncPollTimer);
+            _kbSyncPollTimer = null;
+            if(data.last_error){
+              _toast('Sync failed: ' + data.last_error, 'err');
+            } else if(data.pending_files === 0 && data.failed_files === 0){
+              _toast('Sync complete — all files indexed', 'ok');
+            } else if(data.failed_files > 0){
+              _toast('Sync finished — ' + data.failed_files + ' files failed', 'err');
+            } else {
+              _toast('Sync complete — ' + data.pending_files + ' files still pending', 'ok');
+            }
+          }
+        })
+        .catch(function(){});
+    }, 3000);
+  }
+
+  // Wire KB status buttons
+  var kbRefreshBtn = _q('kb-refresh-btn');
+  if(kbRefreshBtn) kbRefreshBtn.addEventListener('click', _fetchKbStatus);
+  var kbSyncBtn = _q('kb-sync-btn');
+  if(kbSyncBtn) kbSyncBtn.addEventListener('click', _triggerKbSync);
+
+  // Auto-fetch KB status when settings opens
+  var _origOpenSettings = _openSettings;
+  _openSettings = function(){
+    _origOpenSettings();
+    _fetchKbStatus();
+    // Start auto-refresh while settings is open
+    if(_kbRefreshTimer) clearInterval(_kbRefreshTimer);
+    _kbRefreshTimer = setInterval(_fetchKbStatus, 10000);
+  };
+  var _origCloseSettings = _closeSettings;
+  _closeSettings = function(){
+    _origCloseSettings();
+    if(_kbRefreshTimer){ clearInterval(_kbRefreshTimer); _kbRefreshTimer = null; }
+  };
 })();
 </script>
 </body>

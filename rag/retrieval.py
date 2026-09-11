@@ -97,6 +97,10 @@ def retrieve(
         candidate_file_ids = _hierarchical_narrowing(
             client, suffix, _query_emb, query, cfg, db, allowed_file_ids
         )
+    elif allowed_file_ids is not None:
+        # Without hierarchical narrowing the folder filter must still bind:
+        # candidate_file_ids=None would search the entire corpus.
+        candidate_file_ids = set(allowed_file_ids)
 
     # Exclude derived/meta files from search (preflight_report.md
     # contains folder listings that poison keyword matching)
@@ -109,10 +113,14 @@ def retrieve(
     # This ensures files with query terms in their path (e.g. "kwh")
     # are included even if hierarchical narrowing didn't pick them
     _path_match_ids = _find_files_by_path(db, query, excluded_ids)
+    if allowed_file_ids is not None:
+        _path_match_ids &= allowed_file_ids
     if candidate_file_ids is not None:
         candidate_file_ids = (candidate_file_ids | _path_match_ids) - excluded_ids
     elif _path_match_ids:
-        candidate_file_ids = _path_match_ids - excluded_ids
+        # No filter and no narrowing: keep unrestricted — path hits still
+        # get their BM25 boost via _path_match_retrieve below.
+        pass
 
     # 5. Dense chunk retrieval
     dense_candidates = cfg.retrieval.dense_candidates
@@ -287,6 +295,11 @@ def _hierarchical_narrowing(
 
     if allowed_file_ids is not None:
         candidate_ids &= allowed_file_ids
+        # Narrowing is a recall heuristic, never a scope boundary: if it
+        # produced nothing inside the allowed scope, fall back to the whole
+        # allowed scope. Never return None (unrestricted) when a filter is
+        # active, and never an empty set the caller would treat as None.
+        return candidate_ids if candidate_ids else set(allowed_file_ids)
 
     return candidate_ids if candidate_ids else None
 

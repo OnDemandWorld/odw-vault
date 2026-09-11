@@ -3,6 +3,12 @@
 Pure SQL operation. Assigns dup_group_id to all files sharing a SHA-256,
 marking all but one member as is_dup_primary=0. Canonical copy: shortest
 rel_path, tiebreaker oldest mtime.
+
+The phase resets all primary flags first so re-runs are idempotent: files
+whose sha256 changed since the last run don't keep stale non-primary marks.
+The canonical copy is always chosen among *eligible* files (not excluded,
+hash done) — an excluded copy must never win the canonical slot, or the
+whole group disappears from downstream views and phases.
 """
 
 from __future__ import annotations
@@ -17,12 +23,15 @@ def run_phase4(
     plog: PhaseLogger,
 ) -> dict:
     """Run exact deduplication."""
+    # Reset grouping so re-runs are idempotent (sha256 may have changed).
+    db.execute("UPDATE file SET is_dup_primary=1, dup_group_id=NULL")
+
     # Find duplicate groups (files sharing SHA-256)
     dup_groups = list(
         db.query("""
         SELECT sha256, COUNT(*) AS copies, MIN(id) AS min_id
         FROM file
-        WHERE sha256 IS NOT NULL AND hash_status='done' AND excluded=0
+        WHERE sha256 IS NOT NULL AND sha256 != '' AND hash_status='done' AND excluded=0
         GROUP BY sha256
         HAVING copies > 1
     """)
@@ -48,14 +57,18 @@ def run_phase4(
                 [min_id, sha256],
             )
 
-            # Mark all but the canonical as non-primary
+            # Mark all but the canonical as non-primary. The canonical is
+            # selected only among eligible copies (excluded=0, hash done) —
+            # the same filter that grouped them above.
             db.execute(
                 """
                 UPDATE file SET is_dup_primary=0
                 WHERE sha256=?
+                AND excluded=0 AND hash_status='done'
                 AND id NOT IN (
                     SELECT id FROM file
                     WHERE sha256=?
+                    AND excluded=0 AND hash_status='done'
                     ORDER BY LENGTH(rel_path) ASC, mtime ASC, id ASC
                     LIMIT 1
                 )

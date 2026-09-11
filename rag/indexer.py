@@ -473,16 +473,28 @@ class IncrementalIndexer:
             extractor_fn = extract_filename_only
 
         try:
-            result = extractor_fn(str(file_path))
-            text = result.get("text", "") or ""
-            tool = result.get("tool", strategy)
-            page_count = result.get("page_count")
+            # Extractors return (text, meta, succeeded, err) — same contract
+            # as rag/phase8_extract.py; tika needs its URL/brute-force opts.
+            if strategy == "tika":
+                text, meta, succeeded, err = extractor_fn(
+                    str(file_path),
+                    tika_url=self.cfg.extract.tika_url,
+                    brute_force=self.cfg.extract.tika_brute_force_fallback,
+                )
+            else:
+                text, meta, succeeded, err = extractor_fn(str(file_path))
+
+            if not succeeded:
+                raise RuntimeError(err or "extractor reported failure")
+
+            text = text or ""
+            page_count = meta.get("page_count") if isinstance(meta, dict) else None
 
             stored_text = text[:_MAX_EXTRACT_TEXT_DB]
             self.db["extraction"].insert(
                 {
                     "file_id": file_id,
-                    "tool": tool,
+                    "tool": strategy,
                     "text_extracted": stored_text if stored_text else None,
                     "char_count": len(text),
                     "page_count": page_count,
@@ -712,7 +724,6 @@ class IncrementalIndexer:
             return
 
         try:
-            import chromadb
 
             from rag.phase11_embed import _ensure_collection, _get_dim_from_ollama, _ollama_embed
 

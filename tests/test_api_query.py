@@ -175,23 +175,31 @@ class TestQueryStreamEndpoint:
     @patch("api.main.retrieve")
     @patch("api.main._load_config")
     @patch("api.main.ollama.Client")
+    @patch("api.main.ollama.AsyncClient")
     @patch("api.main.chromadb.PersistentClient")
     def test_stream_emits_expected_events(
-        self, mock_chroma, mock_ollama, mock_load_cfg, mock_retrieve, tmp_path
+        self, mock_chroma, mock_async_ollama, mock_ollama, mock_load_cfg, mock_retrieve, tmp_path
     ):
         db = _make_test_db(tmp_path)
         mock_load_cfg.return_value = _make_cfg(tmp_path)
 
-        # Same mock instance is used for the reachability check (.list) and
-        # the streaming chat call (.chat).
-        client_instance = mock_ollama.return_value
-        client_instance.list.return_value = {"models": []}
-        client_instance.chat.return_value = iter(
-            [
-                {"message": {"content": "The answer "}},
-                {"message": {"content": "is platform X [1]."}},
-            ]
-        )
+        # Reachability check uses the sync client; streaming uses the async
+        # client whose .chat awaits to an async iterator of chunks.
+        mock_ollama.return_value.list.return_value = {"models": []}
+
+        chunks = [
+            {"message": {"content": "The answer "}},
+            {"message": {"content": "is platform X [1]."}},
+        ]
+
+        async def _fake_chat(**kwargs):
+            async def _gen():
+                for chunk in chunks:
+                    yield chunk
+
+            return _gen()
+
+        mock_async_ollama.return_value.chat.side_effect = _fake_chat
         mock_chroma.return_value.get_collection.return_value = MagicMock()
         mock_retrieve.return_value = (
             [_make_hit()],
