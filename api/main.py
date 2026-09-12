@@ -17,6 +17,7 @@ from pathlib import Path
 import chromadb
 import ollama
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
@@ -77,7 +78,21 @@ def _get_db():
 
 
 def _load_config():
-    return load_app_config(CONFIG_PATH)
+    cfg = load_app_config(CONFIG_PATH)
+    # Container/suite deployments point Ollama at a sibling service via env;
+    # config.toml has no way to express that, so the env wins when present.
+    env_host = os.environ.get("VAULT_OLLAMA_HOST", "").strip()
+    if env_host:
+        cfg.ollama.host = env_host
+    # The example config ships with a cloud generation endpoint; containers use
+    # the in-network Ollama instead (VAULT_GENERATION_HOST, or the same host as
+    # VAULT_OLLAMA_HOST when the baked config still points at a cloud default).
+    gen_host = os.environ.get("VAULT_GENERATION_HOST", "").strip()
+    if gen_host:
+        cfg.models.generation.endpoint.host = gen_host
+    elif env_host and "ollama.com" in str(cfg.models.generation.endpoint.host):
+        cfg.models.generation.endpoint.host = env_host
+    return cfg
 
 
 app = FastAPI(title="ODW.ai Vault RAG")
@@ -229,9 +244,19 @@ def root():
 # GET /health
 # ---------------------------------------------------------------------------
 
+# Component probes (Ollama list, Chroma collection open, fasttext load) are
+# expensive; under concurrent LLM load they pushed /health p95 past 1s. Cache
+# the computed snapshot briefly — /health is a status probe, not a live gauge.
+_HEALTH_TTL_SECONDS = 5.0
+_health_cache: dict = {"at": 0.0, "value": None}
+
 
 @app.get("/health", response_model=HealthResponse)
 def health():
+    now = time.monotonic()
+    if _health_cache["value"] is not None and now - _health_cache["at"] < _HEALTH_TTL_SECONDS:
+        return _health_cache["value"]
+
     cfg = _load_config()
 
     # Ollama check
@@ -277,11 +302,42 @@ def health():
     except Exception:
         logger.warning("fastText model not found at %s", model_path)
 
-    return HealthResponse(
+    snapshot = HealthResponse(
         ollama=ollama_ok,
         chroma=chroma_ok,
         database=db_ok,
         fasttext=fasttext_ok,
+    )
+    _health_cache["at"] = now
+    _health_cache["value"] = snapshot
+    return snapshot
+
+
+# ---------------------------------------------------------------------------
+# 422 校验错误瘦身：默认的 RequestValidationError 会把完整输入回显进
+# `input` 字段（一个 50KB 的 query 就能把错误体放大到 >50KB）。截断长字符串，
+# 保留字段定位信息。
+# ---------------------------------------------------------------------------
+
+
+def _shrink_validation_errors(exc: RequestValidationError) -> list:
+    shrunk = []
+    for err in exc.errors():
+        item = dict(err)
+        value = item.get("input")
+        if isinstance(value, str) and len(value) > 200:
+            item["input"] = value[:200] + f"…（截断，原长 {len(value)}）"
+        elif isinstance(value, (list, dict)) and len(str(value)) > 500:
+            item["input"] = f"（大型 {type(value).__name__} 输入已省略，len={len(value)}）"
+        shrunk.append(item)
+    return shrunk
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _shrink_validation_errors(exc)},
     )
 
 

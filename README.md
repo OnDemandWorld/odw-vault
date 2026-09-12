@@ -182,7 +182,7 @@ vault query "What formats are in the corpus?" --json
 vault serve --port 8001 &
 curl -X POST http://127.0.0.1:8001/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "What CAD files exist?"}'
+  -d '{"query": "What CAD files exist?", "top_k_chunks": 3}'
 
 # Gradio UI
 vault ui
