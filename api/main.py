@@ -56,6 +56,23 @@ from rag.filters import resolve_folder_filter
 from rag.generation import generate_answer
 from rag.retrieval import Hit, retrieve
 
+def _ensure_loopback_bypasses_proxy() -> None:
+    """Ensure loopback hosts bypass HTTP(S) proxies.
+
+    In proxy-equipped environments (HTTP_PROXY/HTTPS_PROXY set), HTTP client
+    libraries route even 127.0.0.1/localhost calls through the proxy unless
+    NO_PROXY lists them — a proxy that cannot reach the loopback service then
+    turns every internal call (Ollama, sibling products) into a 502/500 (found
+    in QA when NO_PROXY contained 127.0.0.0 but not 127.0.0.1).
+    """
+    for key in ("NO_PROXY", "no_proxy"):
+        parts = {p.strip() for p in os.environ.get(key, "").split(",") if p.strip()}
+        if not {"localhost", "127.0.0.1"} <= parts:
+            parts |= {"localhost", "127.0.0.1"}
+            os.environ[key] = ",".join(sorted(parts))
+
+_ensure_loopback_bypasses_proxy()
+
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path("config.toml")
@@ -246,8 +263,9 @@ def root():
 
 # Component probes (Ollama list, Chroma collection open, fasttext load) are
 # expensive; under concurrent LLM load they pushed /health p95 past 1s. Cache
-# the computed snapshot briefly — /health is a status probe, not a live gauge.
-_HEALTH_TTL_SECONDS = 5.0
+# the computed snapshot briefly (15s covers concurrent LLM bursts where a
+# cold re-probe measured 1.0-2.0s; /health is a status probe, not a live gauge).
+_HEALTH_TTL_SECONDS = 15.0
 _health_cache: dict = {"at": 0.0, "value": None}
 
 

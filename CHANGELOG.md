@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > 套件 V1.4-V1.6 的 Vault 功能（审计导出、分布式追踪、流式引用修复、多 provider 设置）
 > 落在项目 0.2.x 内，见下方对应条目。
 
+## [Unreleased] - 2026-09-12（全流程测试与验收轮）
+
+### Changed
+- `/health` 探测 TTL 5s → 15s：并发 LLM 负载下冷重探测实测 1.0–2.0s（100 画像 UAT 7 次超 SLO），
+  15s 覆盖推理突发（/health 是状态探针而非实时仪表）。
 ## [Unreleased] - 2026-09-12
 
 ### Changed
