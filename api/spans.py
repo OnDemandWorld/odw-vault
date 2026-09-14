@@ -285,7 +285,7 @@ class OtlpHttpSpanExporter(SpanExporter):
                         {
                             "spans": [
                                 {
-                                    "traceId": span_obj.trace_id,
+                                    "traceId": span_obj.trace_id.replace("-", "").lower(),
                                     "spanId": span_obj.span_id,
                                     "parentSpanId": span_obj.parent_span_id or "",
                                     "name": span_obj.name,

@@ -73,7 +73,15 @@ def _last_rowid(db) -> int:
 
 
 def _ensure_folder(db, folder_path: Path, corpus_root: Path) -> int:
-    """Ensure a folder record exists.  Returns folder_id."""
+    """Ensure a folder record exists.  Returns folder_id.
+
+    Both paths are canonicalized first: on macOS /var is a symlink to
+    /private/var, so a corpus root from the config and a file path resolved
+    by sync_file can otherwise be the same directory in two spellings and
+    relative_to() raises.
+    """
+    folder_path = Path(folder_path).resolve()
+    corpus_root = Path(corpus_root).resolve()
     rel = str(folder_path.relative_to(corpus_root)) if folder_path != corpus_root else "."
     row = next(iter(db.query("SELECT id FROM folder WHERE path = ?", [str(folder_path)])), None)
     if row:
@@ -124,12 +132,14 @@ def _cleanup_file_derivatives(db, file_id: int) -> None:
     """
     # Chroma deletion is handled by the caller before invoking this.
 
-    # Chunk FTS
-    db.execute(
-        "DELETE FROM chunk_fts WHERE rowid IN "
-        "(SELECT id FROM chunk WHERE file_id = ?)",
-        [file_id],
-    )
+    # NOTE: do NOT delete from chunk_fts here — chunk_fts is an external-
+    # content FTS5 index whose AFTER DELETE trigger on chunk (migration 4)
+    # already runs the 'delete' command for every removed row. Clearing it
+    # manually first makes the trigger's second 'delete' hit missing
+    # postings, and SQLite then reports "database disk image is malformed"
+    # — i.e. every re-index/removal of an existing file corrupted the
+    # database under the old code.
+
     # V1.2 M2: Chinese BM25 index (standalone table, no auto-sync trigger).
     remove_zh_index_for_file(db, file_id)
     # Embedding refs for chunks
@@ -171,10 +181,15 @@ class IncrementalIndexer:
     # sync_file
     # ------------------------------------------------------------------
 
-    def sync_file(self, file_path: Path) -> dict:
+    def sync_file(self, file_path: Path, force: bool = False) -> dict:
         """Process a single new or modified file through the pipeline.
 
         Returns a dict with *status*, *file_id*, and optional *error*.
+
+        Args:
+            force: reprocess even when the content hash is unchanged — used
+                by the sync repair pass to retry files whose indexing failed
+                earlier (e.g. embedding while Ollama was down).
 
         Steps:
           1. Compute SHA-256 hash
@@ -188,7 +203,7 @@ class IncrementalIndexer:
           9. Return result
         """
         file_path = Path(file_path).resolve()
-        corpus_root = self.cfg.corpus_root_path
+        corpus_root = self.cfg.corpus_root_path.resolve()
 
         # --- 1. Hash ---
         try:
@@ -203,7 +218,7 @@ class IncrementalIndexer:
             None,
         )
 
-        if existing and existing["sha256"] == new_hash:
+        if existing and existing["sha256"] == new_hash and not force:
             logger.debug("File unchanged, skipping: %s", file_path)
             return {"status": "skipped_unchanged", "file_id": existing["id"]}
 
@@ -333,6 +348,7 @@ class IncrementalIndexer:
         hashed_count = 0
         skipped_hash = 0
 
+        corpus_root = corpus_root.resolve()
         for dirpath, dirnames, filenames in os.walk(str(corpus_root)):
             dp = Path(dirpath)
             # Skip hidden / cache directories
@@ -344,7 +360,11 @@ class IncrementalIndexer:
                 if fname.startswith(".") or fname in {".DS_Store", "Thumbs.db"}:
                     continue
                 fp = dp / fname
-                fp_str = str(fp)
+                try:
+                    fp_str = str(fp.resolve())
+                except OSError:
+                    logger.warning("Cannot resolve %s, skipping", fp)
+                    continue
                 try:
                     stat = fp.stat()
                 except OSError:
@@ -405,6 +425,49 @@ class IncrementalIndexer:
             else:
                 failed += 1
 
+        # --- 3b. Repair pass: retry files whose indexing failed earlier ---
+        # A file that failed at extract/embed while its dependencies were
+        # down stays failed forever: sync only revisits NEW/CHANGED content,
+        # and its hash never changes. Requeue files that have a pipeline
+        # failure and no embeddings, or any chunk without a current
+        # embedding, so a later sync (with Ollama back up) heals them.
+        already_handled = set(new_paths) | set(modified_paths)
+        retry_rows = self.db.query(
+            """SELECT DISTINCT f.path FROM file f
+               WHERE f.excluded = 0 AND f.is_dup_primary = 1 AND (
+                   EXISTS (
+                       SELECT 1 FROM chunk c
+                       WHERE c.file_id = f.id
+                         AND NOT EXISTS (
+                             SELECT 1 FROM embedding_ref er
+                             WHERE er.chunk_id = c.id AND er.is_current = 1
+                         )
+                   )
+                   OR (
+                       EXISTS (SELECT 1 FROM failure fail
+                               WHERE fail.file_id = f.id
+                                 AND fail.phase IN ('extract','indexer','embed','summarize'))
+                       AND NOT EXISTS (SELECT 1 FROM chunk c WHERE c.file_id = f.id)
+                   )
+               )"""
+        )
+        retried = 0
+        retry_failed = 0
+        for r in retry_rows:
+            if r["path"] in already_handled:
+                continue
+            if not Path(r["path"]).exists():
+                continue
+            result = self.sync_file(Path(r["path"]), force=True)
+            if result["status"] == "success":
+                retried += 1
+            else:
+                retry_failed += 1
+        if retried or retry_failed:
+            logger.info(
+                "Repair pass: %d retried, %d still failing", retried, retry_failed
+            )
+
         # --- 4. Remove deleted ---
         removed = 0
         for p in deleted_paths:
@@ -422,6 +485,8 @@ class IncrementalIndexer:
             "deleted": len(deleted_paths),
             "processed": processed,
             "skipped": skipped,
+            "retried": retried,
+            "retry_failed": retry_failed,
             "removed": removed,
             "failed": failed,
         }
@@ -562,7 +627,7 @@ class IncrementalIndexer:
 
             @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=30))
             def _call(prompt_text: str) -> str:
-                client = ollama.Client(host=self.cfg.ollama.host)
+                client = ollama.Client(host=self.cfg.ollama.host, timeout=self.cfg.ollama.timeout_seconds)
                 resp = client.chat(
                     model=model,
                     messages=[

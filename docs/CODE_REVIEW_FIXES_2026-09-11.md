@@ -118,3 +118,65 @@
 ---
 
 *生成：2026-09-11 · 分支 dev · 676 tests passing*
+
+---
+
+# 第二轮（2026-09-13）
+
+> 基线：第一轮修复已提交（HEAD `821aca2`，679 项测试通过）。本轮针对上次报告的"遗留项"逐条核实后修复，并在端到端测试中**发现并修复了一个会损坏数据库的隐藏 P0**。测试 679 → **694 通过**（新增 `tests/test_review_fixes_round2.py` 15 项）。
+
+## 一、本轮新发现的 P0
+
+### 12. `_cleanup_file_derivatives` 双重删除 FTS 索引 → 数据库损坏
+- **位置**：`rag/indexer.py`
+- **问题**：该函数先手动 `DELETE FROM chunk_fts WHERE rowid IN (...)`，随后 `DELETE FROM chunk` 又触发 migration 4 的 AFTER DELETE 触发器，对同一行再次执行 FTS5 `'delete'` 命令。external-content FTS5 表的二次删除命中不存在的 postings，SQLite 直接报 **`database disk image is malformed`**。触发路径：**每一次对"已存在文件"的重索引/删除**（`sync_file` 处理 modified、watcher 更新、`remove_file`、API DELETE /files）。本轮新增"同步修复轮"在真实库上跑这个清理路径时把它引爆——纯属运气好发现得早。
+- **修复**：删除手动 `chunk_fts` 清理（触发器已全权负责），仅保留无触发器的 `chunk_fts_zh` 清理。
+- **回归测试**：`TestFtsCleanupNoCorruption`（cleanup 后 `PRAGMA integrity_check` 必须为 ok）。
+
+### 13. `sync_file(force)/符号链接语料根` 下 `_ensure_folder` 崩溃
+- **位置**：`rag/indexer.py`
+- **问题**：`file_path.resolve()` 与未规范化的 `cfg.corpus_root_path` 在 macOS（`/var`→`/private/var`）等场景下是同一目录的两种拼写，`relative_to()` 抛 `ValueError`；force 重索引与修复轮必踩。
+- **修复**：`_ensure_folder` 与 `sync_file`/`sync_all` 统一对语料根与文件路径做 `resolve()` 规范化（顺带消除符号链接根下"所有文件每轮都被当新文件重复索引"的隐患）。
+
+## 二、本轮新增产品能力（修补缺口）
+
+### 14. 同步"修复轮"：失败文件自动重试（`sync_all` 步骤 3b）
+- **问题**：embed 在 Ollama 宕机期间失败的文件，因内容哈希未变，**任何后续同步都永远不再碰它**——用户看到"failed"挂到地老天荒。
+- **修复**：`sync_all` 增加 repair pass：有 chunk 但缺 current embedding（或 extract/embed 失败且无 chunk）的文件以 `force=True` 重处理；`sync_file` 新增 `force` 参数；summary 新增 `retried`/`retry_failed`。
+- **真实数据验证**：255 文件语料，5 个 embed 卡死文件在下一次 Sync Now 后全部自愈，**255/255 embedded、failed 0、integrity ok、chunk_fts 与 chunk 行数一致**。
+
+## 三、上轮遗留项的修复情况
+
+| # | 项 | 状态 | 说明 |
+|---|---|---|---|
+| 1 | rag 各模块 ollama 无超时 | ✅ | `_make_client(cfg, stream=)` 统一超时；retrieval/indexer/reranker/phase9/phase10_5 全部接通（ollama-python 默认 `timeout=None` = 禁用超时，挂死的 Ollama 曾会无限占住请求线程） |
+| 2 | phase1 符号链接/全量重哈希/mtime/尺寸检查 | ✅ | 越界 symlink 跳过并记录 `failure(phase='walk', error_class='symlink')`；已哈希文件不再每轮重算（第二次 walk `files_processed=0`，有测试钉住）；`mtime` 写入真实 `stat.st_mtime`（phase4 的"最老 mtime 优先"决胜恢复有效）；尺寸上限对已知文件也生效（测试钉住"养胖的文件"能被标记 oversized） |
+| 3 | CORS 注册顺序（401 无 CORS 头） | ✅ | CORS 移至 auth/trace 之后注册（Starlette 后注册=最外层）；实测 `VAULT_API_KEY` 开启时 401 响应携带 `access-control-allow-origin` |
+| 4 | `/query/stream` 与 `/query` 分歧 | ✅ | 同一 `_make_client` 工厂（endpoint+api_key+timeout）、同一 `_load_prompt` 模板、会话历史注入、`query_log.conversation_id` + user/assistant `message` 行落库、`done` 事件回传 `conversation_id`。实测双轮流式问答 4 条消息按序持久化、答案带引用。api/main.py 手写的 DEFAULT_PROMPT 死代码删除 |
+| 5 | `/audit/export` CSV 公式注入；上传无上限且整读内存 | ✅ | `_csv_safe()` 对 `= + - @ \t \r` 前缀单元格加 `'`（有测试）；上传 1MiB 分块流式写 + `VAULT_MAX_UPLOAD_BYTES` 上限（默认 512MiB，超限清理半成品并计入 failed，有测试） |
+| 6 | LIKE 通配符转义 | ✅ | `resolve_folder_filter.path_prefix`（越界扩权风险：`%` 可匹配所有文件夹）与 `/queries` keyword 均转义 + `ESCAPE '\'`，测试钉住 |
+| 7 | phase0 dry-run ×depth 计数、folder UNIQUE、`archive_file_id=0` FK | ✅ | dry-run 单趟 break；`.extracted` folder insert 加 `ignore=True`；`arc_id` 为 None 时不再用 `0` 伪造 FK（跳过记录并告警，原错误不再被掩盖） |
+| 8 | phase6 报告自摄取 | ✅ | 默认输出改到 cache 根（walk 不遍历） |
+| 9 | 每线程首次 `_get_db()` 重复 `migrate()` | ✅ | 进程级双检门 |
+| 10 | config 校验 | ⚠️ 部分 | 未知名 section 加载时告警。**未做**路径规范化强制（示例配置本身用相对路径 `./SourceData`，强校验会破坏开箱）；phase2 改为消费端规范化（sf 传 resolve 根 + 双键索引 + 匹配率 <10% 显式 error 告警），实测路径失配导致"全部静默 unknown"的问题已封死 |
+| 11 | X-Trace-Id 校验、OTLP traceId 格式 | ✅ | 头部仅接受 `[A-Za-z0-9_-]{1,64}` 否则重新生成（防日志注入/伪造，测试含 CRLF 注入用例）；OTLP payload `traceId` 输出 32-hex（此前带连字符的 UUID4 必被合规采集器拒收） |
+
+## 四、静态检查
+
+- `api rag pipeline ui cli` 可操作项清零：RUF005/RUF015/B008(noqa)/F841/SIM103/SIM117/I001/UP017/F401 全部处理。保留 RUF001/003（中英文标点歧义告警，属风格误报）与 W605（JS 模板字符串转义，运行期行为正确，改动无意义）。
+
+## 五、本轮端到端验证记录
+
+| 验证 | 结果 |
+|---|---|
+| 真实语料全量同步（255 文件） | 250→255 embedded，0 failed，integrity ok，FTS/chunk 行数一致 |
+| 修复轮自愈 | 5 个 embed 卡死文件在新一轮 sync 全部恢复（旧代码会永久滞留） |
+| 流式多轮对话 | 两轮 `/query/stream`：75/181 token 事件 + citations + done(conversation_id)；DB 中 user/assistant 四条消息按序落库，答案正确带引用 |
+| 普通问答 | 真实模型回答 + 5 条 citations，retrieval 548ms |
+| 401 + CORS | `VAULT_API_KEY` 生效且 401 携带 CORS 头；带 key 请求通过 |
+| 健康检查降级 | fasttext 缺失返回 `false` 不再 500（Ollama 未启动时正确报 down） |
+| 测试 | **694 passed**（+15 回归），覆盖率门禁 50% 通过 |
+
+## 六、第二轮后仍遗留（详见 docs/NEXT_STEPS.md）
+
+CORS/鉴权默认策略（产品决策）、UI 代理 `/api/*` 无鉴权与 CSRF、`/query*` 可达性预检查在纯云配置下仍打 `cfg.ollama.host`、watcher 与手动 sync 并发无互斥、thread-local 连接不关闭、`DELETE /files` 无事务、eval 并发闸、phase10_chunk 冗余 FTS 插入（有 rebuild 兜底）、phase0/1 提取目录父链回填、`--rehash` 与 incremental walk 的 status 列细分等。

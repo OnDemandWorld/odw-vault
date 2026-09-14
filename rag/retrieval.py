@@ -85,7 +85,9 @@ def retrieve(
     import ollama as _ollama_mod
 
     try:
-        _qc = _ollama_mod.Client(host=cfg.ollama.host)
+        _qc = _ollama_mod.Client(
+            host=cfg.ollama.host, timeout=getattr(cfg.ollama, "timeout_seconds", 120)
+        )
         _qr = _qc.embed(model=cfg.models.embedding.name, input=[query])
         _query_emb = _qr["embeddings"][0]
     except Exception as _e:

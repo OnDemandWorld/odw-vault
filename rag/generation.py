@@ -157,15 +157,25 @@ def _load_prompt(prompt_template: str | None, cfg) -> str:
     return DEFAULT_PROMPT
 
 
-def _make_client(cfg):
-    """Create an ollama client from the generation endpoint config."""
+def _make_client(cfg, *, stream: bool = False):
+    """Create an ollama client from the generation endpoint config.
+
+    Honors the configured endpoint (host + optional Bearer api_key) and
+    applies cfg.ollama.timeout_seconds — without a timeout, ollama-python
+    disables all httpx timeouts and a wedged server hangs the request
+    forever (tenacity retries never fire).
+    """
     ep = getattr(cfg.models.generation, "endpoint", None)
-    if ep:
-        kwargs = {"host": ep.host}
+    kwargs: dict = {"timeout": getattr(cfg.ollama, "timeout_seconds", 120)}
+    if ep and getattr(ep, "host", ""):
+        kwargs["host"] = ep.host
         if getattr(ep, "api_key", ""):
             kwargs["headers"] = {"Authorization": f"Bearer {ep.api_key}"}
-        return ollama.Client(**kwargs)
-    return ollama.Client(host=getattr(cfg.ollama, "host", "http://localhost:11434"))
+    else:
+        kwargs["host"] = getattr(cfg.ollama, "host", "http://localhost:11434")
+    if stream:
+        return ollama.AsyncClient(**kwargs)
+    return ollama.Client(**kwargs)
 
 
 @retry(

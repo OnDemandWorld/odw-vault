@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -17,7 +18,6 @@ from pipeline.config import Config
 from pipeline.helpers import (
     is_hidden_or_system,
     is_system_dir,
-    now_iso,
     record_failure,
     sha256_file,
 )
@@ -28,9 +28,7 @@ def _should_skip_file(name: str, path: Path, config: Config) -> bool:
     """Determine if a file should be skipped during walk."""
     if is_hidden_or_system(name):
         return True
-    if path.resolve().is_relative_to(config.cache_root_path.resolve()):
-        return True
-    return False
+    return path.resolve().is_relative_to(config.cache_root_path.resolve())
 
 
 def _should_skip_dir(name: str) -> bool:
@@ -82,7 +80,7 @@ def run_phase1(
 ) -> dict:
     """Walk corpus and hash all files."""
     root = config.corpus_root_path
-    cache_root = config.cache_root_path
+    root_resolved = root.resolve()
     max_size = config.walk.max_file_size_bytes
     n_workers = workers or config.walk.hash_workers or os.cpu_count() or 4
 
@@ -114,24 +112,36 @@ def run_phase1(
                 if _should_skip_file(fn, fp, config):
                     continue
 
+                # Symlinks are resolved before they are stored. A link whose
+                # target leaves the corpus root is skipped and recorded:
+                # storing the external target in file.path (as the resolved
+                # path) would make downstream phases read/hash/identify files
+                # outside the corpus while rel_path claims a corpus location.
+                if fp.is_symlink():
+                    try:
+                        link_target = fp.resolve()
+                    except OSError:
+                        link_target = None
+                    if link_target is None or not link_target.is_relative_to(root_resolved):
+                        record_failure(
+                            db,
+                            phase="walk",
+                            error_class="symlink",
+                            error_message=f"Skipped symlink pointing outside corpus: {fp}",
+                        )
+                        continue
+
                 abs_path = str(fp.resolve())
                 rel_path = str(fp.relative_to(root))
-
-                if not rehash:
-                    existing = _row_by_path(db, "file", abs_path)
-                    if existing and existing.get("hash_status") in ("done", "skipped"):
-                        # File already in DB (from phase0 or previous walk), just add to hash list
-                        files_to_hash.append(abs_path)
-                        total_files += 1
-                        continue
-                else:
-                    # Check if file exists even in rehash mode
-                    existing = _row_by_path(db, "file", abs_path)
 
                 try:
                     stat = fp.stat()
                     size = stat.st_size
-                    mtime = now_iso()
+                    # Real file mtime (not "now") — phase 4's "oldest mtime
+                    # first" canonical tiebreaker depends on it.
+                    mtime = datetime.fromtimestamp(
+                        stat.st_mtime, tz=UTC
+                    ).isoformat()
                 except OSError as e:
                     record_failure(
                         db,
@@ -141,6 +151,9 @@ def run_phase1(
                     )
                     continue
 
+                # Size cap is enforced BEFORE the already-known skip below,
+                # so a file that grew past the limit between walks is still
+                # flagged instead of passing on stale metadata.
                 if size > max_size:
                     record_failure(
                         db,
@@ -149,6 +162,18 @@ def run_phase1(
                         error_message=f"File too large: {size} bytes ({abs_path})",
                     )
                     continue
+
+                if not rehash:
+                    existing = _row_by_path(db, "file", abs_path)
+                    if existing and existing.get("hash_status") in ("done", "skipped"):
+                        # Already hashed in a previous walk/phase — counted
+                        # but NOT re-queued: the corpus is only hashed once
+                        # per change (incremental walk).
+                        total_files += 1
+                        continue
+                else:
+                    # Check if file exists even in rehash mode
+                    existing = _row_by_path(db, "file", abs_path)
 
                 folder_id = _ensure_folder(db, dir_path, root)
 

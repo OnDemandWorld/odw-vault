@@ -335,6 +335,19 @@ def load_app_config(config_path: Path) -> AppConfig:
     if "alternatives" in emb_block:
         models_block["alternatives"] = emb_block.pop("alternatives")
 
+    # Pydantic ignores unknown top-level keys by default — a typo'd section
+    # (e.g. [wolk] instead of [walk]) would otherwise be silently dropped
+    # and its settings never applied.
+    known = set(AppConfig.model_fields)
+    unknown = [k for k in raw if k not in known]
+    if unknown:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "config.toml contains unknown top-level sections %s — they are ignored",
+            sorted(unknown),
+        )
+
     return AppConfig(**raw)
 
 

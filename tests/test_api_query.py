@@ -175,16 +175,17 @@ class TestQueryStreamEndpoint:
     @patch("api.main.retrieve")
     @patch("api.main._load_config")
     @patch("api.main.ollama.Client")
-    @patch("api.main.ollama.AsyncClient")
+    @patch("rag.generation._make_client")
     @patch("api.main.chromadb.PersistentClient")
     def test_stream_emits_expected_events(
-        self, mock_chroma, mock_async_ollama, mock_ollama, mock_load_cfg, mock_retrieve, tmp_path
+        self, mock_chroma, mock_make_client, mock_ollama, mock_load_cfg, mock_retrieve, tmp_path
     ):
         db = _make_test_db(tmp_path)
         mock_load_cfg.return_value = _make_cfg(tmp_path)
 
         # Reachability check uses the sync client; streaming uses the async
-        # client whose .chat awaits to an async iterator of chunks.
+        # client from rag.generation._make_client(cfg, stream=True) whose
+        # .chat awaits to an async iterator of chunks.
         mock_ollama.return_value.list.return_value = {"models": []}
 
         chunks = [
@@ -199,7 +200,9 @@ class TestQueryStreamEndpoint:
 
             return _gen()
 
-        mock_async_ollama.return_value.chat.side_effect = _fake_chat
+        stream_client = MagicMock()
+        stream_client.chat.side_effect = _fake_chat
+        mock_make_client.return_value = stream_client
         mock_chroma.return_value.get_collection.return_value = MagicMock()
         mock_retrieve.return_value = (
             [_make_hit()],
@@ -216,5 +219,23 @@ class TestQueryStreamEndpoint:
             text = response.text
             for event_name in ("retrieval", "token", "citations", "done"):
                 assert f"event: {event_name}" in text
+
+            # Parity with /query: the stream path must use the SAME client
+            # factory (endpoint + api_key + timeout honored) ...
+            mock_make_client.assert_called_once()
+            assert mock_make_client.call_args.kwargs.get("stream") is True
+
+            # ... and persist the full conversation, not just the query log.
+            # (db is a raw sqlite_utils.Database here — its query() returns a
+            # generator, unlike the pipeline.db wrapper used in production.)
+            log = list(db.query("SELECT conversation_id FROM query_log ORDER BY id DESC LIMIT 1"))
+            assert log and log[0]["conversation_id"]
+            msgs = list(
+                db.query(
+                    "SELECT role FROM message WHERE conversation_id = ? ORDER BY id",
+                    [log[0]["conversation_id"]],
+                )
+            )
+            assert [m["role"] for m in msgs] == ["user", "assistant"]
         finally:
             patcher.stop()

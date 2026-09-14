@@ -301,8 +301,9 @@ def _provider_chat_stream(
         }
 
     timeout = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
-    with httpx.Client(trust_env=not _provider_is_local(base), timeout=timeout) as client:
-        with client.stream("POST", url, headers=headers, json=payload) as resp:
+    with httpx.Client(
+        trust_env=not _provider_is_local(base), timeout=timeout
+    ) as client, client.stream("POST", url, headers=headers, json=payload) as resp:
             if resp.status_code >= 400:
                 body = resp.read().decode("utf-8", "replace")[:300]
                 raise RuntimeError(f"Provider HTTP {resp.status_code}: {body}")

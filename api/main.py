@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -17,8 +18,8 @@ from pathlib import Path
 import chromadb
 import ollama
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.exceptions import RequestValidationError
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -56,6 +57,7 @@ from rag.filters import resolve_folder_filter
 from rag.generation import generate_answer
 from rag.retrieval import Hit, retrieve
 
+
 def _ensure_loopback_bypasses_proxy() -> None:
     """Ensure loopback hosts bypass HTTP(S) proxies.
 
@@ -83,13 +85,26 @@ DB_NAME = "corpus.db"
 # ---------------------------------------------------------------------------
 
 _thread_local = threading.local()
+_migrate_lock = threading.Lock()
+_migrated = False
 
 
 def _get_db():
-    """Return a thread-local DB connection."""
+    """Return a thread-local DB connection.
+
+    The connection itself stays thread-local (sqlite3 objects must not cross
+    threads), but schema migration runs exactly once per process — every
+    new thread-pool thread otherwise re-runs the write-locked migration on
+    its first request.
+    """
+    global _migrated
     if not hasattr(_thread_local, "db"):
         db = open_db(Path(DB_NAME))
-        migrate(db)
+        if not _migrated:
+            with _migrate_lock:
+                if not _migrated:
+                    migrate(db)
+                    _migrated = True
         _thread_local.db = db
     return _thread_local.db
 
@@ -125,12 +140,10 @@ if _cors_origins_env == "*":
 else:
     _cors_allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_allow_origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOTE: CORS middleware registration is deferred until after the auth/trace
+# middlewares below — Starlette puts the LAST-registered middleware outermost,
+# and CORS must wrap auth so its 401 responses also carry
+# Access-Control-Allow-Origin (browser clients otherwise see an opaque error).
 
 # ---------------------------------------------------------------------------
 # Optional inbound API-key authentication (additive, backward-compatible)
@@ -181,9 +194,17 @@ async def _require_api_key(request: Request, call_next):
 install_trace_id_filter(logger)
 
 
+# Inbound trace ids are only accepted in a conservative charset/length;
+# anything else (newlines, huge strings) would be log forgery / header
+# abuse and is replaced with a fresh id.
+_TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 @app.middleware("http")
 async def _bind_trace_id(request: Request, call_next):
-    trace_id = request.headers.get(TRACE_HEADER) or new_trace_id()
+    trace_id = request.headers.get(TRACE_HEADER) or ""
+    if not _TRACE_ID_RE.fullmatch(trace_id):
+        trace_id = new_trace_id()
     token = trace_id_var.set(trace_id)
     try:
         response = await call_next(request)
@@ -193,6 +214,16 @@ async def _bind_trace_id(request: Request, call_next):
         return response
     finally:
         trace_id_var.reset(token)
+
+
+# Registered after the auth/trace middlewares so it ends up OUTERMOST
+# (Starlette: last added = outermost). See the note at the CORS defaults.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allow_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _resolve_actor() -> str:
@@ -692,22 +723,38 @@ def query_stream(req: QueryRequest):
     # Build context for generation
     numbered_chunks = _format_chunks_for_prompt(hits)
 
-    # Build citations from hits (before streaming, so we have them)
+    # Stream generation — mirror /query so both paths share the model
+    # contract: same prompt template, same endpoint/api_key client, same
+    # conversation handling.
     from rag.citations import parse_citations as _parse_citations
     from rag.citations import resolve_citations as _resolve_citations
+    from rag.conversation import add_message, get_history, get_or_create_conversation
+    from rag.generation import _load_prompt, _make_client
 
-    # Stream generation
+    conversation_id = get_or_create_conversation(db, req.conversation_id, user=req.user)
+    add_message(db, conversation_id, "user", req.query)
+    history = get_history(db, conversation_id)
+    if history and history[-1]["role"] == "user" and history[-1]["content"] == req.query:
+        history = history[:-1]
+
     model_name = cfg.models.generation.name
     system_prefix = "<|think|>" if getattr(cfg.models.generation, "thinking", False) else ""
     system_content = "You are a helpful assistant."
     if system_prefix:
         system_content = f"{system_prefix}\n{system_content}"
 
-    prompt = DEFAULT_PROMPT.format(numbered_chunks=numbered_chunks, query=req.query)
+    prompt = _load_prompt(None, cfg).format(numbered_chunks=numbered_chunks, query=req.query)
 
-    # Async client + configured timeout so a wedged Ollama cannot block the
-    # event loop (and with it every other in-flight request).
-    oclient = ollama.AsyncClient(host=cfg.ollama.host, timeout=cfg.ollama.timeout_seconds)
+    chat_messages = [{"role": "system", "content": system_content}]
+    chat_messages += [
+        {"role": m["role"], "content": m["content"]} for m in (history or [])
+    ]
+    chat_messages.append({"role": "user", "content": prompt})
+
+    # Async client from the SAME factory as /query: honors
+    # models.generation.endpoint (host + api_key) and cfg.ollama timeout.
+    # Without async, token streaming would block the event loop.
+    oclient = _make_client(cfg, stream=True)
 
     # Persisted once the answer is complete — must run on a worker thread,
     # because the generator iterates on the event-loop thread and the
@@ -737,8 +784,8 @@ def query_stream(req: QueryRequest):
                (user, query_text, query_lang, folder_filter_json,
                 retrieved_chunks_json, answer_text, answer_model,
                 embedding_model, reranker_model,
-                latency_ms, retrieval_ms, generation_ms)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                latency_ms, retrieval_ms, generation_ms, conversation_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 req.user,
                 req.query,
@@ -752,10 +799,16 @@ def query_stream(req: QueryRequest):
                 total_ms,
                 retrieval_ms,
                 gen_ms,
+                conversation_id,
             ),
         )
         pdb.conn.commit()
         query_log_id = cursor.lastrowid
+        # Keep multi-turn conversations consistent with /query: record the
+        # streamed assistant answer too.
+        add_message(
+            pdb, conversation_id, "assistant", answer_text, query_log_id=query_log_id
+        )
         record_audit(
             pdb,
             _resolve_actor(),
@@ -785,10 +838,7 @@ def query_stream(req: QueryRequest):
             answer_parts: list[str] = []
             stream_resp = await oclient.chat(
                 model=model_name,
-                messages=[
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=chat_messages,
                 options={
                     "temperature": cfg.models.generation.temperature,
                     "top_p": cfg.models.generation.top_p,
@@ -848,6 +898,7 @@ def query_stream(req: QueryRequest):
                             "total_ms": total_ms,
                         },
                         "query_log_id": query_log_id,
+                        "conversation_id": conversation_id,
                     }
                 ),
             )
@@ -1159,8 +1210,11 @@ def query_history(
     params: list = []
 
     if keyword:
-        conditions.append("query_text LIKE ?")
-        params.append(f"%{keyword}%")
+        # Escape LIKE wildcards so a literal '%'/'_' in the keyword matches
+        # itself instead of broadening the search semantics.
+        conditions.append("query_text LIKE ? ESCAPE '\\'")
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.append(f"%{escaped}%")
 
     if start_date:
         conditions.append("asked_at >= ?")
@@ -1190,7 +1244,7 @@ def query_history(
             FROM query_log {where_clause}
             ORDER BY asked_at DESC
             LIMIT ? OFFSET ?""",
-        params + [size, offset],
+        [*params, size, offset],
     ))
 
     items = []
@@ -1225,7 +1279,7 @@ def query_history(
 
 @app.post("/files/upload", response_model=FileUploadResponse)
 async def upload_files(
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = File(...),  # noqa: B008 — FastAPI idiom
     workspace: str | None = Form(None),
 ):
     """Upload files to the corpus directory.
@@ -1297,12 +1351,26 @@ async def _upload_files_impl(
                     dest = corpus_root / f"{stem} ({counter}){suffix}"
                     counter += 1
 
-            # Save file
-            content = await upload_file.read()
-            dest.write_bytes(content)
-
-            # Get file size
-            size_bytes = dest.stat().st_size
+            # Save file — streamed in 1 MiB chunks with a byte cap so a huge
+            # upload can't exhaust server memory (default 512 MiB, override
+            # via VAULT_MAX_UPLOAD_BYTES).
+            max_bytes = int(os.environ.get("VAULT_MAX_UPLOAD_BYTES", "") or 512 * 1024 * 1024)
+            size_bytes = 0
+            try:
+                with dest.open("wb") as out:
+                    while True:
+                        part = await upload_file.read(1024 * 1024)
+                        if not part:
+                            break
+                        size_bytes += len(part)
+                        if size_bytes > max_bytes:
+                            raise ValueError(
+                                f"upload exceeds {max_bytes} bytes (VAULT_MAX_UPLOAD_BYTES)"
+                            )
+                        out.write(part)
+            except Exception:
+                dest.unlink(missing_ok=True)
+                raise
 
             # Determine relative path
             rel_path = str(dest.relative_to(corpus_root))
@@ -1484,7 +1552,7 @@ def list_files(
 
     # Count total
     count_sql = f"SELECT COUNT(*) as c FROM file f WHERE {where_sql}"
-    total = list(db.query(count_sql, params))[0]["c"]
+    total = next(iter(db.query(count_sql, params)))["c"]
 
     # Fetch page
     offset = (page - 1) * size
@@ -1517,7 +1585,7 @@ def list_files(
         ORDER BY f.created_at DESC
         LIMIT ? OFFSET ?
     """
-    rows = list(db.query(query_sql, params + [size, offset]))
+    rows = list(db.query(query_sql, [*params, size, offset]))
 
     items = [
         FileListItem(
@@ -1688,6 +1756,19 @@ _AUDIT_EXPORT_COLUMNS = [
 ]
 
 
+def _csv_safe(value: object) -> object:
+    """Neutralize spreadsheet formula injection in exported CSV cells.
+
+    Audit ``detail``/``actor`` values are user-influenced (query text,
+    filenames); a cell starting with =, +, -, @, tab or CR executes as a
+    formula when the export is opened in Excel/Sheets. Prefix such cells
+    with a single quote so spreadsheet apps treat them as text.
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 @app.get("/audit/export")
 def export_audit(
     fmt: str = Query("json", alias="format"),
@@ -1733,7 +1814,7 @@ def export_audit(
         writer = csv.writer(buf)
         writer.writerow(_AUDIT_EXPORT_COLUMNS)
         for row in rows:
-            writer.writerow([row[col] for col in _AUDIT_EXPORT_COLUMNS])
+            writer.writerow([_csv_safe(row[col]) for col in _AUDIT_EXPORT_COLUMNS])
         return Response(
             content=buf.getvalue(),
             media_type="text/csv",
@@ -1746,36 +1827,6 @@ def export_audit(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-DEFAULT_PROMPT = """\
-You are the ODW.ai Vault internal knowledge assistant. You help staff find
-information about company projects, products, deployments, and operations
-by answering questions using ONLY the provided context excerpts.
-
-You answer in the same language as the user's question (English or
-Traditional Chinese). Match the user's terminology and tone.
-
-RULES:
-1. Every factual claim MUST be supported by a citation marker [N] where N
-   refers to a numbered context excerpt below. Use markers inline.
-2. If the context does not contain enough information to answer, say so
-   explicitly. Do not guess. Do not use external knowledge about products,
-   clients, robots, sites, or contracts beyond what the context says.
-3. When synthesizing across multiple sources, cite each.
-4. Preserve technical terminology, model numbers, robot platform names,
-   client names, site names, and project names exactly as they appear in the context.
-5. Never invent file names, page numbers, or citation markers that are
-   not in the provided context.
-6. If asked about a client or project not present in the context, state
-   that you have no information about it; do not speculate.
-
-CONTEXT EXCERPTS:
-{numbered_chunks}
-
-USER QUESTION: {query}
-
-ANSWER:
-"""
 
 
 def _format_chunks_for_prompt(hits: list[Hit]) -> str:
