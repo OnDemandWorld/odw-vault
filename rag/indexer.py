@@ -498,26 +498,44 @@ class IncrementalIndexer:
     # ------------------------------------------------------------------
 
     def _remove_chroma_vectors(self, file_id: int) -> None:
-        """Remove all Chroma vectors associated with a file's chunks."""
+        """Remove all Chroma vectors associated with a file's chunks/summaries."""
         if not self.chroma_client:
             return
 
+        suffix = self.cfg.models.embedding.collection_suffix
+
+        # Chunk vectors are keyed c_{chunk_id}.
         chunk_ids = [
             r["id"]
             for r in self.db.query("SELECT id FROM chunk WHERE file_id = ?", [file_id])
         ]
-        if not chunk_ids:
-            return
-
-        suffix = self.cfg.models.embedding.collection_suffix
-        for prefix in ("chunks__", "summaries__"):
-            coll_name = f"{prefix}{suffix}"
+        if chunk_ids:
             try:
-                coll = self.chroma_client.get_collection(coll_name)
-                chroma_ids = [f"{'c' if prefix == 'chunks__' else 's'}_{cid}" for cid in chunk_ids]
-                coll.delete(ids=chroma_ids)
+                coll = self.chroma_client.get_collection(f"chunks__{suffix}")
+                coll.delete(ids=[f"c_{cid}" for cid in chunk_ids])
             except Exception:
-                logger.debug("Chroma delete skipped for %s", coll_name)
+                logger.debug("Chroma delete skipped for chunks__%s", suffix)
+
+        # Summary vectors are keyed s_{summary_id} — a DIFFERENT sequence from
+        # chunk ids (the old c_/s_ pairing against chunk ids deleted the wrong
+        # vectors whenever the two sequences happened to collide, and usually
+        # deleted nothing at all, orphaning summary vectors forever). Pull the
+        # real external ids recorded at embed time.
+        summary_ext_ids = [
+            r["external_id"]
+            for r in self.db.query(
+                "SELECT ser.external_id FROM summary_embedding_ref ser "
+                "JOIN summary s ON s.id = ser.summary_id "
+                "WHERE s.file_id = ?",
+                [file_id],
+            )
+        ]
+        if summary_ext_ids:
+            try:
+                coll = self.chroma_client.get_collection(f"summaries__{suffix}")
+                coll.delete(ids=summary_ext_ids)
+            except Exception:
+                logger.debug("Chroma delete skipped for summaries__%s", suffix)
 
     # ------------------------------------------------------------------
     # Private: pipeline stages

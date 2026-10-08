@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > 套件 V1.4-V1.6 的 Vault 功能（审计导出、分布式追踪、流式引用修复、多 provider 设置）
 > 落在项目 0.2.x 内，见下方对应条目。
 
+## [Unreleased] - 2026-10-08（上线前深度审查轮）
+
+### Fixed
+- **[P0] 文件监听（watcher）跨线程使用 SQLite 连接**：API/CLI 把事件循环线程的连接传给
+  监听 worker 线程，每个文件变更事件都抛 `sqlite3.ProgrammingError` 被吞成 failed——
+  watcher 开启后一个文件也索不进去且完全静默。改为 worker 线程经 `db_factory` 自建连接；
+  `startup_sync` 全量同步也移出事件循环线程（此前直接阻塞服务启动分钟级）。
+- **[P1] summary 向量删除错位/泄漏**：`_remove_chroma_vectors` 对 `summaries__` 集合用
+  `s_{chunk_id}` 构造 ID，而真实主键是 `s_{summary_id}`（两条自增序列）——通常删不到
+  任何东西（孤儿向量永久累积），序列撞号时误删其他文件的 summary 向量（数据损坏）。
+  改为按 `summary_embedding_ref` 记录的真实 external_id 删除；`DELETE /files/{id}`
+  同步补上 summary 向量、`summary_embedding_ref` 行与中文 BM25 索引清理。
+- **[P1] 检索候选集 `$in` 过滤未分批**：Chroma 对单次 `$in` 有规模上限（嵌入管线自身按
+  1000 分批），检索侧一次性塞入全部候选时大目录下 dense 召回静默归零。dense 与英文
+  BM25 路径均改为分批查询后按分数/rank 合并取 top-n（BM25 同时规避 SQLite 绑定参数
+  上限）；中文 BM25 失败日志 debug→warning。
+- **[P1] fastText 语言模型每查询从磁盘重载**（~130MB）：改用 `rag.tokenization` 的按
+  路径缓存加载器；`/health` 探测同改。
+- **[P1] 上传阻塞事件循环**：分块写盘移入线程池（`run_in_threadpool`），大文件上传
+  期间不再停摆所有并发请求/流式 token 推送。
+- **[P2] CLI `query` 默认强行启用 reranker**：`use_reranker=not no_rerank` 恒为 True，
+  覆盖配置且在未配置真实 reranker 时退化为逐文档 LLM 打分（一次查询多出 50 次调用）。
+  改为 `None` 时回落到 `cfg.models.reranker.enabled`。
+- **[P2] 上传同名文件 TOCTOU**：`exists()` 检查后写入可被并发请求双双通过并互相覆盖。
+  改为独占创建 `open("xb")` + `FileExistsError` 原子换名重试。
+- **[P2] 上传路径未 resolve 与索引器不一致**：符号链接语料根下产生重复根 folder、
+  `sync_all` 把全部上传文件误判为已删除。上传侧统一存 resolved 路径。
+
+### Changed
+- 测试规模 694 → 703（新增 `tests/test_review_round4_fixes.py` 9 条回归：
+  watcher 线程亲和 ×2、summary 向量删除 ×2、dense/BM25 分批 ×4、CLI reranker 默认 ×1）。
+
 ## [Unreleased] - 2026-09-12（全流程测试与验收轮）
 
 ### Changed

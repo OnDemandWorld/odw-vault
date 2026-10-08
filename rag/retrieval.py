@@ -218,15 +218,17 @@ def reciprocal_rank_fuse(dense_hits: list[Hit], bm25_hits: list[Hit], k: int) ->
 
 def _detect_language(query: str, cfg) -> str:
     """Detect query language using fasttext, falling back to lingua."""
-    # Try fasttext first
+    # Try fasttext first — via the per-path cached loader (the lid model is
+    # ~130MB; reloading it from disk on every query added a constant
+    # multi-hundred-ms stall to the retrieval hot path).
     try:
-        import fasttext
+        from rag.tokenization import _get_fasttext
 
-        model_path = cfg.models.language_id.model_path
-        model = fasttext.load_model(model_path)
-        predictions = model.predict(query.replace("\n", " "), k=1)
-        lang_code = predictions[0][0].replace("__label__", "")
-        return lang_code
+        model = _get_fasttext(cfg.models.language_id.model_path)
+        if model is not None:
+            predictions = model.predict(query.replace("\n", " "), k=1)
+            lang_code = predictions[0][0].replace("__label__", "")
+            return lang_code
     except Exception as e:
         logger.debug("fasttext language detection failed: %s", e)
 
@@ -319,6 +321,12 @@ def _query_db_for_files_in_folder(db, folder_id: int) -> set[int]:
         return set()
 
 
+# Chroma caps the number of values accepted by a single $in filter (the embed
+# pipeline batches with the same constant); retrieval must respect it too or
+# dense recall silently empties out for large folders/workspaces.
+IN_FILTER_BATCH = 1000
+
+
 def _dense_retrieve_with_embedding(
     collection,
     query_embedding: list[float],
@@ -326,9 +334,39 @@ def _dense_retrieve_with_embedding(
     candidate_file_ids: set[int] | None,
 ) -> list[Hit]:
     """Retrieve chunks via dense vector similarity from Chroma."""
+    if candidate_file_ids is None:
+        return _dense_query_collection(collection, query_embedding, n_results, None)
+
+    file_ids = list(candidate_file_ids)
+    if len(file_ids) <= IN_FILTER_BATCH:
+        return _dense_query_collection(collection, query_embedding, n_results, file_ids)
+
+    # Batch oversized candidate sets, then merge by score — a single $in with
+    # tens of thousands of ids raises inside Chroma and (best case) logs an
+    # error while returning zero dense hits.
+    merged: list[Hit] = []
+    for i in range(0, len(file_ids), IN_FILTER_BATCH):
+        batch = file_ids[i : i + IN_FILTER_BATCH]
+        merged.extend(
+            _dense_query_collection(collection, query_embedding, n_results, batch)
+        )
+    merged.sort(
+        key=lambda h: h.dense_score if h.dense_score is not None else float("-inf"),
+        reverse=True,
+    )
+    return merged[:n_results]
+
+
+def _dense_query_collection(
+    collection,
+    query_embedding: list[float],
+    n_results: int,
+    file_ids: list[int] | None,
+) -> list[Hit]:
+    """Run one Chroma dense query, optionally restricted to file_ids."""
     where_clause = None
-    if candidate_file_ids is not None:
-        where_clause = {"file_id": {"$in": list(candidate_file_ids)}}
+    if file_ids is not None:
+        where_clause = {"file_id": {"$in": file_ids}}
 
     try:
         results = collection.query(
@@ -544,7 +582,7 @@ def _bm25_retrieve_zh(
 
         rows = db.query(sql, params)
     except Exception as e:
-        logger.debug("Chinese BM25 retrieval skipped: %s", e)
+        logger.warning("Chinese BM25 retrieval failed: %s", e)
         return []
 
     hits: list[Hit] = []
@@ -614,46 +652,66 @@ def _bm25_retrieve(
         return []
     fts_query = " OR ".join(clean_tokens)
 
+    # SQLite caps bound parameters per statement (999 on older builds); an
+    # oversized candidate set would raise OperationalError here. Batch the IN
+    # list and merge — rows are rank-ordered, so top-n across batches is the
+    # same as a single unbatched query.
+    SQL_PARAM_BATCH = 900
+
+    def _run_fts(candidate_ids: list[int] | None, exclude_ids: set[int] | None):
+        if candidate_ids is not None:
+            placeholders = ",".join("?" for _ in candidate_ids)
+            sql = (
+                "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
+                "f.folder_id, f.rel_path, rank "
+                "FROM chunk_fts "
+                "JOIN chunk c ON chunk_fts.rowid = c.id "
+                "JOIN file f ON c.file_id = f.id "
+                f"WHERE chunk_fts MATCH ? AND c.file_id IN ({placeholders}) "
+                "ORDER BY rank LIMIT ?"
+            )
+            params = [fts_query, *candidate_ids, n_results]
+        else:
+            exclude_ids = exclude_ids or set()
+            if exclude_ids:
+                exc_placeholders = ",".join("?" for _ in exclude_ids)
+                sql = (
+                    "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
+                    "f.folder_id, f.rel_path, rank "
+                    "FROM chunk_fts "
+                    "JOIN chunk c ON chunk_fts.rowid = c.id "
+                    "JOIN file f ON c.file_id = f.id "
+                    f"WHERE chunk_fts MATCH ? AND c.file_id NOT IN ({exc_placeholders}) "
+                    "ORDER BY rank LIMIT ?"
+                )
+                params = [fts_query, *list(exclude_ids), n_results]
+            else:
+                sql = (
+                    "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
+                    "f.folder_id, f.rel_path, rank "
+                    "FROM chunk_fts "
+                    "JOIN chunk c ON chunk_fts.rowid = c.id "
+                    "JOIN file f ON c.file_id = f.id "
+                    "WHERE chunk_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?"
+                )
+                params = [fts_query, n_results]
+        return list(db.query(sql, params))
+
     if candidate_file_ids is not None:
         # candidate_file_ids already has excluded_ids removed (set subtraction above)
-        placeholders = ",".join("?" for _ in candidate_file_ids)
-        sql = (
-            "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
-            "f.folder_id, f.rel_path, rank "
-            "FROM chunk_fts "
-            "JOIN chunk c ON chunk_fts.rowid = c.id "
-            "JOIN file f ON c.file_id = f.id "
-            f"WHERE chunk_fts MATCH ? AND c.file_id IN ({placeholders}) "
-            "ORDER BY rank LIMIT ?"
-        )
-        params = [fts_query, *list(candidate_file_ids), n_results]
+        id_list = list(candidate_file_ids)
+        if len(id_list) <= SQL_PARAM_BATCH:
+            rows = _run_fts(id_list, None)
+        else:
+            rows = []
+            for i in range(0, len(id_list), SQL_PARAM_BATCH):
+                rows.extend(_run_fts(id_list[i : i + SQL_PARAM_BATCH], None))
+            rows.sort(key=lambda r: r.get("rank") if r.get("rank") is not None else 0)
+            rows = rows[:n_results]
     else:
         # No hierarchical narrowing; apply exclusion filter directly
-        if excluded_file_ids:
-            exc_placeholders = ",".join("?" for _ in excluded_file_ids)
-            sql = (
-                "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
-                "f.folder_id, f.rel_path, rank "
-                "FROM chunk_fts "
-                "JOIN chunk c ON chunk_fts.rowid = c.id "
-                "JOIN file f ON c.file_id = f.id "
-                f"WHERE chunk_fts MATCH ? AND c.file_id NOT IN ({exc_placeholders}) "
-                "ORDER BY rank LIMIT ?"
-            )
-            params = [fts_query, *list(excluded_file_ids), n_results]
-        else:
-            sql = (
-                "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
-                "f.folder_id, f.rel_path, rank "
-                "FROM chunk_fts "
-                "JOIN chunk c ON chunk_fts.rowid = c.id "
-                "JOIN file f ON c.file_id = f.id "
-                "WHERE chunk_fts MATCH ? "
-                "ORDER BY rank LIMIT ?"
-            )
-            params = [fts_query, n_results]
-
-    rows = db.query(sql, params)
+        rows = _run_fts(None, excluded_file_ids)
 
     hits: list[Hit] = []
     for row in rows:

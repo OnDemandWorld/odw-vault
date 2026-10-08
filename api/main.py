@@ -261,11 +261,18 @@ def _startup_watcher():
             return
         from rag.watcher import CorpusWatcher
 
-        db = _get_db()
         chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
-        _watcher = CorpusWatcher(cfg, db, chroma_client)
-        if cfg.watcher.startup_sync:
-            _watcher.indexer.sync_all()
+        # sqlite3 connections are thread-affine and the watcher flushes on its
+        # own worker thread — pass a factory so the worker builds its own
+        # connection (_get_db is thread-local). Passing this thread's handle
+        # would make every flush raise sqlite3.ProgrammingError.
+        _watcher = CorpusWatcher(
+            cfg,
+            _get_db(),
+            chroma_client,
+            db_factory=_get_db,
+            startup_sync=cfg.watcher.startup_sync,
+        )
         _watcher.start()
         logger.info("Corpus watcher started via API server")
     except Exception as exc:
@@ -340,14 +347,14 @@ def health():
     except Exception:
         logger.warning("Database not reachable")
 
-    # fastText check
+    # fastText check (cached loader — the 130MB model must not be re-parsed
+    # from disk on every uncached /health probe)
     fasttext_ok = False
     model_path = cfg.models.language_id.model_path
     try:
-        import fasttext
+        from rag.tokenization import _get_fasttext
 
-        fasttext.load_model(model_path)
-        fasttext_ok = True
+        fasttext_ok = _get_fasttext(model_path) is not None
     except Exception:
         logger.warning("fastText model not found at %s", model_path)
 
@@ -1316,7 +1323,10 @@ async def _upload_files_impl(
         folder_id = root_folders[0]["id"]
     else:
         db["folder"].insert({
-            "path": str(corpus_root),
+            # Resolve: the indexer stores resolved roots (symlinked corpus
+            # roots otherwise produce duplicate "." folders with two
+            # different path spellings).
+            "path": str(corpus_root.resolve()),
             "rel_path": ".",
             "name": ".",
             "depth": 0,
@@ -1342,22 +1352,25 @@ async def _upload_files_impl(
                 failed.append(raw_name)
                 continue
 
-            # Handle filename conflicts
-            if dest.exists():
-                stem = dest.stem
-                suffix = dest.suffix
-                counter = 1
-                while dest.exists():
-                    dest = corpus_root / f"{stem} ({counter}){suffix}"
-                    counter += 1
-
             # Save file — streamed in 1 MiB chunks with a byte cap so a huge
             # upload can't exhaust server memory (default 512 MiB, override
-            # via VAULT_MAX_UPLOAD_BYTES).
+            # via VAULT_MAX_UPLOAD_BYTES). The open mode is exclusive-create
+            # ("xb"): an exists()-then-write loop let two concurrent uploads
+            # of the same name both pick the same target and clobber each
+            # other's bytes; "xb" makes the loser atomically rename-retry.
             max_bytes = int(os.environ.get("VAULT_MAX_UPLOAD_BYTES", "") or 512 * 1024 * 1024)
             size_bytes = 0
+            stem, suffix = dest.stem, dest.suffix
+            counter = 1
+            while True:
+                try:
+                    out = dest.open("xb")
+                    break
+                except FileExistsError:
+                    dest = corpus_root / f"{stem} ({counter}){suffix}"
+                    counter += 1
             try:
-                with dest.open("wb") as out:
+                with out:
                     while True:
                         part = await upload_file.read(1024 * 1024)
                         if not part:
@@ -1367,13 +1380,18 @@ async def _upload_files_impl(
                             raise ValueError(
                                 f"upload exceeds {max_bytes} bytes (VAULT_MAX_UPLOAD_BYTES)"
                             )
-                        out.write(part)
+                        # Disk writes off the event loop — a 100MB upload used
+                        # to stall every concurrent /query/stream token push.
+                        await run_in_threadpool(out.write, part)
             except Exception:
                 dest.unlink(missing_ok=True)
                 raise
 
-            # Determine relative path
-            rel_path = str(dest.relative_to(corpus_root))
+            # Determine relative path (store resolved paths, matching the
+            # indexer — unresolved spellings made sync_all treat every
+            # uploaded file as deleted when the corpus root had symlinks).
+            dest = dest.resolve()
+            rel_path = str(dest.relative_to(corpus_root.resolve()))
 
             # Get file modification time
             mtime = datetime.datetime.fromtimestamp(
@@ -1677,6 +1695,19 @@ def delete_file(file_id: int):
             [file_id],
         ))
 
+        # Summary vectors live in summaries__ keyed by summary_id — without
+        # this join they are orphaned in Chroma forever (the file rows below
+        # are the only record of their ids).
+        summary_refs = list(db.query(
+            """SELECT ser.collection, ser.external_id
+               FROM summary_embedding_ref ser
+               JOIN summary s ON ser.summary_id = s.id
+               WHERE s.file_id = ?""",
+            [file_id],
+        ))
+        for ref in summary_refs:
+            embedding_refs.append(ref)
+
         # Group by collection and delete
         collections_to_delete: dict[str, list[str]] = {}
         for ref in embedding_refs:
@@ -1695,9 +1726,17 @@ def delete_file(file_id: int):
         logger.warning("Failed to connect to Chroma: %s", e)
 
     # Delete from SQLite (cascade)
+    from rag.tokenization import remove_zh_index_for_file
+
+    remove_zh_index_for_file(db, file_id)
     db.execute("DELETE FROM embedding_ref WHERE chunk_id IN (SELECT id FROM chunk WHERE file_id = ?)", [file_id])
     db.execute("DELETE FROM chunk WHERE file_id = ?", [file_id])
     db.execute("DELETE FROM extraction WHERE file_id = ?", [file_id])
+    db.execute(
+        "DELETE FROM summary_embedding_ref WHERE summary_id IN "
+        "(SELECT id FROM summary WHERE file_id = ?)",
+        [file_id],
+    )
     db.execute("DELETE FROM summary WHERE file_id = ?", [file_id])
     db.execute("DELETE FROM failure WHERE file_id = ?", [file_id])
     db.execute("DELETE FROM file WHERE id = ?", [file_id])

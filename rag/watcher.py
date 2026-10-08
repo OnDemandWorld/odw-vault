@@ -82,12 +82,32 @@ class CorpusWatcher:
 
     Events are debounced (coalesced per path) before being dispatched
     to IncrementalIndexer.sync_file() or remove_file().
+
+    Thread affinity: sqlite3 connections must not cross threads, and the
+    flush loop runs on a dedicated worker thread. When ``db_factory`` is
+    supplied, the worker creates and owns its own connection/indexer
+    (pass-through ``db`` is then only used for same-thread callers such
+    as tests calling ``_flush_ready`` directly).
     """
 
-    def __init__(self, cfg: AppConfig, db, chroma_client=None) -> None:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        db,
+        chroma_client=None,
+        db_factory=None,
+        startup_sync: bool = False,
+    ) -> None:
         self._cfg = cfg
         self._db = db
+        self._db_factory = db_factory
+        self._chroma_client = chroma_client
         self._indexer = IncrementalIndexer(db, cfg, chroma_client)
+        # Worker-thread-affine resources (set in _flush_loop when a factory
+        # is provided; sqlite3 objects raised in another thread are unusable).
+        self._worker_db = None
+        self._worker_indexer = None
+        self._startup_sync = startup_sync
         self._pending: dict[str, tuple[str, float]] = {}  # path -> (action, timestamp)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -206,12 +226,33 @@ class CorpusWatcher:
 
     def _flush_loop(self) -> None:
         """Background worker that flushes debounced events to the indexer."""
+        if self._db_factory is not None:
+            self._worker_db = self._db_factory()
+            self._worker_indexer = IncrementalIndexer(
+                self._worker_db, self._cfg, self._chroma_client
+            )
+        if self._startup_sync:
+            # Runs here (worker thread), not on the API event loop: a full
+            # sync hashes + embeds every file and can block for minutes.
+            try:
+                self._active_indexer().sync_all()
+                logger.info("Watcher startup sync completed")
+            except Exception as exc:
+                logger.error("Watcher startup sync failed: %s", exc)
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=1.0)
             self._flush_ready()
 
         # Final drain on shutdown
         self._flush_ready(force=True)
+
+    def _active_db(self):
+        """DB handle owned by whichever thread is flushing."""
+        return self._worker_db if self._worker_db is not None else self._db
+
+    def _active_indexer(self) -> IncrementalIndexer:
+        """Indexer bound to the active DB handle (see _flush_loop)."""
+        return self._worker_indexer if self._worker_indexer is not None else self._indexer
 
     def _flush_ready(self, force: bool = False) -> None:
         """Process all pending events that have passed the debounce window."""
@@ -225,12 +266,13 @@ class CorpusWatcher:
                     ready.append((path, action))
                     del self._pending[path]
 
+        indexer = self._active_indexer()
         for path, action in ready:
             try:
                 if action == "delete":
                     self._handle_delete(path)
                 else:
-                    self._indexer.sync_file(Path(path))
+                    indexer.sync_file(Path(path))
                 self._stats["processed"] += 1
                 logger.info("Watcher synced: %s (%s)", path, action)
             except Exception as exc:
@@ -240,11 +282,11 @@ class CorpusWatcher:
     def _handle_delete(self, path: str) -> None:
         """Look up file_id by path and remove from index."""
         row = next(
-            iter(self._db.query("SELECT id FROM file WHERE path = ?", [path])),
+            iter(self._active_db().query("SELECT id FROM file WHERE path = ?", [path])),
             None,
         )
         if row:
-            self._indexer.remove_file(row["id"])
+            self._active_indexer().remove_file(row["id"])
             logger.info("Watcher removed file_id=%d (%s)", row["id"], path)
         else:
             logger.debug("Delete event for unindexed path: %s", path)

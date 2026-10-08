@@ -626,8 +626,11 @@ def query(
         cfg,
         folder_filter=folder_filter,
         top_k_chunks=top_k,
-        use_reranker=not no_rerank,
-        use_augmentation=not no_augment,
+        # None lets retrieve() fall back to cfg.models.reranker.enabled —
+        # forcing True here overrode the config and, when no real reranker
+        # was configured, silently degraded to dozens of per-doc LLM calls.
+        use_reranker=(False if no_rerank else None),
+        use_augmentation=(False if no_augment else None),
     )
 
     result = generate_answer(
@@ -727,13 +730,21 @@ def watch(once: bool) -> None:
 
     from rag.watcher import CorpusWatcher
 
-    db = open_db(get_db_path(click.get_current_context()))
+    db_path = get_db_path(click.get_current_context())
+    db = open_db(db_path)
     chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
-    watcher = CorpusWatcher(cfg, db, chroma_client)
-
+    # The flush loop runs on a worker thread; give it its own connection
+    # (sqlite3 handles are thread-affine — reusing this thread's handle
+    # fails every flush with sqlite3.ProgrammingError).
+    watcher = CorpusWatcher(
+        cfg,
+        db,
+        chroma_client,
+        db_factory=lambda: open_db(db_path),
+        startup_sync=cfg.watcher.startup_sync,
+    )
     if cfg.watcher.startup_sync:
-        click.echo("Running startup sync...")
-        watcher.indexer.sync_all()
+        click.echo("Running startup sync (background)...")
 
     click.echo(f"Watching {cfg.corpus_root_path} (Ctrl+C to stop)...")
     watcher.start()
