@@ -840,6 +840,9 @@ class IncrementalIndexer:
                         "file_id": int(ch["file_id"]),
                         "folder_id": int(ch.get("folder_id") or 0),
                         "rel_path": str(ch.get("rel_path", "")),
+                        # V-3: page citations (omitted when the source has no
+                        # page info — Chroma rejects None metadata values).
+                        **({"start_page": int(ch["start_page"])} if ch.get("start_page") is not None else {}),
                     }
                     for ch in batch
                 ]

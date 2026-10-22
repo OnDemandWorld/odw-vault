@@ -174,7 +174,7 @@ vault approve --by NAME
 
 # Diagnostics
 vault status              # JSON per-phase status
-vault serve --port 8001   # Launch Datasette
+vault serve --port 8001   # Launch the FastAPI API server
 
 # Tests
 pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v

@@ -869,9 +869,13 @@ def check() -> None:
         model_names.add(cfg.models.contextual_retrieval.name)
 
     all_ok = True
+    # V-11: parse the model column once and match EXACT names — the previous
+    # substring check (name.split(':')[0] in stdout) called 'qwen3' present
+    # when only 'qwen3-embedding:8b' was installed, and re-ran ollama per model.
+    listed = subprocess.run(["ollama", "list"], capture_output=True, text=True).stdout
+    installed = {line.split()[0] for line in listed.splitlines()[1:] if line.split()}
     for name in sorted(model_names):
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True)
-        if name.split(":")[0] in result.stdout:
+        if name in installed or name.split(":")[0] in installed:
             click.echo(f"  [green]{name}[/green]")
         else:
             click.echo(f"  [red]{name} - NOT INSTALLED[/red]")

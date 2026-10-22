@@ -465,11 +465,24 @@ def _query_impl(req: QueryRequest):
     cfg = _load_config()
     db = _get_db()
 
-    # Check Ollama reachability
+    # Check Ollama reachability (embedding host)
     try:
         ollama.Client(host=cfg.ollama.host, timeout=10).list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
+
+    # V-8: precheck the GENERATION endpoint too — it can differ from the
+    # embedding host (cloud Ollama default in config.example.toml); a dead
+    # generation endpoint previously surfaced as a raw 500 after retries.
+    gen_host = getattr(cfg.models.generation.endpoint, "host", None)
+    if gen_host and gen_host != cfg.ollama.host:
+        try:
+            ollama.Client(host=gen_host, timeout=10).list()
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Generation model endpoint ({gen_host}) is not reachable",
+            ) from None
 
     # Check Chroma collection
     suffix = cfg.models.embedding.collection_suffix
@@ -542,12 +555,20 @@ def _query_impl(req: QueryRequest):
         history = history[:-1]
 
     with span("vault.query.generate") as generate_span:
-        gen_result = generate_answer(
-            query=req.query,
-            hits=hits,
-            cfg=cfg,
-            history=history,
-        )
+        try:
+            gen_result = generate_answer(
+                query=req.query,
+                hits=hits,
+                cfg=cfg,
+                history=history,
+            )
+        except Exception as gen_err:
+            # V-8: retry exhaustion / endpoint death is a service-level
+            # condition, not a client error.
+            raise HTTPException(
+                status_code=503,
+                detail=f"Generation failed: {gen_err}",
+            ) from gen_err
         generate_span.set_attr("generation_ms", gen_result.get("generation_ms"))
         generate_span.set_attr("model", gen_result.get("model"))
         generate_span.set_attr("refused", gen_result.get("refused", False))
@@ -841,6 +862,30 @@ def query_stream(req: QueryRequest):
                 ),
             )
 
+            # V-5: mirror /query's refuse_on_empty_context — the stream
+            # previously generated from "(no context available)" instead of
+            # refusing, diverging from the non-streaming contract.
+            if cfg.generation_runtime.refuse_on_empty_context and not hits:
+                from rag.generation import REFUSAL_TEXT
+
+                query_log_id = _persist_stream_query(
+                    REFUSAL_TEXT,
+                    int((time.monotonic() - t0) * 1000),
+                    0,
+                )
+                yield ServerSentEvent(event="citations", data=json.dumps([]))
+                yield ServerSentEvent(
+                    event="done",
+                    data=json.dumps(
+                        {
+                            "query_log_id": query_log_id,
+                            "metrics": {"retrieval_ms": retrieval_ms, "generation_ms": 0.0, "total_ms": retrieval_ms},
+                            "refused": True,
+                        }
+                    ),
+                )
+                return
+
             # Event: streaming tokens
             answer_parts: list[str] = []
             stream_resp = await oclient.chat(
@@ -1127,21 +1172,55 @@ def list_models():
 # ---------------------------------------------------------------------------
 
 
-@app.post("/eval/run")
-def run_eval():
+# V-13: eval runs are minutes-long (per-question retrieval+generation) — the
+# previous synchronous handler blocked the request worker. Track in-flight
+# runs in-process and expose status for polling.
+_eval_runs: dict[str, dict] = {}
+_eval_lock = threading.Lock()
+
+
+def _run_eval_background(run_id: str) -> None:
+    import traceback
+
     db = _get_db()
     cfg = _load_config()
-
     try:
         from eval.runner import run_eval as _run_eval
-    except ImportError:
-        raise HTTPException(
-            status_code=501,
-            detail="Evaluation harness not yet implemented",
-        ) from None
 
-    result = _run_eval(db, cfg)
-    return result
+        result = _run_eval(db, cfg)
+        with _eval_lock:
+            _eval_runs[run_id] = {"status": "done", "result": result}
+    except ImportError:
+        with _eval_lock:
+            _eval_runs[run_id] = {
+                "status": "error",
+                "error": "evaluation module unavailable",
+            }
+    except Exception as exc:  # noqa: BLE001
+        with _eval_lock:
+            _eval_runs[run_id] = {"status": "error", "error": f"{exc}", "trace": traceback.format_exc()[-2000:]}
+
+
+@app.post("/eval/run")
+def run_eval():
+    import uuid as _uuid
+
+    run_id = str(_uuid.uuid4())
+    with _eval_lock:
+        if any(r["status"] == "running" for r in _eval_runs.values()):
+            raise HTTPException(status_code=409, detail="An eval run is already in progress")
+        _eval_runs[run_id] = {"status": "running"}
+    threading.Thread(target=_run_eval_background, args=(run_id,), daemon=True).start()
+    return {"run_id": run_id, "status": "running"}
+
+
+@app.get("/eval/run/{run_id}")
+def get_eval_status(run_id: str):
+    with _eval_lock:
+        state = _eval_runs.get(run_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown eval run id")
+    return {"run_id": run_id, **state}
 
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +1280,20 @@ def delete_conversation_api(conversation_id: str):
 # ---------------------------------------------------------------------------
 
 
+def _normalize_date_bound(raw: str, *, end: bool) -> str:
+    """Normalize a date filter to the query_log `asked_at` format.
+
+    `asked_at` rows are 'YYYY-MM-DD HH:MM:SS'; a bare 'YYYY-MM-DD' bound must
+    become inclusive of that whole day (V-9). Values already carrying a time
+    component pass through unchanged (space or ISO 'T' separators both
+    accepted).
+    """
+    value = raw.strip()
+    if len(value) == 10:
+        return f"{value} 23:59:59" if end else f"{value} 00:00:00"
+    return value.replace("T", " ", 1) if "T" in value else value
+
+
 @app.get("/queries", response_model=QueryLogPage)
 def query_history(
     page: int = Query(1, ge=1),
@@ -1225,11 +1318,13 @@ def query_history(
 
     if start_date:
         conditions.append("asked_at >= ?")
-        params.append(start_date)
+        params.append(_normalize_date_bound(start_date, end=False))
 
     if end_date:
+        # V-9: 'YYYY-MM-DD' is the whole final day — a raw string compare
+        # against 'YYYY-MM-DD HH:MM:SS' rows excluded that day entirely.
         conditions.append("asked_at <= ?")
-        params.append(end_date)
+        params.append(_normalize_date_bound(end_date, end=True))
 
     where_clause = ""
     if conditions:
@@ -1393,10 +1488,11 @@ async def _upload_files_impl(
             dest = dest.resolve()
             rel_path = str(dest.relative_to(corpus_root.resolve()))
 
-            # Get file modification time
+            # Get file modification time (V-10: same format the indexer/sync
+            # writes — '%Y-%m-%dT%H:%M:%SZ' — so the sync fast-skip can match).
             mtime = datetime.datetime.fromtimestamp(
                 dest.stat().st_mtime, tz=datetime.UTC
-            ).isoformat()
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
             # Insert file record
             db["file"].insert({
@@ -1557,13 +1653,18 @@ def list_files(
                 "WHERE c.file_id = f.id AND er.is_current = 1)"
             )
         elif status == "failed":
+            # V-1: pipeline writers record failures under 'extract' (phase8/
+            # indexer) and 'embed' — the previous 'extraction' literal matched
+            # nothing, so failed files were listed as pending forever.
             where_clauses.append(
-                "EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id AND fail.phase = 'extraction')"
+                "EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id "
+                "AND fail.phase IN ('extract', 'extraction', 'indexer', 'embed'))"
             )
         elif status == "pending":
             where_clauses.append(
                 "NOT EXISTS (SELECT 1 FROM extraction e WHERE e.file_id = f.id AND e.succeeded = 1) "
-                "AND NOT EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id AND fail.phase = 'extraction')"
+                "AND NOT EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id "
+                "AND fail.phase IN ('extract', 'extraction', 'indexer', 'embed'))"
             )
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
@@ -1594,7 +1695,8 @@ def list_files(
                 ) THEN 'indexed'
                 WHEN EXISTS (
                     SELECT 1 FROM failure fail
-                    WHERE fail.file_id = f.id AND fail.phase = 'extraction'
+                    WHERE fail.file_id = f.id
+                      AND fail.phase IN ('extract', 'extraction', 'indexer', 'embed')
                 ) THEN 'failed'
                 ELSE 'pending'
             END as status

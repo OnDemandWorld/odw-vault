@@ -132,7 +132,7 @@ def _embed_chunks(
     if reembed:
         sql = """
             SELECT c.id AS chunk_id, c.text, c.context_text,
-                   c.file_id, c.metadata_json, f.folder_id, f.rel_path,
+                   c.file_id, c.start_page, c.metadata_json, f.folder_id, f.rel_path,
                    f.category AS file_category
             FROM chunk c
             JOIN file f ON f.id = c.file_id
@@ -143,7 +143,7 @@ def _embed_chunks(
     else:
         sql = """
             SELECT c.id AS chunk_id, c.text, c.context_text,
-                   c.file_id, c.metadata_json, f.folder_id, f.rel_path,
+                   c.file_id, c.start_page, c.metadata_json, f.folder_id, f.rel_path,
                    f.category AS file_category
             FROM chunk c
             JOIN file f ON f.id = c.file_id
@@ -223,6 +223,10 @@ def _embed_chunks(
             meta["rel_path"] = str(r.get("rel_path", ""))
             meta["inferred_category"] = str(fldr.get("inferred_category", "") or "")
             meta["inferred_label"] = str(fldr.get("inferred_label", "") or "")
+            # V-3: carry the chunk's start_page so retrieval/citations can
+            # cite pages (omitted when the source has no page info).
+            if r.get("start_page") is not None:
+                meta["start_page"] = int(r["start_page"])
             metadatas.append(meta)
 
         # Upsert into Chroma (add for new, update for existing)

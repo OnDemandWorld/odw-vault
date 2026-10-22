@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > 套件 V1.4-V1.6 的 Vault 功能（审计导出、分布式追踪、流式引用修复、多 provider 设置）
 > 落在项目 0.2.x 内，见下方对应条目。
 
+## [Unreleased] - 2026-10-22（第六轮深度审查）
+
+### Fixed
+- **[P1] `/files?status=failed` 永远匹配不到**：过滤用的失败相位标签是 `'extraction'`，
+  而管线写入的是 `'extract'`（phase8/indexer/embed）——真实失败的文件永远显示为 pending。
+  连同把旧标签锁进测试的 fixture 一并修正（tests/test_review_round6_fixes.py）。
+- **[P1] UI 点赞/点踩静默失败**：`UPDATE … ORDER BY … LIMIT` 不是合法 SQLite 语法；
+  改为 UI 轮次记录 query_log 行后按主键精确定位更新。
+- **[P1] 引用页码几乎恒 null**：两处 embed 均未把 `start_page` 写入 Chroma metadata，
+  RRF 融合也不回填 BM25 命中的页码。三路修复：embed 写入 + 融合回填 + chunk 表兜底。
+- **[P1] `use_augmentation` 死参数**：schema/CLI 接受并透传但 retrieve() 从不读取；
+  现按配置默认（contextual_retrieval.enabled）或请求覆盖，启用时把 phase-10.5 情境
+  前缀进生成上下文。
+- **[P2] `/query/stream` 不拒答空上下文**：与非流式路径分叉；现按
+  refuse_on_empty_context 直接返回拒答（refused=true）。
+- **[P2] 生成端点故障裸 500**：预检只 ping embedding host；现同时预检
+  models.generation.endpoint，重试耗尽映射为 503。
+- **[P2] `/queries` end_date 排除当天**：裸日期字符串比较边界错误；归一化为当天
+  23:59:59（含 ISO `T` 分隔兼容）。
+- **[P2] 上传 mtime 格式不一致**：isoformat（微秒+时区）vs indexer 的
+  `%Y-%m-%dT%H:%M:%SZ`——sync 的 mtime+size 快速跳过对上传文件永不命中，每次重算
+  SHA-256。统一为 indexer 格式。
+- **[P2] `vault models check` 误报**：子串匹配（qwen3 命中 qwen3-embedding）且每模型
+  跑一次 ollama list；改为解析一次精确匹配。
+- **[P2] UI 多轮对话名存实亡**：_stream_tokens 只发当前轮；现注入与 API /query 相同的
+  历史窗口。UI 查询现也落 query_log（/queries 历史与指标不再对 UI 流量全盲）。
+- **[P2] `/eval/run` 同步阻塞**：分钟级评估在请求线程执行；改后台线程 + run_id +
+  `GET /eval/run/{id}` 轮询；501 文案同步修正。
+- **[P2] 文档**：README/CLAUDE 中 `vault serve` 的 Datasette 描述纠正（serve 启动
+  FastAPI；Datasette 是 serve-datasette）。
+
+### Deferred
+- require_citations 生成期强制（V-14）列 V1.7（当前仅提示词约束 + 设置页展示）。
+
 ## [Unreleased] - 2026-10-08（上线前深度审查轮）
 
 ### Fixed

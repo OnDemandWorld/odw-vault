@@ -420,7 +420,7 @@ def _format_chunks_for_prompt(hits: list[Hit]) -> str:
     return "\n\n".join(blocks) if blocks else "(no context available)"
 
 
-def _stream_tokens(query: str, hits: list[Hit]):
+def _stream_tokens(query: str, hits: list[Hit], history: list[dict] | None = None):
     numbered_chunks = _format_chunks_for_prompt(hits)
     template = _load_prompt(None, _cfg)
     prompt = template.format(numbered_chunks=numbered_chunks, query=query)
@@ -436,10 +436,16 @@ def _stream_tokens(query: str, hits: list[Hit]):
     if provider is None:
         raise RuntimeError("No model provider configured. Open Settings to add one.")
 
-    messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": prompt},
-    ]
+    messages = [{"role": "system", "content": system_content}]
+
+    # V-6 (UI multi-turn): replay the trailing conversation window so follow-up
+    # questions ("再详细说说") keep context — previously the UI sent only the
+    # latest turn while the API /query path injected a 5-turn window.
+    prior_turns = [m for m in (history or []) if m.get("role") in ("user", "assistant") and m.get("content")]
+    for m in prior_turns[-10:]:  # 5 user/assistant round-trips
+        messages.append({"role": m["role"], "content": m["content"]})
+
+    messages.append({"role": "user", "content": prompt})
 
     full_text = ""
     for token in _provider_chat_stream(
@@ -512,12 +518,62 @@ def _on_folder_change(folder_filter: str) -> str:
     return f"Scoped to: {folder_filter}"
 
 
+# V-7: chat-history index → query_log row id for the turn that finished there.
+# Gradio's LikeData.index points at the message inside the history list, so the
+# mapping stays aligned with what the user actually liked.
+_turn_log_ids: dict[int, int] = {}
+
+
+def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float, total_ms: float) -> None:
+    """Persist a UI turn to query_log (V-7): /queries history and metrics were
+    blind to all UI traffic; feedback also had no row to target."""
+    try:
+        cursor = _get_db().conn.execute(
+            """
+            INSERT INTO query_log
+               (user, query_text, query_lang, folder_filter_json,
+                retrieved_chunks_json, answer_text, answer_model,
+                latency_ms, retrieval_ms, generation_ms)
+            VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ui",
+                message,
+                "unknown",
+                json.dumps([h.rel_path for h in hits]),
+                answer,
+                _cfg.models.generation.name,
+                int(total_ms * 1000),
+                int(retrieval_ms * 1000),
+                int((total_ms - retrieval_ms) * 1000),
+            ),
+        )
+        _get_db().conn.commit()
+        _turn_log_ids[len(_chat_history_snapshot()) - 1] = cursor.lastrowid
+    except Exception:
+        logger.warning("Failed to record UI query_log", exc_info=True)
+
+
+def _chat_history_snapshot() -> list:
+    """Latest chat history as tracked by the Gradio state (best-effort)."""
+    return _LATEST_HISTORY
+
+
+# The history list most recently yielded by _on_chat (feedback alignment).
+_LATEST_HISTORY: list = []
+
+
 def _on_feedback(feedback_data: gr.LikeData) -> None:
     try:
+        log_id = _turn_log_ids.get(feedback_data.index)
+        if log_id is None:
+            logger.warning("Feedback received for a turn without a query_log row")
+            return
+        # V-2: target the exact row by primary key — the previous
+        # UPDATE ... ORDER BY ... LIMIT is invalid SQLite (silently failing).
         _get_db().conn.execute(
-            "UPDATE query_log SET feedback = ?, feedback_at = datetime('now') "
-            "WHERE feedback IS NULL ORDER BY asked_at DESC LIMIT 1",
-            ("up" if feedback_data.liked else "down",),
+            "UPDATE query_log SET feedback = ?, feedback_at = datetime('now') WHERE id = ?",
+            ("up" if feedback_data.liked else "down", log_id),
         )
         _get_db().conn.commit()
     except Exception:
@@ -588,7 +644,7 @@ def _on_chat(message: str, history: list[dict], folder_filter: str, conversation
     citations = []
     full_text = ""
     try:
-        token_gen = _stream_tokens(message.strip(), hits)
+        token_gen = _stream_tokens(message.strip(), hits, history=history[:-1])
         for result in token_gen:
             if isinstance(result, tuple):
                 full_text, citations = result
@@ -612,6 +668,17 @@ def _on_chat(message: str, history: list[dict], folder_filter: str, conversation
         _save_conversation_message(conv_id, "assistant", full_text)
     except Exception:
         logger.warning("Failed to save assistant message to conversation", exc_info=True)
+
+    # V-7: persist the turn to query_log (metrics/history) before finishing.
+    global _LATEST_HISTORY
+    _LATEST_HISTORY = list(history)
+    _record_query_log(
+        message=message.strip(),
+        answer=full_text,
+        hits=hits,
+        retrieval_ms=elapsed_retrieval,
+        total_ms=elapsed_total,
+    )
 
     yield history, _citations_html(citations)
 

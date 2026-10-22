@@ -509,7 +509,7 @@ vault exclude --target {file,folder} --id N --reason TEXT
 vault exclude-batch --from-file exclusions.csv
 vault approve --by NAME
 vault status              # JSON per-phase status
-vault serve --port 8001   # Launch Datasette
+vault serve --port 8001   # Launch the FastAPI API server
 
 # Part 2: RAG Pipeline
 vault extract [--workers N] [--reextract]

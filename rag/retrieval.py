@@ -45,6 +45,15 @@ def retrieve(
     t0 = time.monotonic()
     metrics: dict = {}
 
+    # V-4: `use_augmentation` was accepted by schema/CLI but never read —
+    # resolve it against the config default so the switch actually does
+    # something (context prepending happens in _assemble_context).
+    augmentation_enabled = use_augmentation
+    if augmentation_enabled is None:
+        augmentation_enabled = bool(
+            getattr(getattr(cfg.models, "contextual_retrieval", None), "enabled", False)
+        )
+
     # 1. Config assertion: verify Chroma collection exists and embedding model matches
     suffix = cfg.models.embedding.collection_suffix
     chunk_collection_name = f"chunks__{suffix}"
@@ -183,7 +192,8 @@ def retrieve(
     final_hits = fused[:top_k]
 
     # 9. Context assembly
-    _assemble_context(final_hits, db)
+    _augment_hit_text = augmentation_enabled
+    _assemble_context(final_hits, db, augment=_augment_hit_text)
 
     elapsed = (time.monotonic() - t0) * 1000
     metrics["retrieval_ms"] = round(elapsed, 1)
@@ -205,6 +215,10 @@ def reciprocal_rank_fuse(dense_hits: list[Hit], bm25_hits: list[Hit], k: int) ->
         if h.chunk_id in by_id:
             by_id[h.chunk_id].fused_score += c
             by_id[h.chunk_id].bm25_score = h.bm25_score
+            # V-3: dense hits lack start_page unless (re)embedded after the
+            # metadata fix — take the BM25 hit's value (chunk-table sourced).
+            if by_id[h.chunk_id].page_start is None and h.page_start is not None:
+                by_id[h.chunk_id].page_start = h.page_start
         else:
             h.fused_score = c
             by_id[h.chunk_id] = h
@@ -734,11 +748,43 @@ def _bm25_retrieve(
     return hits
 
 
-def _assemble_context(hits: list[Hit], db) -> None:
+def _assemble_context(hits: list[Hit], db, augment: bool = False) -> None:
     """Sort hits in a coherent order for the generation prompt.
 
     Orders final chunks by (file_id, ordinal). The caller is responsible
     for formatting the context blocks (e.g., _format_chunks_for_prompt).
     """
+    # V-3: embeddings written before the start_page metadata fix (and any
+    # dense-only hit) carry page_start=None — backfill from the chunk table so
+    # citations actually cite pages.
+    missing = [h for h in hits if h.page_start is None]
+    if missing:
+        try:
+            id_list = ",".join(str(h.chunk_id) for h in missing)
+            rows = db.query(f"SELECT id, start_page FROM chunk WHERE id IN ({id_list}) AND start_page IS NOT NULL")
+            pages = {r["id"]: r["start_page"] for r in rows}
+            for h in missing:
+                if h.chunk_id in pages:
+                    h.page_start = pages[h.chunk_id]
+        except Exception:
+            pass  # best-effort enrichment
+
+    if augment:
+        # V-4: prepend each chunk's phase-10.5 situating context so the
+        # generation prompt carries the richer context the pipeline paid for.
+        try:
+            id_list = ",".join(str(h.chunk_id) for h in hits)
+            rows = db.query(
+                f"SELECT id, context_text FROM chunk WHERE id IN ({id_list}) "
+                "AND context_text IS NOT NULL AND context_text != ''"
+            )
+            contexts = {r["id"]: r["context_text"] for r in rows}
+            for h in hits:
+                ctx = contexts.get(h.chunk_id)
+                if ctx:
+                    h.text = f"{ctx}\n\n{h.text}"
+        except Exception:
+            pass  # best-effort augmentation
+
     # Sort by file_id then by chunk_id (ordinal within file)
     hits.sort(key=lambda h: (h.file_id, h.chunk_id))
