@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest.importorskip("watchdog", reason="watchdog not installed; skip watcher tests")
+
 from pipeline.config import (
     AppConfig,
     ChunkConfig,
