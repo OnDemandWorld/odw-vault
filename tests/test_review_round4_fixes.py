@@ -40,7 +40,13 @@ from pipeline.config import (
 from pipeline.db import migrate, open_db
 from rag.indexer import IncrementalIndexer
 from rag.retrieval import IN_FILTER_BATCH, _dense_retrieve_with_embedding
-from rag.watcher import CorpusWatcher
+
+try:
+    from rag.watcher import CorpusWatcher
+    _HAS_WATCHDOG = True
+except ImportError:
+    CorpusWatcher = None  # type: ignore[assignment]
+    _HAS_WATCHDOG = False
 
 
 def _make_app_config(corpus: Path, cache: Path, chroma: Path, **watcher_kwargs) -> AppConfig:
@@ -111,6 +117,7 @@ def env(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _HAS_WATCHDOG, reason="watchdog not installed")
 class TestWatcherThreadAffinity:
     def test_worker_builds_own_connection_from_factory(self, env):
         """The flush worker must not touch the caller's sqlite3 handle."""
