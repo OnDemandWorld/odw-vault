@@ -8,7 +8,7 @@ ODW Vault is a **fully offline** pre-flight pipeline + end-to-end RAG system for
 
 ⚠️ **Early release.** ODW Vault is an early, functional release — core features work, but it is not yet hardened for production. We are refining every module toward a first full public release in **Q3 2026**. Until then, it is best used as a foundation to build on with AI coding agents (see below).
 
-** Build Status:** Part 1 (pre-flight) and Part 2 (RAG pipeline) both implemented and operational. 167 tests passing.
+** Build Status:** Part 1 (pre-flight) and Part 2 (RAG pipeline) both implemented and operational. 706 tests passing.
 
 ## Features
 
@@ -381,7 +381,7 @@ vault ui
 | UI | Gradio 6.x | Chat interface |
 | CLI | click | Subcommand surface |
 | Progress bars | rich | Terminal UI |
-| Testing | pytest + pytest-cov | 167 tests, 86% coverage |
+| Testing | pytest + pytest-cov | 706 tests |
 
 ### Database Schema
 
@@ -534,7 +534,7 @@ pytest tests/ --cov=pipeline --cov=cli --cov-report=term-missing -v
 
 - **BUILD_STATUS.md** — Complete build status, all 28 bugs resolved, pending issues
 - **PART_2_STATUS.md** — Part 2 (phases 8–14) detailed status, architecture, query results
-- **TEST_REPORT.md** — Test suite report (167 tests, 86% coverage)
+- **TEST_REPORT.md** — Test suite report (706 tests)
 - **CLAUDE.md** — AI assistant context for this project
 - **Technical Specification Document- Local RAG Pre-Flight Pipeline.md** — Original Part 1 spec
 - **Technical Specification Document- Local RAG Pipeline (Phases 8–14).md** — Part 2 spec

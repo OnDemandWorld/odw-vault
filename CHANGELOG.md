@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > 套件 V1.4-V1.6 的 Vault 功能（审计导出、分布式追踪、流式引用修复、多 provider 设置）
 > 落在项目 0.2.x 内，见下方对应条目。
 
+## [Unreleased] - 2026-10-26
+
+### Changed
+- **FastAPI lifespan migration**：`@app.on_event("startup"/"shutdown")` 替换为
+  `asynccontextmanager` lifespan handler，消除 DeprecationWarning（FastAPI 0.115+
+  将在未来版本移除 on_event）。
+- **CI watcher 测试修复**：`pytest.importorskip("watchdog")` 守卫，CI 未安装可选
+  watchdog 依赖时 16 条 watcher 测试优雅跳过而非 ImportError 失败。
+- **文档同步**：README 测试计数 167 → 706；技术栈表、文档索引同步更新。
+
 ## [Unreleased] - 2026-10-22（第六轮深度审查）
 
 ### Fixed

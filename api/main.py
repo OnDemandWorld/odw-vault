@@ -127,7 +127,38 @@ def _load_config():
     return cfg
 
 
-app = FastAPI(title="ODW.ai Vault RAG")
+_watcher = None  # CorpusWatcher instance (started on app startup if enabled)
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """Manage application lifespan: start/stop the corpus file watcher."""
+    global _watcher
+    try:
+        cfg = _load_config()
+        if cfg.watcher.enabled:
+            from rag.watcher import CorpusWatcher
+
+            chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
+            _watcher = CorpusWatcher(
+                cfg,
+                _get_db(),
+                chroma_client,
+                db_factory=_get_db,
+                startup_sync=cfg.watcher.startup_sync,
+            )
+            _watcher.start()
+            logger.info("Corpus watcher started via API server")
+    except Exception as exc:
+        logger.warning("Failed to start corpus watcher: %s", exc)
+    yield
+    if _watcher is not None:
+        _watcher.stop()
+        _watcher = None
+        logger.info("Corpus watcher stopped")
+
+
+app = FastAPI(title="ODW.ai Vault RAG", lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
 # CORS (browser clients such as the Loop canvas call Vault cross-origin)
@@ -244,49 +275,6 @@ def _resolve_actor() -> str:
     return "anonymous"
 
 
-# ---------------------------------------------------------------------------
-# File watcher (opt-in via config [watcher] enabled = true)
-# ---------------------------------------------------------------------------
-
-_watcher = None  # CorpusWatcher instance (started on app startup if enabled)
-
-
-@app.on_event("startup")
-def _startup_watcher():
-    """Start the corpus file watcher if enabled in config."""
-    global _watcher
-    try:
-        cfg = _load_config()
-        if not cfg.watcher.enabled:
-            return
-        from rag.watcher import CorpusWatcher
-
-        chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
-        # sqlite3 connections are thread-affine and the watcher flushes on its
-        # own worker thread — pass a factory so the worker builds its own
-        # connection (_get_db is thread-local). Passing this thread's handle
-        # would make every flush raise sqlite3.ProgrammingError.
-        _watcher = CorpusWatcher(
-            cfg,
-            _get_db(),
-            chroma_client,
-            db_factory=_get_db,
-            startup_sync=cfg.watcher.startup_sync,
-        )
-        _watcher.start()
-        logger.info("Corpus watcher started via API server")
-    except Exception as exc:
-        logger.warning("Failed to start corpus watcher: %s", exc)
-
-
-@app.on_event("shutdown")
-def _shutdown_watcher():
-    """Stop the corpus file watcher."""
-    global _watcher
-    if _watcher is not None:
-        _watcher.stop()
-        _watcher = None
-        logger.info("Corpus watcher stopped")
 
 
 @app.get("/")
