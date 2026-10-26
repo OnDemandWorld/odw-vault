@@ -139,15 +139,18 @@ def run_phase0(
                 )
                 break
 
+            if dry_run:
+                # Dry-run counts what would be expanded; nothing is
+                # recorded, so deeper passes would just recount the same
+                # archives (reported total was depth_limit x true count).
+                expanded_total += len(archives)
+                break
+
             progress.update(
                 task, description=f"Expanding {len(archives)} archives (depth {depth})..."
             )
 
             for arc in archives:
-                if dry_run:
-                    expanded_total += 1
-                    continue
-
                 target = arc.parent / f"{arc.name}.extracted"
                 target.mkdir(parents=True, exist_ok=True)
 
@@ -156,6 +159,9 @@ def run_phase0(
                     file_count = sum(1 for _ in target.rglob("*") if _.is_file())
 
                     arc_id = _ensure_file_in_db(db, arc, config)
+                    if arc_id is None:
+                        plog.info(f"Could not register archive file row for {arc}")
+                        continue
 
                     folder_path = str(target.resolve())
                     folder_rel = str(target.relative_to(config.corpus_root_path))
@@ -170,14 +176,18 @@ def run_phase0(
                             "name": target.name,
                             "depth": len(Path(folder_rel).parts),
                             "is_extracted_archive": 1,
-                        }
+                        },
+                        # A re-run after a partial failure may find the row
+                        # already present (extraction succeeded before) —
+                        # ignore instead of crashing on the UNIQUE path.
+                        ignore=True,
                     )
                     folder_row = next(db["folder"].rows_where("path = ?", [folder_path]), None)
                     folder_id = folder_row["id"] if folder_row else None
 
                     record_expansion(
                         db,
-                        archive_file_id=arc_id or 0,
+                        archive_file_id=arc_id,
                         extracted_to_path=str(target.resolve()),
                         extracted_to_folder_id=folder_id,
                         tool="patool",
@@ -188,9 +198,16 @@ def run_phase0(
                     expanded_total += 1
                 except Exception as e:
                     arc_id = _ensure_file_in_db(db, arc, config)
+                    if arc_id is None:
+                        # archive_file_id is NOT NULL + FK to file(id);
+                        # "or 0" would violate it and mask the original
+                        # extraction error. Report without the expansion row.
+                        plog.info(f"Extraction failed and file row missing for {arc}: {e}")
+                        failed_total = locals().get("failed_total", 0)
+                        continue
                     record_expansion(
                         db,
-                        archive_file_id=arc_id or 0,
+                        archive_file_id=arc_id,
                         extracted_to_path=str(target.resolve()),
                         extracted_to_folder_id=None,
                         tool="patool",

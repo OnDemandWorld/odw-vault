@@ -41,7 +41,7 @@ def _build_prompt(extracted_text: str) -> str:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=30))
 def _call_ollama(prompt: str, model: str, host: str, temperature: float, max_tokens: int) -> str:
     """Call Ollama and return stripped summary text."""
-    client = ollama.Client(host=host)
+    client = ollama.Client(host=host, timeout=600)
     response = client.chat(
         model=model,
         messages=[

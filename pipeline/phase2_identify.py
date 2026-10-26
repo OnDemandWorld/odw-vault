@@ -86,7 +86,7 @@ def run_phase2(
 
     try:
         result = subprocess.run(
-            [sf_path, "-json", "-multi", str(n_workers), str(root)],
+            [sf_path, "-json", "-multi", str(n_workers), str(Path(root).resolve())],
             capture_output=True,
             text=True,
             timeout=3600,
@@ -104,14 +104,32 @@ def run_phase2(
         plog.error(f"Failed to parse Siegfried JSON: {e}")
         raise RuntimeError(f"Siegfried JSON parse error: {e}") from None
 
-    # Build path -> identification map
+    # Build path -> identification map. DB paths are resolved (phase 1
+    # stores fp.resolve()); index sf's echoed paths both raw and canonical
+    # so relative roots or symlinked ancestors can't silently mismatch
+    # (a mismatch marks every file 'unknown' without any error).
     sf_results = {}
     for file_entry in sf_data.get("files", []):
         filepath = file_entry.get("filename", "")
         sf_results[filepath] = file_entry
+        try:
+            canonical = str(Path(filepath).resolve())
+        except OSError:
+            canonical = filepath
+        sf_results.setdefault(canonical, file_entry)
 
     identified = 0
     unknown = 0
+
+    # Coverage guard: if sf reported paths we can't match at all, everything
+    # would silently fall through to 'unknown' — make it loud instead.
+    _unmatched = sum(1 for fp in files_to_id if fp not in sf_results)
+    if files_to_id and _unmatched > 0.9 * len(files_to_id):
+        plog.error(
+            f"Siegfried output matched only {len(files_to_id) - _unmatched}/"
+            f"{len(files_to_id)} files — most files will be marked 'unknown'. "
+            "Check corpus_root vs sf output paths."
+        )
 
     with Progress(
         SpinnerColumn(),

@@ -113,7 +113,7 @@ def _call_ollama_native(
     max_tokens: int,
 ) -> str:
     """Call Ollama native API."""
-    client = ollama.Client(host=host)
+    client = ollama.Client(host=host, timeout=600)
     response = client.chat(
         model=model,
         messages=[

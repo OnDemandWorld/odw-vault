@@ -38,10 +38,13 @@ def resolve_folder_filter(db: sqlite_utils.Database, folder_filter: dict) -> set
 
     if "path_prefix" in folder_filter:
         prefix = folder_filter["path_prefix"]
+        # Escape LIKE wildcards: a caller-supplied '%' or '_' would otherwise
+        # BROADEN the scope filter (e.g. prefix "%" matches every folder).
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         rows = db.query(
             "SELECT f.id FROM file f JOIN folder fo ON f.folder_id = fo.id "
-            "WHERE fo.rel_path LIKE ? AND f.excluded = 0",
-            [f"{prefix}%"],
+            "WHERE fo.rel_path LIKE ? ESCAPE '\\' AND f.excluded = 0",
+            [f"{escaped}%"],
         )
         allowed_ids.update(r["id"] for r in rows)
 

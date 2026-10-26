@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ DEFAULT_WINDOW_SIZE = 5  # number of recent turns (user+assistant pairs)
 def create_conversation(db, user: str | None = None, title: str | None = None) -> str:
     """Create a new conversation and return its ID."""
     conv_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
     db.execute(
         "INSERT INTO conversation (id, user, title, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -53,7 +53,7 @@ def add_message(
     query_log_id: int | None = None,
 ) -> int:
     """Add a message to a conversation and return its ID."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
     cursor = db.execute(
         "INSERT INTO message (conversation_id, role, content, query_log_id, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -90,7 +90,8 @@ def get_history(
     rows = db.query(
         "SELECT role, content FROM message "
         "WHERE conversation_id = ? "
-        "ORDER BY created_at DESC LIMIT ?",
+        # id tiebreaker: second-granularity timestamps collide within a turn
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
         [conversation_id, limit],
     )
 
@@ -128,7 +129,7 @@ def get_conversation_messages(db, conversation_id: str) -> list[dict]:
     rows = db.query(
         "SELECT id, role, content, query_log_id, created_at "
         "FROM message WHERE conversation_id = ? "
-        "ORDER BY created_at",
+        "ORDER BY created_at, id",
         [conversation_id],
     )
     return [dict(r) for r in rows]
@@ -145,7 +146,7 @@ def delete_conversation(db, conversation_id: str) -> bool:
 
 def _default_title(user: str | None) -> str:
     """Generate a default conversation title."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
     if user:
         return f"Chat with {user} — {now}"
     return f"Conversation — {now}"

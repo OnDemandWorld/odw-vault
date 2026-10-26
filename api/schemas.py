@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -58,7 +60,9 @@ class QueryResponse(BaseModel):
 
 class FeedbackRequest(BaseModel):
     query_log_id: int
-    feedback: str  # "up" or "down"
+    # Mirrors the CHECK constraint on query_log.feedback — bad input becomes
+    # a 422 instead of an unhandled sqlite3.IntegrityError (500).
+    feedback: Literal["up", "down"]
     note: str | None = None
 
 

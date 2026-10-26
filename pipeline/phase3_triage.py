@@ -6,6 +6,7 @@ Runs in a thread pool with per-thread DB connections.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -60,15 +61,28 @@ def _triage_pdf(filepath: str, config: Config) -> dict:
         out["triage_json"] = json.dumps({"error": str(e)}, ensure_ascii=False)
         return out
 
+    # fitz defers parsing: is_encrypted/page_count/load_page can raise on
+    # PDFs that opened fine. Isolate the failure to this one file instead of
+    # aborting the whole phase.
+    try:
+        return _triage_pdf_body(doc, filepath, config, out)
+    except Exception as e:
+        out["is_corrupt"] = 1
+        out["triage_json"] = json.dumps({"error": str(e)}, ensure_ascii=False)
+        return out
+    finally:
+        with contextlib.suppress(Exception):
+            doc.close()
+
+
+def _triage_pdf_body(doc, filepath: str, config: Config, out: dict) -> dict:
     if doc.is_encrypted and not doc.authenticate(""):
         out["is_encrypted"] = 1
-        doc.close()
         return out
 
     out["page_count"] = doc.page_count
     n = doc.page_count
     if n == 0:
-        doc.close()
         out["triage_json"] = json.dumps({"sampled_pages": [], "avg_chars": 0}, ensure_ascii=False)
         out["has_text_layer"] = 0
         out["category_override"] = "pdf-scanned"
@@ -105,7 +119,6 @@ def _triage_pdf(filepath: str, config: Config) -> dict:
         },
         ensure_ascii=False,
     )
-    doc.close()
     return out
 
 
@@ -280,7 +293,14 @@ def run_phase3(
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {executor.submit(_triage_one, fr): fr for fr in files_to_triage}
             for future in as_completed(futures):
-                file_id, result, error = future.result()
+                # Per-file isolation: one unexpected worker exception must
+                # not abort the whole phase.
+                try:
+                    file_id, result, error = future.result()
+                except Exception as exc:
+                    results.append((None, {"error": str(exc)}, True))
+                    progress.update(task, advance=1)
+                    continue
                 if error and result:
                     record_failure(
                         db,

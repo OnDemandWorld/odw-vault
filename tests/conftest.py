@@ -561,3 +561,16 @@ def seed_test_extractions(
         ext_ids.append(ext_table.last_rowid)
     db.conn.commit()
     return ext_ids
+
+
+@pytest.fixture(autouse=True)
+def _reset_health_cache():
+    """Keep /health's TTL cache from leaking between tests (each test mocks
+    different component states and expects fresh probes)."""
+    import api.main as _api_main
+
+    _api_main._health_cache["at"] = 0.0
+    _api_main._health_cache["value"] = None
+    yield
+    _api_main._health_cache["at"] = 0.0
+    _api_main._health_cache["value"] = None

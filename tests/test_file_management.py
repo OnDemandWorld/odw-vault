@@ -217,7 +217,9 @@ class TestFileList:
         failed_id = _get_last_file_id(db)
         db["failure"].insert({
             "file_id": failed_id,
-            "phase": "extraction",
+            # V-1 regression guard: the real pipeline writes 'extract' (not
+            # 'extraction') — the fixture previously matched only the old bug.
+            "phase": "extract",
             "tool": "test",
             "error_class": "Error",
             "error_message": "fail",

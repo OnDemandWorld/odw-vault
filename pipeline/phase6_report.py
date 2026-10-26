@@ -284,8 +284,11 @@ def run_phase6(
         sections.append(_fmt_table(failures, "Failure Summary"))
 
     # Write report
+    # Default to the cache root, NOT the corpus root: a report inside the
+    # corpus gets walked and indexed on the next run, and its folder
+    # listings poison keyword retrieval (retrieval.py has to exclude it).
     report_path = (
-        Path(output_path) if output_path else config.corpus_root_path / "preflight_report.md"
+        Path(output_path) if output_path else config.cache_root_path / "preflight_report.md"
     )
     report_path.write_text("\n".join(sections), encoding="utf-8")
     plog.info(f"Report written to {report_path}")

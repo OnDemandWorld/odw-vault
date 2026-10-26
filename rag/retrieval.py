@@ -45,6 +45,15 @@ def retrieve(
     t0 = time.monotonic()
     metrics: dict = {}
 
+    # V-4: `use_augmentation` was accepted by schema/CLI but never read —
+    # resolve it against the config default so the switch actually does
+    # something (context prepending happens in _assemble_context).
+    augmentation_enabled = use_augmentation
+    if augmentation_enabled is None:
+        augmentation_enabled = bool(
+            getattr(getattr(cfg.models, "contextual_retrieval", None), "enabled", False)
+        )
+
     # 1. Config assertion: verify Chroma collection exists and embedding model matches
     suffix = cfg.models.embedding.collection_suffix
     chunk_collection_name = f"chunks__{suffix}"
@@ -85,7 +94,9 @@ def retrieve(
     import ollama as _ollama_mod
 
     try:
-        _qc = _ollama_mod.Client(host=cfg.ollama.host)
+        _qc = _ollama_mod.Client(
+            host=cfg.ollama.host, timeout=getattr(cfg.ollama, "timeout_seconds", 120)
+        )
         _qr = _qc.embed(model=cfg.models.embedding.name, input=[query])
         _query_emb = _qr["embeddings"][0]
     except Exception as _e:
@@ -97,6 +108,10 @@ def retrieve(
         candidate_file_ids = _hierarchical_narrowing(
             client, suffix, _query_emb, query, cfg, db, allowed_file_ids
         )
+    elif allowed_file_ids is not None:
+        # Without hierarchical narrowing the folder filter must still bind:
+        # candidate_file_ids=None would search the entire corpus.
+        candidate_file_ids = set(allowed_file_ids)
 
     # Exclude derived/meta files from search (preflight_report.md
     # contains folder listings that poison keyword matching)
@@ -109,10 +124,14 @@ def retrieve(
     # This ensures files with query terms in their path (e.g. "kwh")
     # are included even if hierarchical narrowing didn't pick them
     _path_match_ids = _find_files_by_path(db, query, excluded_ids)
+    if allowed_file_ids is not None:
+        _path_match_ids &= allowed_file_ids
     if candidate_file_ids is not None:
         candidate_file_ids = (candidate_file_ids | _path_match_ids) - excluded_ids
     elif _path_match_ids:
-        candidate_file_ids = _path_match_ids - excluded_ids
+        # No filter and no narrowing: keep unrestricted — path hits still
+        # get their BM25 boost via _path_match_retrieve below.
+        pass
 
     # 5. Dense chunk retrieval
     dense_candidates = cfg.retrieval.dense_candidates
@@ -173,7 +192,8 @@ def retrieve(
     final_hits = fused[:top_k]
 
     # 9. Context assembly
-    _assemble_context(final_hits, db)
+    _augment_hit_text = augmentation_enabled
+    _assemble_context(final_hits, db, augment=_augment_hit_text)
 
     elapsed = (time.monotonic() - t0) * 1000
     metrics["retrieval_ms"] = round(elapsed, 1)
@@ -195,6 +215,10 @@ def reciprocal_rank_fuse(dense_hits: list[Hit], bm25_hits: list[Hit], k: int) ->
         if h.chunk_id in by_id:
             by_id[h.chunk_id].fused_score += c
             by_id[h.chunk_id].bm25_score = h.bm25_score
+            # V-3: dense hits lack start_page unless (re)embedded after the
+            # metadata fix — take the BM25 hit's value (chunk-table sourced).
+            if by_id[h.chunk_id].page_start is None and h.page_start is not None:
+                by_id[h.chunk_id].page_start = h.page_start
         else:
             h.fused_score = c
             by_id[h.chunk_id] = h
@@ -208,15 +232,17 @@ def reciprocal_rank_fuse(dense_hits: list[Hit], bm25_hits: list[Hit], k: int) ->
 
 def _detect_language(query: str, cfg) -> str:
     """Detect query language using fasttext, falling back to lingua."""
-    # Try fasttext first
+    # Try fasttext first — via the per-path cached loader (the lid model is
+    # ~130MB; reloading it from disk on every query added a constant
+    # multi-hundred-ms stall to the retrieval hot path).
     try:
-        import fasttext
+        from rag.tokenization import _get_fasttext
 
-        model_path = cfg.models.language_id.model_path
-        model = fasttext.load_model(model_path)
-        predictions = model.predict(query.replace("\n", " "), k=1)
-        lang_code = predictions[0][0].replace("__label__", "")
-        return lang_code
+        model = _get_fasttext(cfg.models.language_id.model_path)
+        if model is not None:
+            predictions = model.predict(query.replace("\n", " "), k=1)
+            lang_code = predictions[0][0].replace("__label__", "")
+            return lang_code
     except Exception as e:
         logger.debug("fasttext language detection failed: %s", e)
 
@@ -287,6 +313,11 @@ def _hierarchical_narrowing(
 
     if allowed_file_ids is not None:
         candidate_ids &= allowed_file_ids
+        # Narrowing is a recall heuristic, never a scope boundary: if it
+        # produced nothing inside the allowed scope, fall back to the whole
+        # allowed scope. Never return None (unrestricted) when a filter is
+        # active, and never an empty set the caller would treat as None.
+        return candidate_ids if candidate_ids else set(allowed_file_ids)
 
     return candidate_ids if candidate_ids else None
 
@@ -304,6 +335,12 @@ def _query_db_for_files_in_folder(db, folder_id: int) -> set[int]:
         return set()
 
 
+# Chroma caps the number of values accepted by a single $in filter (the embed
+# pipeline batches with the same constant); retrieval must respect it too or
+# dense recall silently empties out for large folders/workspaces.
+IN_FILTER_BATCH = 1000
+
+
 def _dense_retrieve_with_embedding(
     collection,
     query_embedding: list[float],
@@ -311,9 +348,39 @@ def _dense_retrieve_with_embedding(
     candidate_file_ids: set[int] | None,
 ) -> list[Hit]:
     """Retrieve chunks via dense vector similarity from Chroma."""
+    if candidate_file_ids is None:
+        return _dense_query_collection(collection, query_embedding, n_results, None)
+
+    file_ids = list(candidate_file_ids)
+    if len(file_ids) <= IN_FILTER_BATCH:
+        return _dense_query_collection(collection, query_embedding, n_results, file_ids)
+
+    # Batch oversized candidate sets, then merge by score — a single $in with
+    # tens of thousands of ids raises inside Chroma and (best case) logs an
+    # error while returning zero dense hits.
+    merged: list[Hit] = []
+    for i in range(0, len(file_ids), IN_FILTER_BATCH):
+        batch = file_ids[i : i + IN_FILTER_BATCH]
+        merged.extend(
+            _dense_query_collection(collection, query_embedding, n_results, batch)
+        )
+    merged.sort(
+        key=lambda h: h.dense_score if h.dense_score is not None else float("-inf"),
+        reverse=True,
+    )
+    return merged[:n_results]
+
+
+def _dense_query_collection(
+    collection,
+    query_embedding: list[float],
+    n_results: int,
+    file_ids: list[int] | None,
+) -> list[Hit]:
+    """Run one Chroma dense query, optionally restricted to file_ids."""
     where_clause = None
-    if candidate_file_ids is not None:
-        where_clause = {"file_id": {"$in": list(candidate_file_ids)}}
+    if file_ids is not None:
+        where_clause = {"file_id": {"$in": file_ids}}
 
     try:
         results = collection.query(
@@ -529,7 +596,7 @@ def _bm25_retrieve_zh(
 
         rows = db.query(sql, params)
     except Exception as e:
-        logger.debug("Chinese BM25 retrieval skipped: %s", e)
+        logger.warning("Chinese BM25 retrieval failed: %s", e)
         return []
 
     hits: list[Hit] = []
@@ -599,46 +666,66 @@ def _bm25_retrieve(
         return []
     fts_query = " OR ".join(clean_tokens)
 
+    # SQLite caps bound parameters per statement (999 on older builds); an
+    # oversized candidate set would raise OperationalError here. Batch the IN
+    # list and merge — rows are rank-ordered, so top-n across batches is the
+    # same as a single unbatched query.
+    SQL_PARAM_BATCH = 900
+
+    def _run_fts(candidate_ids: list[int] | None, exclude_ids: set[int] | None):
+        if candidate_ids is not None:
+            placeholders = ",".join("?" for _ in candidate_ids)
+            sql = (
+                "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
+                "f.folder_id, f.rel_path, rank "
+                "FROM chunk_fts "
+                "JOIN chunk c ON chunk_fts.rowid = c.id "
+                "JOIN file f ON c.file_id = f.id "
+                f"WHERE chunk_fts MATCH ? AND c.file_id IN ({placeholders}) "
+                "ORDER BY rank LIMIT ?"
+            )
+            params = [fts_query, *candidate_ids, n_results]
+        else:
+            exclude_ids = exclude_ids or set()
+            if exclude_ids:
+                exc_placeholders = ",".join("?" for _ in exclude_ids)
+                sql = (
+                    "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
+                    "f.folder_id, f.rel_path, rank "
+                    "FROM chunk_fts "
+                    "JOIN chunk c ON chunk_fts.rowid = c.id "
+                    "JOIN file f ON c.file_id = f.id "
+                    f"WHERE chunk_fts MATCH ? AND c.file_id NOT IN ({exc_placeholders}) "
+                    "ORDER BY rank LIMIT ?"
+                )
+                params = [fts_query, *list(exclude_ids), n_results]
+            else:
+                sql = (
+                    "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
+                    "f.folder_id, f.rel_path, rank "
+                    "FROM chunk_fts "
+                    "JOIN chunk c ON chunk_fts.rowid = c.id "
+                    "JOIN file f ON c.file_id = f.id "
+                    "WHERE chunk_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?"
+                )
+                params = [fts_query, n_results]
+        return list(db.query(sql, params))
+
     if candidate_file_ids is not None:
         # candidate_file_ids already has excluded_ids removed (set subtraction above)
-        placeholders = ",".join("?" for _ in candidate_file_ids)
-        sql = (
-            "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
-            "f.folder_id, f.rel_path, rank "
-            "FROM chunk_fts "
-            "JOIN chunk c ON chunk_fts.rowid = c.id "
-            "JOIN file f ON c.file_id = f.id "
-            f"WHERE chunk_fts MATCH ? AND c.file_id IN ({placeholders}) "
-            "ORDER BY rank LIMIT ?"
-        )
-        params = [fts_query, *list(candidate_file_ids), n_results]
+        id_list = list(candidate_file_ids)
+        if len(id_list) <= SQL_PARAM_BATCH:
+            rows = _run_fts(id_list, None)
+        else:
+            rows = []
+            for i in range(0, len(id_list), SQL_PARAM_BATCH):
+                rows.extend(_run_fts(id_list[i : i + SQL_PARAM_BATCH], None))
+            rows.sort(key=lambda r: r.get("rank") if r.get("rank") is not None else 0)
+            rows = rows[:n_results]
     else:
         # No hierarchical narrowing; apply exclusion filter directly
-        if excluded_file_ids:
-            exc_placeholders = ",".join("?" for _ in excluded_file_ids)
-            sql = (
-                "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
-                "f.folder_id, f.rel_path, rank "
-                "FROM chunk_fts "
-                "JOIN chunk c ON chunk_fts.rowid = c.id "
-                "JOIN file f ON c.file_id = f.id "
-                f"WHERE chunk_fts MATCH ? AND c.file_id NOT IN ({exc_placeholders}) "
-                "ORDER BY rank LIMIT ?"
-            )
-            params = [fts_query, *list(excluded_file_ids), n_results]
-        else:
-            sql = (
-                "SELECT c.id as chunk_id, c.file_id, c.start_page, c.text, "
-                "f.folder_id, f.rel_path, rank "
-                "FROM chunk_fts "
-                "JOIN chunk c ON chunk_fts.rowid = c.id "
-                "JOIN file f ON c.file_id = f.id "
-                "WHERE chunk_fts MATCH ? "
-                "ORDER BY rank LIMIT ?"
-            )
-            params = [fts_query, n_results]
-
-    rows = db.query(sql, params)
+        rows = _run_fts(None, excluded_file_ids)
 
     hits: list[Hit] = []
     for row in rows:
@@ -661,11 +748,43 @@ def _bm25_retrieve(
     return hits
 
 
-def _assemble_context(hits: list[Hit], db) -> None:
+def _assemble_context(hits: list[Hit], db, augment: bool = False) -> None:
     """Sort hits in a coherent order for the generation prompt.
 
     Orders final chunks by (file_id, ordinal). The caller is responsible
     for formatting the context blocks (e.g., _format_chunks_for_prompt).
     """
+    # V-3: embeddings written before the start_page metadata fix (and any
+    # dense-only hit) carry page_start=None — backfill from the chunk table so
+    # citations actually cite pages.
+    missing = [h for h in hits if h.page_start is None]
+    if missing:
+        try:
+            id_list = ",".join(str(h.chunk_id) for h in missing)
+            rows = db.query(f"SELECT id, start_page FROM chunk WHERE id IN ({id_list}) AND start_page IS NOT NULL")
+            pages = {r["id"]: r["start_page"] for r in rows}
+            for h in missing:
+                if h.chunk_id in pages:
+                    h.page_start = pages[h.chunk_id]
+        except Exception:
+            pass  # best-effort enrichment
+
+    if augment:
+        # V-4: prepend each chunk's phase-10.5 situating context so the
+        # generation prompt carries the richer context the pipeline paid for.
+        try:
+            id_list = ",".join(str(h.chunk_id) for h in hits)
+            rows = db.query(
+                f"SELECT id, context_text FROM chunk WHERE id IN ({id_list}) "
+                "AND context_text IS NOT NULL AND context_text != ''"
+            )
+            contexts = {r["id"]: r["context_text"] for r in rows}
+            for h in hits:
+                ctx = contexts.get(h.chunk_id)
+                if ctx:
+                    h.text = f"{ctx}\n\n{h.text}"
+        except Exception:
+            pass  # best-effort augmentation
+
     # Sort by file_id then by chunk_id (ordinal within file)
     hits.sort(key=lambda h: (h.file_id, h.chunk_id))

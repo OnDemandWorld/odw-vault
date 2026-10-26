@@ -10,7 +10,7 @@ import io
 import json
 import logging
 import os
-import shutil
+import re
 import threading
 import time
 from pathlib import Path
@@ -18,6 +18,8 @@ from pathlib import Path
 import chromadb
 import ollama
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -42,12 +44,36 @@ from api.schemas import (
     QueryResponse,
 )
 from api.spans import get_current_span, span
-from api.tracing import TRACE_HEADER, install_trace_id_filter, new_trace_id, trace_id_var
+from api.tracing import (
+    TRACE_HEADER,
+    get_trace_id,
+    install_trace_id_filter,
+    new_trace_id,
+    trace_id_var,
+)
 from pipeline.config import load_app_config
 from pipeline.db import migrate, open_db
 from rag.filters import resolve_folder_filter
 from rag.generation import generate_answer
 from rag.retrieval import Hit, retrieve
+
+
+def _ensure_loopback_bypasses_proxy() -> None:
+    """Ensure loopback hosts bypass HTTP(S) proxies.
+
+    In proxy-equipped environments (HTTP_PROXY/HTTPS_PROXY set), HTTP client
+    libraries route even 127.0.0.1/localhost calls through the proxy unless
+    NO_PROXY lists them — a proxy that cannot reach the loopback service then
+    turns every internal call (Ollama, sibling products) into a 502/500 (found
+    in QA when NO_PROXY contained 127.0.0.0 but not 127.0.0.1).
+    """
+    for key in ("NO_PROXY", "no_proxy"):
+        parts = {p.strip() for p in os.environ.get(key, "").split(",") if p.strip()}
+        if not {"localhost", "127.0.0.1"} <= parts:
+            parts |= {"localhost", "127.0.0.1"}
+            os.environ[key] = ",".join(sorted(parts))
+
+_ensure_loopback_bypasses_proxy()
 
 logger = logging.getLogger(__name__)
 
@@ -59,19 +85,46 @@ DB_NAME = "corpus.db"
 # ---------------------------------------------------------------------------
 
 _thread_local = threading.local()
+_migrate_lock = threading.Lock()
+_migrated = False
 
 
 def _get_db():
-    """Return a thread-local DB connection."""
+    """Return a thread-local DB connection.
+
+    The connection itself stays thread-local (sqlite3 objects must not cross
+    threads), but schema migration runs exactly once per process — every
+    new thread-pool thread otherwise re-runs the write-locked migration on
+    its first request.
+    """
+    global _migrated
     if not hasattr(_thread_local, "db"):
         db = open_db(Path(DB_NAME))
-        migrate(db)
+        if not _migrated:
+            with _migrate_lock:
+                if not _migrated:
+                    migrate(db)
+                    _migrated = True
         _thread_local.db = db
     return _thread_local.db
 
 
 def _load_config():
-    return load_app_config(CONFIG_PATH)
+    cfg = load_app_config(CONFIG_PATH)
+    # Container/suite deployments point Ollama at a sibling service via env;
+    # config.toml has no way to express that, so the env wins when present.
+    env_host = os.environ.get("VAULT_OLLAMA_HOST", "").strip()
+    if env_host:
+        cfg.ollama.host = env_host
+    # The example config ships with a cloud generation endpoint; containers use
+    # the in-network Ollama instead (VAULT_GENERATION_HOST, or the same host as
+    # VAULT_OLLAMA_HOST when the baked config still points at a cloud default).
+    gen_host = os.environ.get("VAULT_GENERATION_HOST", "").strip()
+    if gen_host:
+        cfg.models.generation.endpoint.host = gen_host
+    elif env_host and "ollama.com" in str(cfg.models.generation.endpoint.host):
+        cfg.models.generation.endpoint.host = env_host
+    return cfg
 
 
 app = FastAPI(title="ODW.ai Vault RAG")
@@ -87,12 +140,10 @@ if _cors_origins_env == "*":
 else:
     _cors_allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_allow_origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOTE: CORS middleware registration is deferred until after the auth/trace
+# middlewares below — Starlette puts the LAST-registered middleware outermost,
+# and CORS must wrap auth so its 401 responses also carry
+# Access-Control-Allow-Origin (browser clients otherwise see an opaque error).
 
 # ---------------------------------------------------------------------------
 # Optional inbound API-key authentication (additive, backward-compatible)
@@ -143,9 +194,17 @@ async def _require_api_key(request: Request, call_next):
 install_trace_id_filter(logger)
 
 
+# Inbound trace ids are only accepted in a conservative charset/length;
+# anything else (newlines, huge strings) would be log forgery / header
+# abuse and is replaced with a fresh id.
+_TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 @app.middleware("http")
 async def _bind_trace_id(request: Request, call_next):
-    trace_id = request.headers.get(TRACE_HEADER) or new_trace_id()
+    trace_id = request.headers.get(TRACE_HEADER) or ""
+    if not _TRACE_ID_RE.fullmatch(trace_id):
+        trace_id = new_trace_id()
     token = trace_id_var.set(trace_id)
     try:
         response = await call_next(request)
@@ -155,6 +214,16 @@ async def _bind_trace_id(request: Request, call_next):
         return response
     finally:
         trace_id_var.reset(token)
+
+
+# Registered after the auth/trace middlewares so it ends up OUTERMOST
+# (Starlette: last added = outermost). See the note at the CORS defaults.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allow_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _resolve_actor() -> str:
@@ -192,11 +261,18 @@ def _startup_watcher():
             return
         from rag.watcher import CorpusWatcher
 
-        db = _get_db()
         chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
-        _watcher = CorpusWatcher(cfg, db, chroma_client)
-        if cfg.watcher.startup_sync:
-            _watcher.indexer.sync_all()
+        # sqlite3 connections are thread-affine and the watcher flushes on its
+        # own worker thread — pass a factory so the worker builds its own
+        # connection (_get_db is thread-local). Passing this thread's handle
+        # would make every flush raise sqlite3.ProgrammingError.
+        _watcher = CorpusWatcher(
+            cfg,
+            _get_db(),
+            chroma_client,
+            db_factory=_get_db,
+            startup_sync=cfg.watcher.startup_sync,
+        )
         _watcher.start()
         logger.info("Corpus watcher started via API server")
     except Exception as exc:
@@ -223,15 +299,26 @@ def root():
 # GET /health
 # ---------------------------------------------------------------------------
 
+# Component probes (Ollama list, Chroma collection open, fasttext load) are
+# expensive; under concurrent LLM load they pushed /health p95 past 1s. Cache
+# the computed snapshot briefly (15s covers concurrent LLM bursts where a
+# cold re-probe measured 1.0-2.0s; /health is a status probe, not a live gauge).
+_HEALTH_TTL_SECONDS = 15.0
+_health_cache: dict = {"at": 0.0, "value": None}
+
 
 @app.get("/health", response_model=HealthResponse)
 def health():
+    now = time.monotonic()
+    if _health_cache["value"] is not None and now - _health_cache["at"] < _HEALTH_TTL_SECONDS:
+        return _health_cache["value"]
+
     cfg = _load_config()
 
     # Ollama check
     ollama_ok = False
     try:
-        client = ollama.Client(host=cfg.ollama.host)
+        client = ollama.Client(host=cfg.ollama.host, timeout=10)
         client.list()
         ollama_ok = True
     except Exception:
@@ -260,22 +347,53 @@ def health():
     except Exception:
         logger.warning("Database not reachable")
 
-    # fastText check
+    # fastText check (cached loader — the 130MB model must not be re-parsed
+    # from disk on every uncached /health probe)
     fasttext_ok = False
+    model_path = cfg.models.language_id.model_path
     try:
-        import fasttext
+        from rag.tokenization import _get_fasttext
 
-        model_path = cfg.models.language_id.model_path
-        fasttext.load_model(model_path)
-        fasttext_ok = True
+        fasttext_ok = _get_fasttext(model_path) is not None
     except Exception:
         logger.warning("fastText model not found at %s", model_path)
 
-    return HealthResponse(
+    snapshot = HealthResponse(
         ollama=ollama_ok,
         chroma=chroma_ok,
         database=db_ok,
         fasttext=fasttext_ok,
+    )
+    _health_cache["at"] = now
+    _health_cache["value"] = snapshot
+    return snapshot
+
+
+# ---------------------------------------------------------------------------
+# 422 校验错误瘦身：默认的 RequestValidationError 会把完整输入回显进
+# `input` 字段（一个 50KB 的 query 就能把错误体放大到 >50KB）。截断长字符串，
+# 保留字段定位信息。
+# ---------------------------------------------------------------------------
+
+
+def _shrink_validation_errors(exc: RequestValidationError) -> list:
+    shrunk = []
+    for err in exc.errors():
+        item = dict(err)
+        value = item.get("input")
+        if isinstance(value, str) and len(value) > 200:
+            item["input"] = value[:200] + f"…（截断，原长 {len(value)}）"
+        elif isinstance(value, (list, dict)) and len(str(value)) > 500:
+            item["input"] = f"（大型 {type(value).__name__} 输入已省略，len={len(value)}）"
+        shrunk.append(item)
+    return shrunk
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _shrink_validation_errors(exc)},
     )
 
 
@@ -347,11 +465,24 @@ def _query_impl(req: QueryRequest):
     cfg = _load_config()
     db = _get_db()
 
-    # Check Ollama reachability
+    # Check Ollama reachability (embedding host)
     try:
-        ollama.Client(host=cfg.ollama.host).list()
+        ollama.Client(host=cfg.ollama.host, timeout=10).list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
+
+    # V-8: precheck the GENERATION endpoint too — it can differ from the
+    # embedding host (cloud Ollama default in config.example.toml); a dead
+    # generation endpoint previously surfaced as a raw 500 after retries.
+    gen_host = getattr(cfg.models.generation.endpoint, "host", None)
+    if gen_host and gen_host != cfg.ollama.host:
+        try:
+            ollama.Client(host=gen_host, timeout=10).list()
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Generation model endpoint ({gen_host}) is not reachable",
+            ) from None
 
     # Check Chroma collection
     suffix = cfg.models.embedding.collection_suffix
@@ -410,27 +541,34 @@ def _query_impl(req: QueryRequest):
 
     # Generate answer
     # Handle conversation history
-    from rag.conversation import get_or_create_conversation, get_history, add_message
+    from rag.conversation import add_message, get_history, get_or_create_conversation
 
-    conversation_id = None
-    history = None
-    if req.conversation_id is not None or True:  # always support conversations
-        conversation_id = get_or_create_conversation(db, req.conversation_id, user=req.user)
-        # Save user message
-        add_message(db, conversation_id, "user", req.query)
-        # Get history for prompt injection (excluding the message we just added)
-        history = get_history(db, conversation_id)
-        # Remove the last message (the one we just added) from history
-        if history and history[-1]["role"] == "user" and history[-1]["content"] == req.query:
-            history = history[:-1]
+    # Conversations are always on: every query gets a conversation row so the
+    # history panel works even for callers that don't pass conversation_id.
+    conversation_id = get_or_create_conversation(db, req.conversation_id, user=req.user)
+    # Save user message
+    add_message(db, conversation_id, "user", req.query)
+    # Get history for prompt injection (excluding the message we just added)
+    history = get_history(db, conversation_id)
+    # Remove the last message (the one we just added) from history
+    if history and history[-1]["role"] == "user" and history[-1]["content"] == req.query:
+        history = history[:-1]
 
     with span("vault.query.generate") as generate_span:
-        gen_result = generate_answer(
-            query=req.query,
-            hits=hits,
-            cfg=cfg,
-            history=history,
-        )
+        try:
+            gen_result = generate_answer(
+                query=req.query,
+                hits=hits,
+                cfg=cfg,
+                history=history,
+            )
+        except Exception as gen_err:
+            # V-8: retry exhaustion / endpoint death is a service-level
+            # condition, not a client error.
+            raise HTTPException(
+                status_code=503,
+                detail=f"Generation failed: {gen_err}",
+            ) from gen_err
         generate_span.set_attr("generation_ms", gen_result.get("generation_ms"))
         generate_span.set_attr("model", gen_result.get("model"))
         generate_span.set_attr("refused", gen_result.get("refused", False))
@@ -558,7 +696,7 @@ def query_stream(req: QueryRequest):
 
     # Check Ollama
     try:
-        ollama.Client(host=cfg.ollama.host).list()
+        ollama.Client(host=cfg.ollama.host, timeout=10).list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
 
@@ -613,20 +751,101 @@ def query_stream(req: QueryRequest):
     # Build context for generation
     numbered_chunks = _format_chunks_for_prompt(hits)
 
-    # Build citations from hits (before streaming, so we have them)
+    # Stream generation — mirror /query so both paths share the model
+    # contract: same prompt template, same endpoint/api_key client, same
+    # conversation handling.
     from rag.citations import parse_citations as _parse_citations
     from rag.citations import resolve_citations as _resolve_citations
+    from rag.conversation import add_message, get_history, get_or_create_conversation
+    from rag.generation import _load_prompt, _make_client
 
-    # Stream generation
+    conversation_id = get_or_create_conversation(db, req.conversation_id, user=req.user)
+    add_message(db, conversation_id, "user", req.query)
+    history = get_history(db, conversation_id)
+    if history and history[-1]["role"] == "user" and history[-1]["content"] == req.query:
+        history = history[:-1]
+
     model_name = cfg.models.generation.name
     system_prefix = "<|think|>" if getattr(cfg.models.generation, "thinking", False) else ""
     system_content = "You are a helpful assistant."
     if system_prefix:
         system_content = f"{system_prefix}\n{system_content}"
 
-    prompt = DEFAULT_PROMPT.format(numbered_chunks=numbered_chunks, query=req.query)
+    prompt = _load_prompt(None, cfg).format(numbered_chunks=numbered_chunks, query=req.query)
 
-    oclient = ollama.Client(host=cfg.ollama.host)
+    chat_messages = [{"role": "system", "content": system_content}]
+    chat_messages += [
+        {"role": m["role"], "content": m["content"]} for m in (history or [])
+    ]
+    chat_messages.append({"role": "user", "content": prompt})
+
+    # Async client from the SAME factory as /query: honors
+    # models.generation.endpoint (host + api_key) and cfg.ollama timeout.
+    # Without async, token streaming would block the event loop.
+    oclient = _make_client(cfg, stream=True)
+
+    # Persisted once the answer is complete — must run on a worker thread,
+    # because the generator iterates on the event-loop thread and the
+    # thread-local sqlite connection cannot cross threads.
+    retrieved_chunks = [
+        {
+            "rank": i,
+            "chunk_id": hit.chunk_id,
+            "file_id": hit.file_id,
+            "folder_id": hit.folder_id,
+            "rel_path": hit.rel_path,
+            "page_start": hit.page_start,
+            "dense_score": hit.dense_score,
+            "bm25_score": hit.bm25_score,
+            "fused_score": hit.fused_score,
+        }
+        for i, hit in enumerate(hits, start=1)
+    ]
+
+    def _persist_stream_query(answer_text: str, total_ms: int, gen_ms: int) -> int:
+        pdb = _get_db()
+        reranker_model = (
+            cfg.models.reranker.name if getattr(cfg.models.reranker, "enabled", False) else None
+        )
+        cursor = pdb.conn.execute(
+            """INSERT INTO query_log
+               (user, query_text, query_lang, folder_filter_json,
+                retrieved_chunks_json, answer_text, answer_model,
+                embedding_model, reranker_model,
+                latency_ms, retrieval_ms, generation_ms, conversation_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                req.user,
+                req.query,
+                retrieval_metrics.get("query_lang", "unknown"),
+                json.dumps(folder_filter_dict) if folder_filter_dict else None,
+                json.dumps(retrieved_chunks),
+                answer_text,
+                model_name,
+                cfg.models.embedding.name,
+                reranker_model,
+                total_ms,
+                retrieval_ms,
+                gen_ms,
+                conversation_id,
+            ),
+        )
+        pdb.conn.commit()
+        query_log_id = cursor.lastrowid
+        # Keep multi-turn conversations consistent with /query: record the
+        # streamed assistant answer too.
+        add_message(
+            pdb, conversation_id, "assistant", answer_text, query_log_id=query_log_id
+        )
+        record_audit(
+            pdb,
+            _resolve_actor(),
+            "query",
+            "query_log",
+            resource_id=query_log_id,
+            detail=req.query,
+        )
+        return query_log_id
 
     async def event_generator():
         nonlocal t0
@@ -643,14 +862,35 @@ def query_stream(req: QueryRequest):
                 ),
             )
 
+            # V-5: mirror /query's refuse_on_empty_context — the stream
+            # previously generated from "(no context available)" instead of
+            # refusing, diverging from the non-streaming contract.
+            if cfg.generation_runtime.refuse_on_empty_context and not hits:
+                from rag.generation import REFUSAL_TEXT
+
+                query_log_id = _persist_stream_query(
+                    REFUSAL_TEXT,
+                    int((time.monotonic() - t0) * 1000),
+                    0,
+                )
+                yield ServerSentEvent(event="citations", data=json.dumps([]))
+                yield ServerSentEvent(
+                    event="done",
+                    data=json.dumps(
+                        {
+                            "query_log_id": query_log_id,
+                            "metrics": {"retrieval_ms": retrieval_ms, "generation_ms": 0.0, "total_ms": retrieval_ms},
+                            "refused": True,
+                        }
+                    ),
+                )
+                return
+
             # Event: streaming tokens
             answer_parts: list[str] = []
-            stream_resp = oclient.chat(
+            stream_resp = await oclient.chat(
                 model=model_name,
-                messages=[
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=chat_messages,
                 options={
                     "temperature": cfg.models.generation.temperature,
                     "top_p": cfg.models.generation.top_p,
@@ -659,7 +899,7 @@ def query_stream(req: QueryRequest):
                 stream=True,
             )
 
-            for chunk in stream_resp:
+            async for chunk in stream_resp:
                 token = chunk.get("message", {}).get("content", "")
                 if token:
                     answer_parts.append(token)
@@ -694,34 +934,10 @@ def query_stream(req: QueryRequest):
 
             total_ms = round((time.monotonic() - t0) * 1000)
 
-            # Log query
-            reranker_model = (
-                cfg.models.reranker.name if getattr(cfg.models.reranker, "enabled", False) else None
+            # Log query (worker thread — event loop cannot touch sqlite)
+            query_log_id = await run_in_threadpool(
+                _persist_stream_query, answer_text, total_ms, gen_ms
             )
-            cursor = db.conn.execute(
-                """INSERT INTO query_log
-                   (user, query_text, query_lang, folder_filter_json,
-                    retrieved_chunks_json, answer_text, answer_model,
-                    embedding_model, reranker_model,
-                    latency_ms, retrieval_ms, generation_ms)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    req.user,
-                    req.query,
-                    retrieval_metrics.get("query_lang", "unknown"),
-                    json.dumps(folder_filter_dict) if folder_filter_dict else None,
-                    json.dumps([]),
-                    answer_text,
-                    model_name,
-                    cfg.models.embedding.name,
-                    reranker_model,
-                    total_ms,
-                    retrieval_ms,
-                    gen_ms,
-                ),
-            )
-            db.conn.commit()
-            query_log_id = cursor.lastrowid
 
             # Event: done
             yield ServerSentEvent(
@@ -734,14 +950,16 @@ def query_stream(req: QueryRequest):
                             "total_ms": total_ms,
                         },
                         "query_log_id": query_log_id,
+                        "conversation_id": conversation_id,
                     }
                 ),
             )
 
-        except Exception as e:
+        except Exception:
+            logger.exception("Streamed query failed (trace_id=%s)", get_trace_id())
             yield ServerSentEvent(
                 event="error",
-                data=json.dumps({"error": str(e)}),
+                data=json.dumps({"error": "Internal error while generating the answer"}),
             )
 
     return EventSourceResponse(event_generator())
@@ -954,21 +1172,55 @@ def list_models():
 # ---------------------------------------------------------------------------
 
 
-@app.post("/eval/run")
-def run_eval():
+# V-13: eval runs are minutes-long (per-question retrieval+generation) — the
+# previous synchronous handler blocked the request worker. Track in-flight
+# runs in-process and expose status for polling.
+_eval_runs: dict[str, dict] = {}
+_eval_lock = threading.Lock()
+
+
+def _run_eval_background(run_id: str) -> None:
+    import traceback
+
     db = _get_db()
     cfg = _load_config()
-
     try:
         from eval.runner import run_eval as _run_eval
-    except ImportError:
-        raise HTTPException(
-            status_code=501,
-            detail="Evaluation harness not yet implemented",
-        ) from None
 
-    result = _run_eval(db, cfg)
-    return result
+        result = _run_eval(db, cfg)
+        with _eval_lock:
+            _eval_runs[run_id] = {"status": "done", "result": result}
+    except ImportError:
+        with _eval_lock:
+            _eval_runs[run_id] = {
+                "status": "error",
+                "error": "evaluation module unavailable",
+            }
+    except Exception as exc:  # noqa: BLE001
+        with _eval_lock:
+            _eval_runs[run_id] = {"status": "error", "error": f"{exc}", "trace": traceback.format_exc()[-2000:]}
+
+
+@app.post("/eval/run")
+def run_eval():
+    import uuid as _uuid
+
+    run_id = str(_uuid.uuid4())
+    with _eval_lock:
+        if any(r["status"] == "running" for r in _eval_runs.values()):
+            raise HTTPException(status_code=409, detail="An eval run is already in progress")
+        _eval_runs[run_id] = {"status": "running"}
+    threading.Thread(target=_run_eval_background, args=(run_id,), daemon=True).start()
+    return {"run_id": run_id, "status": "running"}
+
+
+@app.get("/eval/run/{run_id}")
+def get_eval_status(run_id: str):
+    with _eval_lock:
+        state = _eval_runs.get(run_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown eval run id")
+    return {"run_id": run_id, **state}
 
 
 # ---------------------------------------------------------------------------
@@ -977,7 +1229,10 @@ def run_eval():
 
 
 @app.get("/conversations", response_model=list[ConversationSummary])
-def list_conversations_api(user: str | None = None, limit: int = 50):
+def list_conversations_api(
+    user: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+):
     """List conversations, most recently updated first."""
     from rag.conversation import list_conversations
 
@@ -1025,10 +1280,24 @@ def delete_conversation_api(conversation_id: str):
 # ---------------------------------------------------------------------------
 
 
+def _normalize_date_bound(raw: str, *, end: bool) -> str:
+    """Normalize a date filter to the query_log `asked_at` format.
+
+    `asked_at` rows are 'YYYY-MM-DD HH:MM:SS'; a bare 'YYYY-MM-DD' bound must
+    become inclusive of that whole day (V-9). Values already carrying a time
+    component pass through unchanged (space or ISO 'T' separators both
+    accepted).
+    """
+    value = raw.strip()
+    if len(value) == 10:
+        return f"{value} 23:59:59" if end else f"{value} 00:00:00"
+    return value.replace("T", " ", 1) if "T" in value else value
+
+
 @app.get("/queries", response_model=QueryLogPage)
 def query_history(
-    page: int = 1,
-    size: int = 20,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
     keyword: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
@@ -1041,16 +1310,21 @@ def query_history(
     params: list = []
 
     if keyword:
-        conditions.append("query_text LIKE ?")
-        params.append(f"%{keyword}%")
+        # Escape LIKE wildcards so a literal '%'/'_' in the keyword matches
+        # itself instead of broadening the search semantics.
+        conditions.append("query_text LIKE ? ESCAPE '\\'")
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.append(f"%{escaped}%")
 
     if start_date:
         conditions.append("asked_at >= ?")
-        params.append(start_date)
+        params.append(_normalize_date_bound(start_date, end=False))
 
     if end_date:
+        # V-9: 'YYYY-MM-DD' is the whole final day — a raw string compare
+        # against 'YYYY-MM-DD HH:MM:SS' rows excluded that day entirely.
         conditions.append("asked_at <= ?")
-        params.append(end_date)
+        params.append(_normalize_date_bound(end_date, end=True))
 
     where_clause = ""
     if conditions:
@@ -1072,7 +1346,7 @@ def query_history(
             FROM query_log {where_clause}
             ORDER BY asked_at DESC
             LIMIT ? OFFSET ?""",
-        params + [size, offset],
+        [*params, size, offset],
     ))
 
     items = []
@@ -1107,7 +1381,7 @@ def query_history(
 
 @app.post("/files/upload", response_model=FileUploadResponse)
 async def upload_files(
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = File(...),  # noqa: B008 — FastAPI idiom
     workspace: str | None = Form(None),
 ):
     """Upload files to the corpus directory.
@@ -1144,7 +1418,10 @@ async def _upload_files_impl(
         folder_id = root_folders[0]["id"]
     else:
         db["folder"].insert({
-            "path": str(corpus_root),
+            # Resolve: the indexer stores resolved roots (symlinked corpus
+            # roots otherwise produce duplicate "." folders with two
+            # different path spellings).
+            "path": str(corpus_root.resolve()),
             "rel_path": ".",
             "name": ".",
             "depth": 0,
@@ -1158,32 +1435,64 @@ async def _upload_files_impl(
 
     for upload_file in files:
         try:
-            filename = upload_file.filename or "unnamed"
+            # Sanitize: keep only the basename — reject absolute paths, ".."
+            # segments and empty names so uploads cannot escape the corpus.
+            raw_name = upload_file.filename or ""
+            filename = Path(raw_name).name
+            if not filename or filename in {".", ".."}:
+                failed.append(raw_name or "unnamed")
+                continue
             dest = corpus_root / filename
+            if not dest.resolve().is_relative_to(corpus_root.resolve()):
+                failed.append(raw_name)
+                continue
 
-            # Handle filename conflicts
-            if dest.exists():
-                stem = dest.stem
-                suffix = dest.suffix
-                counter = 1
-                while dest.exists():
+            # Save file — streamed in 1 MiB chunks with a byte cap so a huge
+            # upload can't exhaust server memory (default 512 MiB, override
+            # via VAULT_MAX_UPLOAD_BYTES). The open mode is exclusive-create
+            # ("xb"): an exists()-then-write loop let two concurrent uploads
+            # of the same name both pick the same target and clobber each
+            # other's bytes; "xb" makes the loser atomically rename-retry.
+            max_bytes = int(os.environ.get("VAULT_MAX_UPLOAD_BYTES", "") or 512 * 1024 * 1024)
+            size_bytes = 0
+            stem, suffix = dest.stem, dest.suffix
+            counter = 1
+            while True:
+                try:
+                    out = dest.open("xb")
+                    break
+                except FileExistsError:
                     dest = corpus_root / f"{stem} ({counter}){suffix}"
                     counter += 1
+            try:
+                with out:
+                    while True:
+                        part = await upload_file.read(1024 * 1024)
+                        if not part:
+                            break
+                        size_bytes += len(part)
+                        if size_bytes > max_bytes:
+                            raise ValueError(
+                                f"upload exceeds {max_bytes} bytes (VAULT_MAX_UPLOAD_BYTES)"
+                            )
+                        # Disk writes off the event loop — a 100MB upload used
+                        # to stall every concurrent /query/stream token push.
+                        await run_in_threadpool(out.write, part)
+            except Exception:
+                dest.unlink(missing_ok=True)
+                raise
 
-            # Save file
-            content = await upload_file.read()
-            dest.write_bytes(content)
+            # Determine relative path (store resolved paths, matching the
+            # indexer — unresolved spellings made sync_all treat every
+            # uploaded file as deleted when the corpus root had symlinks).
+            dest = dest.resolve()
+            rel_path = str(dest.relative_to(corpus_root.resolve()))
 
-            # Get file size
-            size_bytes = dest.stat().st_size
-
-            # Determine relative path
-            rel_path = str(dest.relative_to(corpus_root))
-
-            # Get file modification time
+            # Get file modification time (V-10: same format the indexer/sync
+            # writes — '%Y-%m-%dT%H:%M:%SZ' — so the sync fast-skip can match).
             mtime = datetime.datetime.fromtimestamp(
-                dest.stat().st_mtime, tz=datetime.timezone.utc
-            ).isoformat()
+                dest.stat().st_mtime, tz=datetime.UTC
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
             # Insert file record
             db["file"].insert({
@@ -1344,20 +1653,25 @@ def list_files(
                 "WHERE c.file_id = f.id AND er.is_current = 1)"
             )
         elif status == "failed":
+            # V-1: pipeline writers record failures under 'extract' (phase8/
+            # indexer) and 'embed' — the previous 'extraction' literal matched
+            # nothing, so failed files were listed as pending forever.
             where_clauses.append(
-                "EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id AND fail.phase = 'extraction')"
+                "EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id "
+                "AND fail.phase IN ('extract', 'extraction', 'indexer', 'embed'))"
             )
         elif status == "pending":
             where_clauses.append(
                 "NOT EXISTS (SELECT 1 FROM extraction e WHERE e.file_id = f.id AND e.succeeded = 1) "
-                "AND NOT EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id AND fail.phase = 'extraction')"
+                "AND NOT EXISTS (SELECT 1 FROM failure fail WHERE fail.file_id = f.id "
+                "AND fail.phase IN ('extract', 'extraction', 'indexer', 'embed'))"
             )
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
 
     # Count total
     count_sql = f"SELECT COUNT(*) as c FROM file f WHERE {where_sql}"
-    total = list(db.query(count_sql, params))[0]["c"]
+    total = next(iter(db.query(count_sql, params)))["c"]
 
     # Fetch page
     offset = (page - 1) * size
@@ -1381,7 +1695,8 @@ def list_files(
                 ) THEN 'indexed'
                 WHEN EXISTS (
                     SELECT 1 FROM failure fail
-                    WHERE fail.file_id = f.id AND fail.phase = 'extraction'
+                    WHERE fail.file_id = f.id
+                      AND fail.phase IN ('extract', 'extraction', 'indexer', 'embed')
                 ) THEN 'failed'
                 ELSE 'pending'
             END as status
@@ -1390,7 +1705,7 @@ def list_files(
         ORDER BY f.created_at DESC
         LIMIT ? OFFSET ?
     """
-    rows = list(db.query(query_sql, params + [size, offset]))
+    rows = list(db.query(query_sql, [*params, size, offset]))
 
     items = [
         FileListItem(
@@ -1458,10 +1773,14 @@ def delete_file(file_id: int):
     file_row = file_rows[0]
     rel_path = file_row["rel_path"]
 
-    # Delete from disk
+    # Delete from disk — containment check so a tampered rel_path
+    # cannot unlink files outside the corpus root.
     corpus_root = cfg.corpus_root_path
     file_path = corpus_root / rel_path
-    if file_path.exists():
+    if (
+        file_path.exists()
+        and file_path.resolve().is_relative_to(corpus_root.resolve())
+    ):
         file_path.unlink()
 
     # Delete from Chroma
@@ -1477,6 +1796,19 @@ def delete_file(file_id: int):
                WHERE c.file_id = ?""",
             [file_id],
         ))
+
+        # Summary vectors live in summaries__ keyed by summary_id — without
+        # this join they are orphaned in Chroma forever (the file rows below
+        # are the only record of their ids).
+        summary_refs = list(db.query(
+            """SELECT ser.collection, ser.external_id
+               FROM summary_embedding_ref ser
+               JOIN summary s ON ser.summary_id = s.id
+               WHERE s.file_id = ?""",
+            [file_id],
+        ))
+        for ref in summary_refs:
+            embedding_refs.append(ref)
 
         # Group by collection and delete
         collections_to_delete: dict[str, list[str]] = {}
@@ -1496,9 +1828,17 @@ def delete_file(file_id: int):
         logger.warning("Failed to connect to Chroma: %s", e)
 
     # Delete from SQLite (cascade)
+    from rag.tokenization import remove_zh_index_for_file
+
+    remove_zh_index_for_file(db, file_id)
     db.execute("DELETE FROM embedding_ref WHERE chunk_id IN (SELECT id FROM chunk WHERE file_id = ?)", [file_id])
     db.execute("DELETE FROM chunk WHERE file_id = ?", [file_id])
     db.execute("DELETE FROM extraction WHERE file_id = ?", [file_id])
+    db.execute(
+        "DELETE FROM summary_embedding_ref WHERE summary_id IN "
+        "(SELECT id FROM summary WHERE file_id = ?)",
+        [file_id],
+    )
     db.execute("DELETE FROM summary WHERE file_id = ?", [file_id])
     db.execute("DELETE FROM failure WHERE file_id = ?", [file_id])
     db.execute("DELETE FROM file WHERE id = ?", [file_id])
@@ -1557,6 +1897,19 @@ _AUDIT_EXPORT_COLUMNS = [
 ]
 
 
+def _csv_safe(value: object) -> object:
+    """Neutralize spreadsheet formula injection in exported CSV cells.
+
+    Audit ``detail``/``actor`` values are user-influenced (query text,
+    filenames); a cell starting with =, +, -, @, tab or CR executes as a
+    formula when the export is opened in Excel/Sheets. Prefix such cells
+    with a single quote so spreadsheet apps treat them as text.
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 @app.get("/audit/export")
 def export_audit(
     fmt: str = Query("json", alias="format"),
@@ -1602,7 +1955,7 @@ def export_audit(
         writer = csv.writer(buf)
         writer.writerow(_AUDIT_EXPORT_COLUMNS)
         for row in rows:
-            writer.writerow([row[col] for col in _AUDIT_EXPORT_COLUMNS])
+            writer.writerow([_csv_safe(row[col]) for col in _AUDIT_EXPORT_COLUMNS])
         return Response(
             content=buf.getvalue(),
             media_type="text/csv",
@@ -1615,36 +1968,6 @@ def export_audit(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-DEFAULT_PROMPT = """\
-You are the ODW.ai Vault internal knowledge assistant. You help staff find
-information about company projects, products, deployments, and operations
-by answering questions using ONLY the provided context excerpts.
-
-You answer in the same language as the user's question (English or
-Traditional Chinese). Match the user's terminology and tone.
-
-RULES:
-1. Every factual claim MUST be supported by a citation marker [N] where N
-   refers to a numbered context excerpt below. Use markers inline.
-2. If the context does not contain enough information to answer, say so
-   explicitly. Do not guess. Do not use external knowledge about products,
-   clients, robots, sites, or contracts beyond what the context says.
-3. When synthesizing across multiple sources, cite each.
-4. Preserve technical terminology, model numbers, robot platform names,
-   client names, site names, and project names exactly as they appear in the context.
-5. Never invent file names, page numbers, or citation markers that are
-   not in the provided context.
-6. If asked about a client or project not present in the context, state
-   that you have no information about it; do not speculate.
-
-CONTEXT EXCERPTS:
-{numbered_chunks}
-
-USER QUESTION: {query}
-
-ANSWER:
-"""
 
 
 def _format_chunks_for_prompt(hits: list[Hit]) -> str:

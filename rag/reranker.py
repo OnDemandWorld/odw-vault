@@ -46,7 +46,7 @@ def rerank(
 
     import ollama
 
-    client = ollama.Client(host=ollama_host)
+    client = ollama.Client(host=ollama_host, timeout=timeout)
 
     # Build (query, document) pairs
     pairs: list[tuple[int, str]] = []
