@@ -17,7 +17,7 @@ import re
 import sqlite3
 from datetime import UTC
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import sqlite_utils
 from fastapi.testclient import TestClient
@@ -42,6 +42,21 @@ def _make_cfg(tmp_path: Path):
     from tests.test_file_management import _make_cfg as base
 
     return base(tmp_path)
+
+
+def _health_cfg(tmp_path: Path):
+    """Minimal config mock so /health can run without a real config.toml.
+
+    The trace-id tests exercise middleware header handling, not health
+    probing; component checks fail soft (all-False) against these
+    non-existent paths, which is fine for the assertions.
+    """
+    cfg = MagicMock()
+    cfg.ollama.host = "http://localhost:11434"
+    cfg.chroma_root_path = str(tmp_path / "nonexistent-chroma")
+    cfg.models.embedding.collection_suffix = "test"
+    cfg.models.language_id.model_path = str(tmp_path / "nonexistent-model")
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +210,8 @@ class TestLikeEscaping:
 class TestTraceIdValidation:
     def test_valid_header_is_echoed(self, tmp_path):
         db = _make_db(tmp_path)
-        with patch("api.main._get_db", return_value=db):
+        with patch("api.main._get_db", return_value=db), \
+             patch("api.main._load_config", return_value=_health_cfg(tmp_path)):
             client = TestClient(app)
             response = client.get("/health", headers={"X-Trace-Id": "abc-123_XY"})
         assert response.headers.get("X-Trace-Id") == "abc-123_XY"
@@ -203,7 +219,8 @@ class TestTraceIdValidation:
     def test_log_injection_header_is_replaced(self, tmp_path):
         db = _make_db(tmp_path)
         evil = "x" + "\r\nFAKE: 1" + "y" * 200
-        with patch("api.main._get_db", return_value=db):
+        with patch("api.main._get_db", return_value=db), \
+             patch("api.main._load_config", return_value=_health_cfg(tmp_path)):
             client = TestClient(app)
             response = client.get("/health", headers={"X-Trace-Id": evil})
         echoed = response.headers.get("X-Trace-Id")

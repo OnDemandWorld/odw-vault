@@ -1,5 +1,7 @@
 """回归：422 校验错误瘦身 + /health TTL 缓存（2026-09-12 评审批次 B）。"""
 
+from unittest.mock import MagicMock, patch
+
 from fastapi.testclient import TestClient
 
 from api.main import app
@@ -22,7 +24,15 @@ class TestValidationShrinking:
 
 
 class TestHealthCache:
-    def test_health_cached_within_ttl(self):
+    @patch("api.main._load_config")
+    def test_health_cached_within_ttl(self, mock_load_cfg):
+        mock_cfg = MagicMock()
+        mock_cfg.ollama.host = "http://localhost:11434"
+        mock_cfg.chroma_root_path = "/tmp/nonexistent-chroma"
+        mock_cfg.models.embedding.collection_suffix = "test"
+        mock_cfg.models.language_id.model_path = "/tmp/nonexistent-model"
+        mock_load_cfg.return_value = mock_cfg
+
         r1 = client.get("/health")
         r2 = client.get("/health")
         assert r1.status_code == 200 and r2.status_code == 200
