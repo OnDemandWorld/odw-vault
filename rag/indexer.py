@@ -371,9 +371,12 @@ class IncrementalIndexer:
                     logger.warning("Cannot stat %s, skipping", fp)
                     continue
 
-                # Quick check: if mtime and size match DB, skip hashing
+                # Quick check: if mtime and size match DB, skip hashing.
+                # An empty stored hash means the file was never hashed (e.g.
+                # uploaded via the API with hash_status='pending') — it must
+                # still be hashed so sync treats it as modified and indexes it.
                 db_row = db_files.get(fp_str)
-                if db_row:
+                if db_row and db_row["sha256"]:
                     mtime_iso = datetime.fromtimestamp(
                         stat.st_mtime, tz=UTC
                     ).strftime("%Y-%m-%dT%H:%M:%SZ")

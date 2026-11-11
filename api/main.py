@@ -1476,8 +1476,10 @@ async def _upload_files_impl(
                 dest.stat().st_mtime, tz=datetime.UTC
             ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            # Insert file record
-            db["file"].insert({
+            # Insert file record. Chain .last_rowid on the same Table object —
+            # db["file"] returns a fresh Table per access, so a separate
+            # db["file"].last_rowid read would be None.
+            file_id = db["file"].insert({
                 "folder_id": folder_id,
                 "path": str(dest),
                 "rel_path": rel_path,
@@ -1493,11 +1495,10 @@ async def _upload_files_impl(
                 "is_dup_primary": 1,
                 "excluded": 0,
                 "workspace": workspace_label,
-            })
+            }).last_rowid
             db.conn.commit()
 
             # Set created_at
-            file_id = db["file"].last_rowid
             db.execute(
                 "UPDATE file SET created_at = datetime('now') WHERE id = ?",
                 [file_id],
