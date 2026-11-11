@@ -404,11 +404,11 @@ def _provider_list_models(entry: dict) -> list[str]:
 def _check_chroma() -> tuple[bool, str]:
     try:
         import chromadb
-        client = chromadb.PersistentClient(path=_chroma_path)
-        suffix = _cfg.models.embedding.collection_suffix
-        coll_name = f"chunks__{suffix}"
-        client.get_collection(coll_name)
-        return True, coll_name
+        with chromadb.PersistentClient(path=_chroma_path) as client:
+            suffix = _cfg.models.embedding.collection_suffix
+            coll_name = f"chunks__{suffix}"
+            client.get_collection(coll_name)
+            return True, coll_name
     except Exception as exc:
         return False, str(exc)[:120]
 
@@ -1359,11 +1359,11 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
                 # corpus/chroma than retrieval uses.
                 db = _get_db()
                 import chromadb
-                chroma_client = chromadb.PersistentClient(path=str(_chroma_path))
-                from rag.indexer import IncrementalIndexer
-                indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
-                result = indexer.sync_all()
-                _sync_status_ui["last_result"] = result
+                with chromadb.PersistentClient(path=str(_chroma_path)) as chroma_client:
+                    from rag.indexer import IncrementalIndexer
+                    indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+                    result = indexer.sync_all()
+                    _sync_status_ui["last_result"] = result
             except Exception as exc:
                 logger.error("Indexing sync failed: %s", exc)
                 _sync_status_ui["last_result"] = {"error": str(exc)}

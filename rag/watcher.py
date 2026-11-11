@@ -149,6 +149,9 @@ class CorpusWatcher:
             self._observer.stop()
             self._observer.join(timeout=5)
             self._observer = None
+        if self._chroma_client is not None:
+            self._chroma_client.close()
+            self._chroma_client = None
         logger.info("CorpusWatcher stopped")
 
     def status(self) -> dict:

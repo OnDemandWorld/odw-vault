@@ -11,7 +11,7 @@ import sqlite_utils
 from fastapi.testclient import TestClient
 
 from api.main import app
-from pipeline.db import migrate, open_db
+from pipeline.db import migrate
 
 
 def _make_db(tmp_path: Path):
@@ -379,6 +379,7 @@ class TestFileDeletion:
         mock_collection = MagicMock()
         mock_chroma_client = MagicMock()
         mock_chroma_client.get_collection.return_value = mock_collection
+        mock_chroma_client.__enter__.return_value = mock_chroma_client
 
         with patch("api.main._load_config", return_value=cfg), \
              patch("api.main._get_db", return_value=db), \

@@ -42,6 +42,38 @@ def retrieve(
 
     Returns (hits, metrics).
     """
+    # Chroma's SharedSystemClient keeps one System per (process, path) alive
+    # while any client reference remains, and a cached System never sees an
+    # external sync process's writes ("Error finding id" / stale dense hits).
+    # Close the per-call client so each query reloads the on-disk index.
+    client = chromadb.PersistentClient(path=chroma_path)
+    try:
+        return _retrieve_with_client(
+            query,
+            db,
+            client,
+            chroma_path,
+            cfg,
+            folder_filter=folder_filter,
+            top_k_chunks=top_k_chunks,
+            use_reranker=use_reranker,
+            use_augmentation=use_augmentation,
+        )
+    finally:
+        client.close()
+
+
+def _retrieve_with_client(
+    query: str,
+    db,
+    client,
+    chroma_path: str,
+    cfg,
+    folder_filter: dict | None = None,
+    top_k_chunks: int | None = None,
+    use_reranker: bool | None = None,
+    use_augmentation: bool | None = None,
+) -> tuple[list[Hit], dict]:
     t0 = time.monotonic()
     metrics: dict = {}
 
@@ -58,7 +90,6 @@ def retrieve(
     suffix = cfg.models.embedding.collection_suffix
     chunk_collection_name = f"chunks__{suffix}"
 
-    client = chromadb.PersistentClient(path=chroma_path)
     try:
         coll = client.get_collection(chunk_collection_name)
     except Exception:
@@ -674,8 +705,6 @@ def _bm25_retrieve(
 
     import re as _re
 
-    # Strip FTS5 special characters and filter stop words
-    FTS5_SPECIAL = _re.compile(r'[\[\]\(\)\~\^\{\}\|\&\<\>\:\-\!\*\+\?\"\\\\]')
     STOP_WORDS = frozenset([
         'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
         'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
@@ -692,12 +721,15 @@ def _bm25_retrieve(
         'but', 'if', 'while', 'tell', 'get', 'know', 'like', 'want', 'need',
         'use', 'used', 'am', 'also', 'much', 'any', 'make', 'made',
     ])
-    clean_tokens = []
-    for t in query.split():
-        if t.lower() not in STOP_WORDS:
-            cleaned = FTS5_SPECIAL.sub('', t)
-            if cleaned and len(cleaned) >= 2:
-                clean_tokens.append(cleaned)
+    # Split on anything that is not a unicode letter/digit, mirroring the
+    # unicode61 tokenizer used at index time. Stripping an enumerated set of
+    # special characters instead lets punctuation like the comma in "50,000"
+    # reach MATCH as bareword syntax and raise "fts5: syntax error".
+    clean_tokens = [
+        t
+        for t in _re.findall(r"[^\W_]+", query)
+        if len(t) >= 2 and t.lower() not in STOP_WORDS
+    ]
     if not clean_tokens:
         return []
     fts_query = " OR ".join(clean_tokens)

@@ -299,11 +299,11 @@ def health():
     chroma_ok = False
     try:
         chroma_path = str(cfg.chroma_root_path)
-        client = chromadb.PersistentClient(path=chroma_path)
-        suffix = cfg.models.embedding.collection_suffix
-        coll_name = f"chunks__{suffix}"
-        client.get_collection(coll_name)
-        chroma_ok = True
+        with chromadb.PersistentClient(path=chroma_path) as client:
+            suffix = cfg.models.embedding.collection_suffix
+            coll_name = f"chunks__{suffix}"
+            client.get_collection(coll_name)
+            chroma_ok = True
     except Exception:
         logger.warning(
             "Chroma collection '%s' not found", coll_name if "coll_name" in dir() else "unknown"
@@ -462,8 +462,8 @@ def _query_impl(req: QueryRequest):
     coll_name = f"chunks__{suffix}"
     try:
         chroma_path = str(cfg.chroma_root_path)
-        client = chromadb.PersistentClient(path=chroma_path)
-        client.get_collection(coll_name)
+        with chromadb.PersistentClient(path=chroma_path) as client:
+            client.get_collection(coll_name)
     except Exception:
         raise HTTPException(
             status_code=503,
@@ -679,8 +679,8 @@ def query_stream(req: QueryRequest):
     coll_name = f"chunks__{suffix}"
     try:
         chroma_path = str(cfg.chroma_root_path)
-        client = chromadb.PersistentClient(path=chroma_path)
-        client.get_collection(coll_name)
+        with chromadb.PersistentClient(path=chroma_path) as client:
+            client.get_collection(coll_name)
     except Exception:
         raise HTTPException(
             status_code=503,
@@ -1121,9 +1121,9 @@ def list_models():
     # Check which Chroma collections exist
     collections = []
     try:
-        client = chromadb.PersistentClient(path=chroma_path)
-        all_colls = client.list_collections()
-        collections = [c.name for c in all_colls]
+        with chromadb.PersistentClient(path=chroma_path) as client:
+            all_colls = client.list_collections()
+            collections = [c.name for c in all_colls]
     except Exception:
         pass
 
@@ -1554,13 +1554,12 @@ def pipeline_sync():
             cfg = _load_config()
             db = _get_db()
             chroma_path = str(cfg.chroma_root_path)
-            chroma_client = chromadb.PersistentClient(path=chroma_path)
+            with chromadb.PersistentClient(path=chroma_path) as chroma_client:
+                from rag.indexer import IncrementalIndexer
 
-            from rag.indexer import IncrementalIndexer
-
-            indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
-            result = indexer.sync_all()
-            _sync_status["last_result"] = result
+                indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+                result = indexer.sync_all()
+                _sync_status["last_result"] = result
         except Exception as exc:
             logger.error("Pipeline sync failed: %s", exc)
             _sync_status["last_result"] = {"error": str(exc)}
@@ -1769,44 +1768,43 @@ def delete_file(file_id: int):
     # Delete from Chroma
     try:
         chroma_path = str(cfg.chroma_root_path)
-        chroma_client = chromadb.PersistentClient(path=chroma_path)
+        with chromadb.PersistentClient(path=chroma_path) as chroma_client:
+            # Find embedding_ref entries for this file's chunks
+            embedding_refs = list(db.query(
+                """SELECT er.id, er.collection, er.external_id
+                   FROM embedding_ref er
+                   JOIN chunk c ON er.chunk_id = c.id
+                   WHERE c.file_id = ?""",
+                [file_id],
+            ))
 
-        # Find embedding_ref entries for this file's chunks
-        embedding_refs = list(db.query(
-            """SELECT er.id, er.collection, er.external_id
-               FROM embedding_ref er
-               JOIN chunk c ON er.chunk_id = c.id
-               WHERE c.file_id = ?""",
-            [file_id],
-        ))
+            # Summary vectors live in summaries__ keyed by summary_id — without
+            # this join they are orphaned in Chroma forever (the file rows below
+            # are the only record of their ids).
+            summary_refs = list(db.query(
+                """SELECT ser.collection, ser.external_id
+                   FROM summary_embedding_ref ser
+                   JOIN summary s ON ser.summary_id = s.id
+                   WHERE s.file_id = ?""",
+                [file_id],
+            ))
+            for ref in summary_refs:
+                embedding_refs.append(ref)
 
-        # Summary vectors live in summaries__ keyed by summary_id — without
-        # this join they are orphaned in Chroma forever (the file rows below
-        # are the only record of their ids).
-        summary_refs = list(db.query(
-            """SELECT ser.collection, ser.external_id
-               FROM summary_embedding_ref ser
-               JOIN summary s ON ser.summary_id = s.id
-               WHERE s.file_id = ?""",
-            [file_id],
-        ))
-        for ref in summary_refs:
-            embedding_refs.append(ref)
+            # Group by collection and delete
+            collections_to_delete: dict[str, list[str]] = {}
+            for ref in embedding_refs:
+                coll_name = ref.get("collection") or f"chunks__{cfg.models.embedding.collection_suffix}"
+                external_id = ref.get("external_id")
+                if external_id:
+                    collections_to_delete.setdefault(coll_name, []).append(external_id)
 
-        # Group by collection and delete
-        collections_to_delete: dict[str, list[str]] = {}
-        for ref in embedding_refs:
-            coll_name = ref.get("collection") or f"chunks__{cfg.models.embedding.collection_suffix}"
-            external_id = ref.get("external_id")
-            if external_id:
-                collections_to_delete.setdefault(coll_name, []).append(external_id)
-
-        for coll_name, ids in collections_to_delete.items():
-            try:
-                collection = chroma_client.get_collection(coll_name)
-                collection.delete(ids=ids)
-            except Exception as e:
-                logger.warning("Failed to delete from Chroma collection %s: %s", coll_name, e)
+            for coll_name, ids in collections_to_delete.items():
+                try:
+                    collection = chroma_client.get_collection(coll_name)
+                    collection.delete(ids=ids)
+                except Exception as e:
+                    logger.warning("Failed to delete from Chroma collection %s: %s", coll_name, e)
     except Exception as e:
         logger.warning("Failed to connect to Chroma: %s", e)
 
