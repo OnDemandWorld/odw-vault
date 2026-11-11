@@ -287,6 +287,8 @@ def _embed_summaries(
             FROM summary s
             JOIN file f ON f.id = s.file_id
             WHERE f.is_dup_primary = 1 AND f.excluded = 0
+              AND s.id = (SELECT MAX(s2.id) FROM summary s2
+                          WHERE s2.file_id = s.file_id AND s2.model = s.model)
             ORDER BY s.id
         """
         rows = list(db.query(sql))
@@ -296,6 +298,8 @@ def _embed_summaries(
             FROM summary s
             JOIN file f ON f.id = s.file_id
             WHERE f.is_dup_primary = 1 AND f.excluded = 0
+              AND s.id = (SELECT MAX(s2.id) FROM summary s2
+                          WHERE s2.file_id = s.file_id AND s2.model = s.model)
               AND s.id NOT IN (
                   SELECT summary_id FROM summary_embedding_ref WHERE embedding_model = ?
               )

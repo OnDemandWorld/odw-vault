@@ -171,7 +171,10 @@ def run_context(
             FROM chunk c
             JOIN file f ON f.id = c.file_id
             LEFT JOIN extraction e ON e.file_id = f.id AND e.succeeded = 1
+                AND e.id = (SELECT MAX(e2.id) FROM extraction e2
+                            WHERE e2.file_id = f.id AND e2.succeeded = 1)
             LEFT JOIN summary s ON s.file_id = f.id
+                AND s.id = (SELECT MAX(s2.id) FROM summary s2 WHERE s2.file_id = f.id)
             WHERE f.is_dup_primary = 1 AND f.excluded = 0
             ORDER BY c.id
         """
@@ -188,7 +191,10 @@ def run_context(
             FROM chunk c
             JOIN file f ON f.id = c.file_id
             LEFT JOIN extraction e ON e.file_id = f.id AND e.succeeded = 1
+                AND e.id = (SELECT MAX(e2.id) FROM extraction e2
+                            WHERE e2.file_id = f.id AND e2.succeeded = 1)
             LEFT JOIN summary s ON s.file_id = f.id
+                AND s.id = (SELECT MAX(s2.id) FROM summary s2 WHERE s2.file_id = f.id)
             WHERE c.context_text IS NULL
               AND f.is_dup_primary = 1 AND f.excluded = 0
             ORDER BY c.id

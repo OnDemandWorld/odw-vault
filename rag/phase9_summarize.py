@@ -91,6 +91,10 @@ def run_summarize(db, cfg, limit=None, resummarize=False) -> tuple[int, int]:
               AND e.char_count >= ?
               AND f.is_dup_primary = 1
               AND f.excluded = 0
+              AND e.id = (
+                  SELECT MAX(e2.id) FROM extraction e2
+                  WHERE e2.file_id = e.file_id AND e2.succeeded = 1
+              )
             ORDER BY e.file_id
             """,
             [size_threshold],

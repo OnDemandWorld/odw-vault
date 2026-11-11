@@ -1062,7 +1062,10 @@ def get_file(file_id: int):
            FROM file f
            LEFT JOIN folder fo ON f.folder_id = fo.id
            LEFT JOIN summary s ON s.file_id = f.id
+               AND s.id = (SELECT MAX(s2.id) FROM summary s2 WHERE s2.file_id = f.id)
            LEFT JOIN extraction e ON e.file_id = f.id
+               AND e.id = (SELECT MAX(e2.id) FROM extraction e2
+                           WHERE e2.file_id = f.id AND e2.succeeded = 1)
            WHERE f.id = ?""",
         [file_id],
     ))

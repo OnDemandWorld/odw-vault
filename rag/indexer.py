@@ -612,7 +612,7 @@ class IncrementalIndexer:
         ext_row = next(
             iter(self.db.query(
                 "SELECT text_extracted, char_count FROM extraction "
-                "WHERE file_id = ? AND succeeded = 1",
+                "WHERE file_id = ? AND succeeded = 1 ORDER BY id DESC",
                 [file_id],
             )),
             None,
@@ -699,7 +699,7 @@ class IncrementalIndexer:
         ext_row = next(
             iter(self.db.query(
                 "SELECT id, text_extracted, page_count FROM extraction "
-                "WHERE file_id = ? AND succeeded = 1",
+                "WHERE file_id = ? AND succeeded = 1 ORDER BY id DESC",
                 [file_id],
             )),
             None,

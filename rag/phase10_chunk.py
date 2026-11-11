@@ -72,6 +72,10 @@ def run_chunk(
                   AND e.text_extracted != ''
                   AND f.is_dup_primary = 1
                   AND f.excluded = 0
+                  AND e.id = (
+                      SELECT MAX(e2.id) FROM extraction e2
+                      WHERE e2.file_id = e.file_id AND e2.succeeded = 1
+                  )
                 ORDER BY e.file_id
                 """,
             )
@@ -94,6 +98,10 @@ def run_chunk(
                   AND e.text_extracted != ''
                   AND f.is_dup_primary = 1
                   AND f.excluded = 0
+                  AND e.id = (
+                      SELECT MAX(e2.id) FROM extraction e2
+                      WHERE e2.file_id = e.file_id AND e2.succeeded = 1
+                  )
                   AND e.file_id NOT IN (
                       SELECT DISTINCT file_id FROM chunk
                   )
