@@ -27,6 +27,7 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pipeline.env  # isort: skip  # noqa: F401
 import ollama
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -113,21 +114,21 @@ def _call_ollama_native(
     max_tokens: int,
 ) -> str:
     """Call Ollama native API."""
-    client = ollama.Client(host=host, timeout=600)
-    response = client.chat(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful research assistant providing concise document context.",
+    with ollama.Client(host=host, timeout=600) as client:
+        response = client.chat(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful research assistant providing concise document context.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            options={
+                "temperature": temperature,
+                "num_ctx": 16384,
             },
-            {"role": "user", "content": prompt},
-        ],
-        options={
-            "temperature": temperature,
-            "num_ctx": 16384,
-        },
-    )
+        )
     text = response.get("message", {}).get("content", "").strip()
     if not text:
         raise ValueError("Ollama returned empty response")

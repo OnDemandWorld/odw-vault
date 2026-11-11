@@ -61,16 +61,19 @@ def rerank(
     all_scores: list[float] = [0.0] * len(pairs)
     n_batches = math.ceil(len(pairs) / batch_size)
 
-    for batch_idx in range(n_batches):
-        start = batch_idx * batch_size
-        end = min(start + batch_size, len(pairs))
-        batch = pairs[start:end]
+    try:
+        for batch_idx in range(n_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(pairs))
+            batch = pairs[start:end]
 
-        batch_texts = [text for _, text in batch]
-        scores = _score_batch(client, model_name, query, batch_texts, timeout)
+            batch_texts = [text for _, text in batch]
+            scores = _score_batch(client, model_name, query, batch_texts, timeout)
 
-        for j, score in enumerate(scores):
-            all_scores[start + j] = score
+            for j, score in enumerate(scores):
+                all_scores[start + j] = score
+    finally:
+        client.close()
 
     # Assign scores to hits and sort
     scored_hits: list[tuple[float, Any]] = []

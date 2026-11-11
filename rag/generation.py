@@ -7,6 +7,7 @@ import re
 import time
 from pathlib import Path
 
+import pipeline.env  # isort: skip  # noqa: F401
 import ollama
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -97,16 +98,21 @@ def generate_answer(
     model_name = cfg.models.generation.name
     client = _make_client(cfg)
 
-    response = _ollama_chat(
-        client=client,
-        model=model_name,
-        prompt=prompt,
-        system_prefix=system_prefix,
-        temperature=cfg.models.generation.temperature,
-        top_p=cfg.models.generation.top_p,
-        top_k=cfg.models.generation.top_k,
-        history=history,
-    )
+    try:
+        response = _ollama_chat(
+            client=client,
+            model=model_name,
+            prompt=prompt,
+            system_prefix=system_prefix,
+            temperature=cfg.models.generation.temperature,
+            top_p=cfg.models.generation.top_p,
+            top_k=cfg.models.generation.top_k,
+            history=history,
+        )
+    finally:
+        # Each call owns its client; without close() every query leaks an
+        # httpx connection pool in the long-running API process.
+        client.close()
 
     answer_text = response.get("message", {}).get("content", "")
     if not answer_text:

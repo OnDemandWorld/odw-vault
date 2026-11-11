@@ -643,9 +643,12 @@ class IncrementalIndexer:
                 f"Document:\n{text}\n\nSummary:\n"
             )
 
+            # One client for all retry attempts, closed afterwards — a
+            # per-attempt client leaked an httpx pool on every retry.
+            client = ollama.Client(host=self.cfg.ollama.host, timeout=self.cfg.ollama.timeout_seconds)
+
             @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=30))
             def _call(prompt_text: str) -> str:
-                client = ollama.Client(host=self.cfg.ollama.host, timeout=self.cfg.ollama.timeout_seconds)
                 resp = client.chat(
                     model=model,
                     messages=[
@@ -656,7 +659,10 @@ class IncrementalIndexer:
                 )
                 return resp.get("message", {}).get("content", "").strip()
 
-            summary_text = _call(prompt)
+            try:
+                summary_text = _call(prompt)
+            finally:
+                client.close()
             if summary_text:
                 self.db["summary"].insert(
                     {

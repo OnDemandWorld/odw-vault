@@ -109,13 +109,13 @@ def _build_prompt(folder_row, db, config: Config) -> tuple[str, str]:
 def _call_ollama(prompt: str, model: str, host: str) -> FolderInference:
     import ollama
 
-    client = ollama.Client(host=host)
-    response = client.generate(
-        model=model,
-        prompt=prompt,
-        format="json",
-        options={"temperature": 0.2, "num_ctx": 8192},
-    )
+    with ollama.Client(host=host) as client:
+        response = client.generate(
+            model=model,
+            prompt=prompt,
+            format="json",
+            options={"temperature": 0.2, "num_ctx": 8192},
+        )
     raw_text = response["response"].strip()
     # Strip markdown fences if present
     if raw_text.startswith("```"):

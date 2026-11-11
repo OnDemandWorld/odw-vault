@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pipeline.env  # isort: skip  # noqa: F401
 import json
 import subprocess
 import sys

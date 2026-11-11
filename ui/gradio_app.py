@@ -31,6 +31,7 @@ import time
 import uuid
 from pathlib import Path
 
+import pipeline.env  # isort: skip  # noqa: F401
 import gradio as gr
 import ollama
 from fastapi import Request  # module-level on purpose: FastAPI resolves the string
@@ -644,7 +645,11 @@ def _on_chat(message: str, history: list[dict], folder_filter: str, conversation
     citations = []
     full_text = ""
     try:
-        token_gen = _stream_tokens(message.strip(), hits, history=history[:-1])
+        # history ends with [current user message, empty assistant placeholder].
+        # Drop both: the current question already lives inside the prompt, and
+        # replaying it as a bare user turn duplicated it (API /query strips it
+        # the same way).
+        token_gen = _stream_tokens(message.strip(), hits, history=history[:-2])
         for result in token_gen:
             if isinstance(result, tuple):
                 full_text, citations = result
@@ -871,7 +876,6 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     # Ensure localhost bypasses any environment HTTP proxy. Otherwise httpx
     # (used below for the reverse proxy and by Gradio's own startup probe)
     # would route 127.0.0.1 traffic through e.g. HTTP_PROXY and get a 502.
-    import os as _os
     import threading
     import time
 
@@ -880,13 +884,10 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
     from fastapi import FastAPI
     from fastapi.responses import HTMLResponse, StreamingResponse
     from starlette.responses import Response
-    _no_proxy = _os.environ.get("NO_PROXY", _os.environ.get("no_proxy", ""))
-    _no_set = {p.strip() for p in _no_proxy.split(",") if p.strip()}
-    _need = [h for h in ("127.0.0.1", "localhost") if h not in _no_set]
-    if _need:
-        _no_proxy = ",".join(list(_no_set) + _need)
-        _os.environ["NO_PROXY"] = _no_proxy
-        _os.environ["no_proxy"] = _no_proxy
+
+    from pipeline.env import sanitize_proxy_env
+
+    sanitize_proxy_env()
 
     global _cfg, _chroma_path, _ollama_host
 
@@ -896,7 +897,10 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
 
     db_path = Path(cfg.paths.corpus_root) / ".rag-cache" / "corpus.db"
     if not db_path.exists():
-        db_path = Path("corpus.db")
+        # Canonical location written by `vault init` (cli.py PROJECT_ROOT).
+        # A CWD-relative fallback silently created an empty DB when the UI
+        # was launched from any other directory.
+        db_path = Path(__file__).resolve().parent.parent / "corpus.db"
     _ensure_db(db_path)
     _check_db_write_access()
 

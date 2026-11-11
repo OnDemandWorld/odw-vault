@@ -16,21 +16,21 @@ from tests.conftest import seed_test_extractions, seed_test_files
 class TestOllamaEmbed:
     def test_returns_vectors(self):
         with patch("rag.phase11_embed.ollama.Client") as MockClient:
-            instance = MockClient.return_value
+            instance = MockClient.return_value.__enter__.return_value
             instance.embed.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
             result = _ollama_embed("http://localhost:11434", "test-model", ["hello"])
         assert result == [[0.1, 0.2, 0.3]]
 
     def test_empty_embeddings_raises(self):
         with patch("rag.phase11_embed.ollama.Client") as MockClient:
-            instance = MockClient.return_value
+            instance = MockClient.return_value.__enter__.return_value
             instance.embed.return_value = {"embeddings": []}
             with pytest.raises(Exception):  # tenacity wraps ValueError in RetryError
                 _ollama_embed("http://localhost:11434", "test-model", ["hello"])
 
     def test_truncate_dim_passed(self):
         with patch("rag.phase11_embed.ollama.Client") as MockClient:
-            instance = MockClient.return_value
+            instance = MockClient.return_value.__enter__.return_value
             instance.embed.return_value = {"embeddings": [[0.1]]}
             _ollama_embed("http://localhost:11434", "test-model", ["hello"], truncate_dim=256)
             call_kwargs = instance.embed.call_args.kwargs
@@ -38,7 +38,7 @@ class TestOllamaEmbed:
 
     def test_truncate_dim_zero_not_passed(self):
         with patch("rag.phase11_embed.ollama.Client") as MockClient:
-            instance = MockClient.return_value
+            instance = MockClient.return_value.__enter__.return_value
             instance.embed.return_value = {"embeddings": [[0.1]]}
             _ollama_embed("http://localhost:11434", "test-model", ["hello"], truncate_dim=0)
             call_kwargs = instance.embed.call_args.kwargs

@@ -7,7 +7,7 @@ run against the real migrated test DB.
 """
 
 import sqlite3
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import sqlite_utils
 from fastapi.testclient import TestClient
@@ -202,6 +202,9 @@ class TestQueryStreamEndpoint:
 
         stream_client = MagicMock()
         stream_client.chat.side_effect = _fake_chat
+        # Real AsyncClient.close() is a coroutine — the endpoint awaits it
+        # in finally to release the connection pool.
+        stream_client.close = AsyncMock()
         mock_make_client.return_value = stream_client
         mock_chroma.return_value.get_collection.return_value = MagicMock()
         mock_retrieve.return_value = (
@@ -224,6 +227,8 @@ class TestQueryStreamEndpoint:
             # factory (endpoint + api_key + timeout honored) ...
             mock_make_client.assert_called_once()
             assert mock_make_client.call_args.kwargs.get("stream") is True
+            # ... and release the client when the stream completes.
+            stream_client.close.assert_awaited_once()
 
             # ... and persist the full conversation, not just the query log.
             # (db is a raw sqlite_utils.Database here — its query() returns a

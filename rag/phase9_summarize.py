@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+import pipeline.env  # isort: skip  # noqa: F401
 import ollama
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -41,18 +42,18 @@ def _build_prompt(extracted_text: str) -> str:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=30))
 def _call_ollama(prompt: str, model: str, host: str, temperature: float, max_tokens: int) -> str:
     """Call Ollama and return stripped summary text."""
-    client = ollama.Client(host=host, timeout=600)
-    response = client.chat(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a helpful summarization assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        options={
-            "temperature": temperature,
-            "num_ctx": 16384,
-        },
-    )
+    with ollama.Client(host=host, timeout=600) as client:
+        response = client.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful summarization assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            options={
+                "temperature": temperature,
+                "num_ctx": 16384,
+            },
+        )
     text = response.get("message", {}).get("content", "").strip()
     if not text:
         raise ValueError("Ollama returned empty response")

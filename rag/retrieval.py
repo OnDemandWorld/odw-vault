@@ -93,6 +93,7 @@ def retrieve(
     # Embed query once for all dense searches
     import ollama as _ollama_mod
 
+    _qc = None
     try:
         _qc = _ollama_mod.Client(
             host=cfg.ollama.host, timeout=getattr(cfg.ollama, "timeout_seconds", 120)
@@ -102,6 +103,9 @@ def retrieve(
     except Exception as _e:
         logger.error("Failed to embed query for retrieval: %s", _e)
         return [], metrics
+    finally:
+        if _qc is not None:
+            _qc.close()
 
     candidate_file_ids = None
     if cfg.retrieval.hierarchical:
@@ -132,6 +136,13 @@ def retrieve(
         # No filter and no narrowing: keep unrestricted — path hits still
         # get their BM25 boost via _path_match_retrieve below.
         pass
+
+    # An empty candidate set means nothing is eligible (e.g. every path
+    # match was an excluded meta file). Short-circuit: downstream IN ()
+    # clauses would be a SQL syntax error, not an empty result.
+    if candidate_file_ids is not None and not candidate_file_ids:
+        metrics["retrieval_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        return [], metrics
 
     # 5. Dense chunk retrieval
     dense_candidates = cfg.retrieval.dense_candidates
@@ -486,19 +497,26 @@ def _path_match_retrieve(
     if not tokens:
         return []
 
-    # Find all matching files and score by token count
+    # Find all matching files and score by token count. Batch the candidate
+    # IN list like the FTS paths — oversized sets exceed SQLite's bound-
+    # parameter cap on older builds.
     filter_sql = ""
     params: list = []
-    if candidate_file_ids is not None:
-        placeholders = ",".join("?" for _ in candidate_file_ids)
-        filter_sql = f" AND f.id IN ({placeholders})"
-        params.extend(candidate_file_ids)
     if excluded_file_ids:
         exc = ",".join("?" for _ in excluded_file_ids)
         filter_sql += f" AND f.id NOT IN ({exc})"
         params.extend(excluded_file_ids)
 
-    rows = db.query(f"SELECT f.id, f.rel_path FROM file f WHERE 1=1{filter_sql}", params)
+    base_sql = f"SELECT f.id, f.rel_path FROM file f WHERE 1=1{filter_sql}"
+    if candidate_file_ids is not None:
+        id_list = list(candidate_file_ids)
+        rows = []
+        for i in range(0, len(id_list), 900):
+            batch = id_list[i : i + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(db.query(base_sql + f" AND f.id IN ({placeholders})", [*batch, *params]))
+    else:
+        rows = list(db.query(base_sql, params))
 
     # Score each file by how many tokens match its path
     scored: list[tuple[int, int, str]] = []  # (file_id, match_count, rel_path)
@@ -573,28 +591,46 @@ def _bm25_retrieve_zh(
         "JOIN file f ON c.file_id = f.id "
     )
 
-    try:
-        if candidate_file_ids is not None:
-            placeholders = ",".join("?" for _ in candidate_file_ids)
+    # Same bound-parameter cap as the English path: an oversized candidate
+    # set raises OperationalError on SQLite builds with the 999 limit, and
+    # the except below would silently turn that into zero Chinese recall.
+    SQL_PARAM_BATCH = 900
+
+    def _run_fts(candidate_ids: list[int] | None, exclude_ids: list[int] | None):
+        if candidate_ids is not None:
+            placeholders = ",".join("?" for _ in candidate_ids)
             sql = (
                 base_select
                 + f"WHERE chunk_fts_zh MATCH ? AND c.file_id IN ({placeholders}) "
                 + "ORDER BY rank LIMIT ?"
             )
-            params = [fts_query, *list(candidate_file_ids), n_results]
-        elif excluded_file_ids:
-            exc = ",".join("?" for _ in excluded_file_ids)
+            params = [fts_query, *candidate_ids, n_results]
+        elif exclude_ids:
+            exc = ",".join("?" for _ in exclude_ids)
             sql = (
                 base_select
                 + f"WHERE chunk_fts_zh MATCH ? AND c.file_id NOT IN ({exc}) "
                 + "ORDER BY rank LIMIT ?"
             )
-            params = [fts_query, *list(excluded_file_ids), n_results]
+            params = [fts_query, *exclude_ids, n_results]
         else:
             sql = base_select + "WHERE chunk_fts_zh MATCH ? ORDER BY rank LIMIT ?"
             params = [fts_query, n_results]
+        return list(db.query(sql, params))
 
-        rows = db.query(sql, params)
+    try:
+        if candidate_file_ids is not None:
+            id_list = list(candidate_file_ids)
+            if len(id_list) <= SQL_PARAM_BATCH:
+                rows = _run_fts(id_list, None)
+            else:
+                rows = []
+                for i in range(0, len(id_list), SQL_PARAM_BATCH):
+                    rows.extend(_run_fts(id_list[i : i + SQL_PARAM_BATCH], None))
+                rows.sort(key=lambda r: r.get("rank") if r.get("rank") is not None else 0)
+                rows = rows[:n_results]
+        else:
+            rows = _run_fts(None, list(excluded_file_ids) if excluded_file_ids else None)
     except Exception as e:
         logger.warning("Chinese BM25 retrieval failed: %s", e)
         return []

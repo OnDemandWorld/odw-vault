@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import pipeline.env  # isort: skip  # noqa: F401
 import chromadb
 import ollama
 from rich.console import Console
@@ -47,11 +48,11 @@ def _ollama_embed(
     timeout: int = 300,
 ) -> list[list[float]]:
     """Call Ollama embed API and return list of vectors."""
-    client = ollama.Client(host=host, timeout=timeout)
     kwargs: dict = {"model": model, "input": texts}
     if truncate_dim > 0:
         kwargs["options"] = {"truncate_dim": truncate_dim}
-    resp = client.embed(**kwargs)
+    with ollama.Client(host=host, timeout=timeout) as client:
+        resp = client.embed(**kwargs)
     vectors = resp.get("embeddings", [])
     if not vectors:
         raise ValueError("Ollama returned empty embeddings")

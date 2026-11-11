@@ -90,6 +90,18 @@ def run_eval(
         cfg.models.reranker.name if cfg.models.reranker.enabled else None
     )
 
+    # Apply overrides to a private config copy so the recorded model labels
+    # match what actually ran — previously the overrides were labels only.
+    if embedding_model or generation_model or reranker_model:
+        cfg = cfg.model_copy(deep=True)
+        if embedding_model:
+            cfg.models.embedding.name = embedding_model
+        if generation_model:
+            cfg.models.generation.name = generation_model
+        if reranker_model:
+            cfg.models.reranker.name = reranker_model
+            cfg.models.reranker.enabled = True
+
     recalls_at_5: list[int] = []
     recalls_at_10: list[int] = []
     run_count = 0
@@ -106,6 +118,7 @@ def run_eval(
                 chroma_client=chroma_client,
                 chroma_path=chroma_path,
                 cfg=cfg,
+                use_augmentation=False if no_augment else None,
             )
 
             # 2. Compute recall

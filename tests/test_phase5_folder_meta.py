@@ -196,6 +196,7 @@ class TestCallOllama:
             )
         }
         mock_client = MagicMock()
+        mock_client.__enter__.return_value = mock_client
         mock_client.generate.return_value = mock_response
 
         with patch("ollama.Client", return_value=mock_client):
@@ -208,6 +209,7 @@ class TestCallOllama:
             "response": '```json\n{"category":"client-project","label":"Test","tags":["t"],"summary":"S."}\n```'
         }
         mock_client = MagicMock()
+        mock_client.__enter__.return_value = mock_client
         mock_client.generate.return_value = mock_response
 
         with patch("ollama.Client", return_value=mock_client):

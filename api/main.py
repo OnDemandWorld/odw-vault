@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 
+import pipeline.env  # isort: skip  # noqa: F401
 import chromadb
 import ollama
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -56,24 +57,6 @@ from pipeline.db import migrate, open_db
 from rag.filters import resolve_folder_filter
 from rag.generation import generate_answer
 from rag.retrieval import Hit, retrieve
-
-
-def _ensure_loopback_bypasses_proxy() -> None:
-    """Ensure loopback hosts bypass HTTP(S) proxies.
-
-    In proxy-equipped environments (HTTP_PROXY/HTTPS_PROXY set), HTTP client
-    libraries route even 127.0.0.1/localhost calls through the proxy unless
-    NO_PROXY lists them — a proxy that cannot reach the loopback service then
-    turns every internal call (Ollama, sibling products) into a 502/500 (found
-    in QA when NO_PROXY contained 127.0.0.0 but not 127.0.0.1).
-    """
-    for key in ("NO_PROXY", "no_proxy"):
-        parts = {p.strip() for p in os.environ.get(key, "").split(",") if p.strip()}
-        if not {"localhost", "127.0.0.1"} <= parts:
-            parts |= {"localhost", "127.0.0.1"}
-            os.environ[key] = ",".join(sorted(parts))
-
-_ensure_loopback_bypasses_proxy()
 
 logger = logging.getLogger(__name__)
 
@@ -306,8 +289,8 @@ def health():
     # Ollama check
     ollama_ok = False
     try:
-        client = ollama.Client(host=cfg.ollama.host, timeout=10)
-        client.list()
+        with ollama.Client(host=cfg.ollama.host, timeout=10) as client:
+            client.list()
         ollama_ok = True
     except Exception:
         logger.warning("Ollama not reachable at %s", cfg.ollama.host)
@@ -455,7 +438,8 @@ def _query_impl(req: QueryRequest):
 
     # Check Ollama reachability (embedding host)
     try:
-        ollama.Client(host=cfg.ollama.host, timeout=10).list()
+        with ollama.Client(host=cfg.ollama.host, timeout=10) as _c:
+            _c.list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
 
@@ -465,7 +449,8 @@ def _query_impl(req: QueryRequest):
     gen_host = getattr(cfg.models.generation.endpoint, "host", None)
     if gen_host and gen_host != cfg.ollama.host:
         try:
-            ollama.Client(host=gen_host, timeout=10).list()
+            with ollama.Client(host=gen_host, timeout=10) as _c:
+                _c.list()
         except Exception:
             raise HTTPException(
                 status_code=503,
@@ -684,7 +669,8 @@ def query_stream(req: QueryRequest):
 
     # Check Ollama
     try:
-        ollama.Client(host=cfg.ollama.host, timeout=10).list()
+        with ollama.Client(host=cfg.ollama.host, timeout=10) as _c:
+            _c.list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
 
@@ -949,6 +935,11 @@ def query_stream(req: QueryRequest):
                 event="error",
                 data=json.dumps({"error": "Internal error while generating the answer"}),
             )
+        finally:
+            # Runs on normal completion, error, and client disconnect
+            # (generator cancellation) — otherwise every streamed query
+            # leaks an httpx connection pool.
+            await oclient.close()
 
     return EventSourceResponse(event_generator())
 
