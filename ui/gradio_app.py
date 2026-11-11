@@ -421,6 +421,13 @@ def _format_chunks_for_prompt(hits: list[Hit]) -> str:
     return "\n\n".join(blocks) if blocks else "(no context available)"
 
 
+def _content_text(content) -> str:
+    """Gradio messages-format content (list of text/file parts) → plain text."""
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return content or ""
+
+
 def _stream_tokens(query: str, hits: list[Hit], history: list[dict] | None = None):
     numbered_chunks = _format_chunks_for_prompt(hits)
     template = _load_prompt(None, _cfg)
@@ -444,7 +451,7 @@ def _stream_tokens(query: str, hits: list[Hit], history: list[dict] | None = Non
     # latest turn while the API /query path injected a 5-turn window.
     prior_turns = [m for m in (history or []) if m.get("role") in ("user", "assistant") and m.get("content")]
     for m in prior_turns[-10:]:  # 5 user/assistant round-trips
-        messages.append({"role": m["role"], "content": m["content"]})
+        messages.append({"role": m["role"], "content": _content_text(m["content"])})
 
     messages.append({"role": "user", "content": prompt})
 
@@ -525,7 +532,7 @@ def _on_folder_change(folder_filter: str) -> str:
 _turn_log_ids: dict[int, int] = {}
 
 
-def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float, total_ms: float) -> None:
+def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float, total_ms: float, conversation_id: str | None = None) -> None:
     """Persist a UI turn to query_log (V-7): /queries history and metrics were
     blind to all UI traffic; feedback also had no row to target."""
     try:
@@ -534,8 +541,9 @@ def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float
             INSERT INTO query_log
                (user, query_text, query_lang, folder_filter_json,
                 retrieved_chunks_json, answer_text, answer_model,
-                latency_ms, retrieval_ms, generation_ms)
-            VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                embedding_model, reranker_model,
+                latency_ms, retrieval_ms, generation_ms, conversation_id)
+            VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "ui",
@@ -544,9 +552,12 @@ def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float
                 json.dumps([h.rel_path for h in hits]),
                 answer,
                 _cfg.models.generation.name,
+                _cfg.models.embedding.name,
+                _cfg.models.reranker.name if getattr(_cfg.models.reranker, "enabled", False) else None,
                 int(total_ms * 1000),
                 int(retrieval_ms * 1000),
                 int((total_ms - retrieval_ms) * 1000),
+                conversation_id,
             ),
         )
         _get_db().conn.commit()
@@ -600,6 +611,22 @@ def _on_chat(message: str, history: list[dict], folder_filter: str, conversation
         _save_conversation_message(conv_id, "user", message.strip())
     except Exception:
         logger.warning("Failed to save user message to conversation", exc_info=True)
+
+    # The custom frontend pushes the current user turn into history before
+    # calling, and Gradio's messages-format Chatbot delivers content as
+    # [{"text": ..., "type": "text"}] parts. Normalize to plain text (Ollama
+    # rejects array content with HTTP 400) and drop the duplicated current
+    # turn so the replay window below contains only prior turns.
+    history = [
+        {"role": m.get("role"), "content": _content_text(m.get("content"))}
+        for m in (history or [])
+    ]
+    if (
+        history
+        and history[-1].get("role") == "user"
+        and history[-1]["content"] == message.strip()
+    ):
+        history = history[:-1]
 
     history = [*history, {"role": "user", "content": message.strip()}]
     yield history, _citations_html([])
@@ -683,6 +710,7 @@ def _on_chat(message: str, history: list[dict], folder_filter: str, conversation
         hits=hits,
         retrieval_ms=elapsed_retrieval,
         total_ms=elapsed_total,
+        conversation_id=conv_id,
     )
 
     yield history, _citations_html(citations)
@@ -2236,6 +2264,9 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
               }
               if(d && d[0] && d[0].length){
                 var h = d[0];
+                // Adopt the backend history (user + assistant turns) so the
+                // next send replays answers too, not just prior questions.
+                _S.H = h;
                 var last = h[h.length - 1];
                 // Citations first: an exception later in this block (e.g. the
                 // markdown renderer choking on some generated text) must
