@@ -10,7 +10,9 @@
     "root_cause": "Phase 7 only sets file.excluded=1; it never removes chunks/FTS rows/Chroma vectors. Retrieval's only hard exclusion is rel_path='preflight_report.md' (lines 153-156). _find_files_by_path (line 488) and the unrestricted BM25 path (line 796) apply no excluded=0 predicate; path-match ids are unioned INTO candidates at line 165; dense retrieval has no exclusion metadata filter; the summary-narrowing branch (lines 347-349) adds file_ids unconditionally.",
     "suggested_fix": "Add AND f.excluded=0 to every file-table query in the retrieval path, intersect candidate_file_ids with the non-excluded set, filter excluded files out of dense hits (or delete/flag their vectors at exclusion time), and apply exclusion in the summary branch. Related: #2 (folder exclusion).",
     "failure_scenario": "Operator runs `vault exclude --target file --id N --reason 'confidential HR doc'` after indexing. Queries containing terms from that document still return its chunks via BM25/dense/path-match, and generation cites the excluded confidential content.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: excluded_ids query now covers file.excluded=1 OR folder.excluded=1; dense hits post-filtered. Tests: TestRetrievalExclusion (2) in tests/test_ocr_round1_fixes.py PASS. ruff check rag/retrieval.py PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 2,
@@ -23,7 +25,9 @@
     "root_cause": "run_phase7_exclude (and batch) only sets folder.excluded=1 on the single row. No cascade to descendant folders or their files, and no downstream consumer checks folder.excluded: extract/indexer/retrieval filter only file.excluded. The only folder.excluded readers are the folder-listing endpoints (api/main.py:1005,1013).",
     "suggested_fix": "On folder exclusion, mark all descendant folders and their files excluded=1 (recursive CTE over folder.parent_id), or add a folder-exclusion join to every downstream selection/retrieval query. Re-run dedup/report after exclusion. Related: #1.",
     "failure_scenario": "`vault exclude --target folder --id 5 --reason 'confidential HR'` leaves files in folder 5 at excluded=0; identify/triage/extract/embed index them and query/API return their content — the exclusion silently fails to protect the data.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: _exclude_folder_tree recursive-CTE cascade in pipeline/phase7_exclude.py (single + batch). Tests: TestFolderExclusionCascade (2) PASS; tests/test_phase7_exclude.py 8 PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 3,
@@ -36,7 +40,9 @@
     "root_cause": "When resolve/stat/_sha256_file raises OSError during the walk (lines 364-397), the path is skipped and never added to disk_files. deleted_paths (line 410) = db_files - disk_files, so a transiently unreadable file is classified as deleted and remove_file() (lines 476-483) destroys its file row, chunks, extraction, summary, and Chroma vectors. Same for any DB row whose path lies outside the current corpus_root.",
     "suggested_fix": "Track scan errors separately and exclude error paths from deleted_paths; only treat a file as deleted when confirmed absent (explicit exists() check at removal time, as the repair pass already does at line 462).",
     "failure_scenario": "A file is temporarily locked/permission-denied (backup software, macOS sandbox, network volume hiccup) during sync_all. Its hash read fails, it is treated as deleted, and its entire index is destroyed; until re-indexed, queries silently lose that document.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: scan_errors set excludes unreadable paths from deleted_paths; exists() guard at removal. Tests: TestSyncAllUnreadableFileGuard (2) PASS; tests/test_indexer.py + test_upload_sync.py PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 4,
@@ -49,7 +55,9 @@
     "root_cause": "delete_file unlinks the disk file and deletes Chroma vectors before the SQLite deletes. DELETE FROM file violates foreign_keys=ON whenever the file is referenced by archive_expansion.archive_file_id (db.py:201, NOT NULL, no cascade), folder.source_archive_file_id (db.py:132), or file.extracted_from_archive_id (db.py:163) — none cleaned up. The IntegrityError propagates as 500 with no try/rollback; the thread-local connection keeps an open write transaction with the partial deletes, which the next commit on that threadpool thread silently commits.",
     "suggested_fix": "Wrap all SQLite deletes in a transaction with rollback; delete/null the archive_expansion, folder.source_archive_file_id, and child extracted_from_archive_id references first (or refuse with 409); move the disk unlink after the DB transaction commits.",
     "failure_scenario": "Run phase 0 on a ZIP, then DELETE /files/{archive_id}: the archive is unlinked from disk and vectors deleted, DELETE FROM file raises IntegrityError -> 500. The original is permanently lost, and a later unrelated request on the same worker thread commits the orphaned partial deletes.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: refs collected pre-transaction; try/commit/rollback with FK cleanup (archive_expansion delete, folder/file provenance NULLed); disk unlink moved after commit. Tests: TestDeleteFileFKSafety (2) PASS; tests/test_file_management.py 12 PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 5,
@@ -62,7 +70,9 @@
     "root_cause": "_md() (line 2377) escapes only & < > before rendering, then builds '<a href=\"$2\" target=\"_blank\" ...>' from the raw markdown URL. Double quotes in the URL break out of the href attribute; javascript: URLs are accepted.",
     "suggested_fix": "HTML-escape quotes in the URL, allow only http/https/mailto schemes, and validate/encode the URL before inserting into the attribute.",
     "failure_scenario": "A corpus document's prompt-injection text makes the model emit [details](https://x\" onmouseover=\"alert(document.cookie)) or [click](javascript:alert(1)). The rendered answer injects an event handler / javascript: href into every viewer's page, executing attacker JS in the UI origin.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: _md() link callback allowlists http/https/mailto and escapes quotes. Test: TestUiXssFixes.test_md_links_block_unsafe_schemes_and_quote_breakout executes real JS via node — PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 6,
@@ -75,7 +85,9 @@
     "root_cause": "_renderConvList() interpolates c.id raw into data-conv-id=\"...\" attributes via innerHTML. Conversation ids are arbitrary client-supplied strings persisted verbatim by _save_conversation_message (line 752). The title is escaped; the id is not.",
     "suggested_fix": "Escape c.id with an HTML-attribute escaper, or reject non-UUID conversation ids server-side in _on_chat/_save_conversation_message.",
     "failure_scenario": "Any client POSTs /gradio_api/call/chat with conv_id '\"><img src=x onerror=alert(1)>'. The row is stored; every user who loads the UI afterwards renders the sidebar and executes the payload (no auth on the endpoint).",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: _renderConvList escapes c.id via _escHtml before attribute interpolation. Test: TestUiXssFixes.test_conv_list_escapes_client_supplied_id (node, real payload) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 7,
@@ -88,7 +100,9 @@
     "root_cause": "_transcribe_file calls Model(model=..., fname_audio=...), model.print_system_info(), model.new_full_params(...), model.process(...), model.segments. Verified against installed pywhispercpp 1.5.0: Model.__init__ has no fname_audio parameter; the class only has transcribe() and static system_info(). word_timestamps is not a supported param key (token_timestamps is).",
     "suggested_fix": "Rewrite against the real API: Model(model_name, models_dir=<.rag-cache/models>, n_threads=..., language=..., token_timestamps=...); segments = model.transcribe(filepath); seg.t0/t1 are centiseconds. Pin models_dir to the local cache — resolve_model_path otherwise downloads models from the network, violating the offline guarantee.",
     "failure_scenario": "With pywhispercpp installed, `vault transcribe` on any audio/video file raises AttributeError; 100% of files recorded as failed and no transcript ever produced. The opt-in transcription feature is non-functional.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: rewritten against pywhispercpp 1.5.0 Model/transcribe; t0/t1 centiseconds converted; local model resolution with loud offline failure. Tests: TestTranscribeRealApi (2) PASS; tests/test_phase8b_transcribe.py PASS (test_import_error made deterministic). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 8,
@@ -101,7 +115,9 @@
     "root_cause": "cli.py:18 sets PROJECT_ROOT = Path(__file__).resolve().parent. pyproject.toml declares py-modules = [\"cli\"], so pip installs cli.py into site-packages; the vault entry point looks for config.toml/seeds/corpus.db there. The Dockerfile copies config to /app/config.toml and documents mounting it there, but get_config never looks there; init silently skips seeding when the seed CSV is missing.",
     "suggested_fix": "Anchor PROJECT_ROOT to an env var (e.g. VAULT_HOME) or CWD with fallback, or run the container via `python /app/cli.py`; copy seeds next to the resolved root and fail loudly when the seed CSV is missing.",
     "failure_scenario": "docker build && docker run -v $PWD/config.toml:/app/config.toml odw-vault -> `vault serve` exits 2 with 'config.toml not found at /usr/local/lib/python3.11/site-packages/config.toml'; container never starts, healthcheck fails.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: PROJECT_ROOT honors VAULT_HOME env (cli.py); Dockerfile sets ENV VAULT_HOME=/app. Tests: TestVaultHome (3) PASS; tests/test_cli.py 14 PASS. Docker build not run (no docker daemon in review env). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 9,
@@ -114,7 +130,9 @@
     "root_cause": "POST /eval/run spawns threading.Thread(_run_eval_background) (api/main.py:1195) which calls _get_db() and _load_config(); only _get_db is patched. The test returns after one status poll; teardown stops the patch while the thread may not have run. Late execution opens Path('corpus.db') relative to CWD (real repo/deployed DB) and reads real config.toml; run_eval can fire real Ollama/Chroma traffic. Module-global _eval_runs is never reset, so a slow 'running' entry makes later POSTs return 409.",
     "suggested_fix": "Patch api.main._load_config and the eval runner in this test, join/await the background thread before teardown, and add an autouse fixture clearing api.main._eval_runs. Related: #82.",
     "failure_scenario": "On a machine with a populated corpus.db/config.toml, pytest creates eval_run rows in the production database and fires real model traffic from a daemon thread after the test finished; on a fresh clone it silently creates repo-root corpus.db. Repeated runs flake with 409.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: test mocks _load_config + eval.runner.run_eval, joins background thread (5s deadline), clears _eval_runs. tests/test_review_round6_fixes.py PASS repeatedly; no repo corpus.db writes from this test. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 755 passed, 3 skipped, exit 0"
   },
   {
     "id": 10,
@@ -127,7 +145,9 @@
     "root_cause": "_score_batch calls client.embed(model, input=documents) with no query involvement, then takes emb[0] or the mean of all dimensions and sigmoid-normalizes it as a 'relevance score' — near-constant (~0.5) or meaningless for real embedding models. retrieval.py:215 falls back to cfg.models.generation.name when no reranker name is set, enabling this path by accident.",
     "suggested_fix": "Remove the embed-based scoring path (embeddings are not cross-encoder scores); require a genuine reranker endpoint and fail loudly when the configured model cannot score.",
     "failure_scenario": "use_reranker=true with an embedding model configured: every hit scores ~0.5 regardless of query; stable sort preserves arbitrary order and top_n truncation drops genuinely relevant chunks — worse than no reranking.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: _score_batch accepts embed output only when every document yields exactly 1 dimension (genuine scalar reranker); multi-dimensional embeddings fall through to query-dependent generation scoring. Tests: TestRerankerScalarGuard (2) PASS; tests/test_reranker.py 20 PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 766 passed, 3 skipped, exit 0"
   },
   {
     "id": 11,
@@ -140,7 +160,9 @@
     "root_cause": "_path_match_retrieve fetches chunks ORDER BY c.chunk_index LIMIT 30 across the top-10 path-matching files (first ~3 chunks: cover/TOC/intro), no content relevance check, constant bm25_score=0.5, prepended to bm25_hits. With rrf_k=60 a path chunk at rank 0 scores 1/61 while the best genuine BM25 hit pushed to rank 30 scores 1/91.",
     "suggested_fix": "Score path-matched chunks by actual query-term overlap (or run FTS restricted to those files), cap the merged count, and append after genuine BM25 hits.",
     "failure_scenario": "Query 'energy report' matches 10 files named *report*.pdf; their first 30 chunks take the top BM25 ranks and the chunk with the actual energy figures falls out of top_k_chunks=8 — the answer cites boilerplate.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: path-match hits appended AFTER genuine BM25 hits (recall supplement, not top-rank occupants). Test: TestPathHitOrdering (top_k=1 truncation scenario) PASS. Note: final hit list order is (file_id, chunk_id) by pre-existing _assemble_context design; the fix changes RRF ranks/top-k survival. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 766 passed, 3 skipped, exit 0"
   },
   {
     "id": 12,
@@ -153,7 +175,9 @@
     "root_cause": "Line 67: allowed_ids = (allowed_ids & workspace_ids) if allowed_ids else workspace_ids conflates 'no other filter key supplied' with 'other keys supplied but matched zero files'. The empty union is replaced by the ENTIRE workspace (a non-empty set, so the API's None->422 guard does not catch it).",
     "suggested_fix": "Track whether any of path_prefix/folder_id/inferred_category keys were present; if present, intersect even when allowed_ids is empty and return an empty set (callers already treat empty as no-match). Only fall back to workspace_ids when no other filter key was given.",
     "failure_scenario": "folder_filter={'path_prefix': 'Project/Nonexistent', 'workspace': 'team-a'} should match nothing (422) but returns every team-a file; retrieval searches the whole workspace, leaking other projects' documents into a query believed scoped to one project.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: workspace intersection applied whenever path/folder/category keys are present, even when their union is empty; empty result returns None which both callers treat as no-match (422 / []). Tests: TestWorkspaceFilterScope (2) PASS; tests/test_filters.py PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 766 passed, 3 skipped, exit 0"
   },
   {
     "id": 13,
@@ -166,7 +190,9 @@
     "root_cause": "At embed time phase11_embed.py:209-211 (and indexer.py:838-841) store the Chroma document as context_text + '\\n\\n' + chunk text, so dense hits already carry the context in Hit.text. _assemble_context with augment=True unconditionally prepends context_text again — dense hits get it twice, BM25-only hits once.",
     "suggested_fix": "Store the raw chunk text as the Chroma document (context belongs in metadata/SQLite), or skip prepending when the hit text already starts with the stored context.",
     "failure_scenario": "With augmentation enabled, a dense hit's prompt block contains the situating context twice — wasted tokens, bias toward context boilerplate, duplicated citation snippets; inconsistent prompt content for the same chunk depending on retrieval path.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: _assemble_context skips prepending when hit text already starts with the stored context (dense documents carry it). Test: TestContextNoDoubleWrap PASS (dense + BM25 variants). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 766 passed, 3 skipped, exit 0"
   },
   {
     "id": 14,
@@ -270,7 +296,9 @@
     "root_cause": "require_citations (default True, config.py:199) is only displayed in the UI; generate_answer never reads it. An answer with zero valid citation markers returns refused=False, citations=[]. Out-of-range hallucinated markers are silently dropped by resolve_citations while the marker text remains in the answer.",
     "suggested_fix": "When require_citations is true and no citations resolve, retry with stricter instruction or return refusal/flag the response; strip or annotate unresolved markers in the answer text.",
     "failure_scenario": "With require_citations=true the model answers from parametric knowledge without any [N] marker; the API returns a confident uncited answer as normal success, violating the citation-strict contract with no signal to the user.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: generate_answer enforces generation_runtime.require_citations — zero resolvable citations with context present returns REFUSAL_TEXT with refused=True. Tests: TestRequireCitationsEnforced (3) PASS; tests/test_generation*.py PASS. Scope note: streaming UI path has its own generation loop (not covered by this fix). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 766 passed, 3 skipped, exit 0"
   },
   {
     "id": 22,

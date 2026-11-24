@@ -735,3 +735,202 @@ class TestVaultHome:
 
         dockerfile = Path(__file__).resolve().parent.parent / "Dockerfile"
         assert "ENV VAULT_HOME=/app" in dockerfile.read_text(encoding="utf-8")
+
+
+class TestRerankerScalarGuard:
+    """OCR #10: multi-dimensional embeddings must not be used as scores."""
+
+    def test_multidim_embeddings_fall_back_to_query_scoring(self):
+        from rag.reranker import rerank
+        from rag.retrieval import Hit
+
+        hits = [
+            Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="a", page_start=None, text="doc a"),
+            Hit(chunk_id=2, file_id=1, folder_id=1, rel_path="b", page_start=None, text="doc b"),
+        ]
+        client = MagicMock()
+        # A real embedding model: many dimensions, query-independent.
+        client.embed.return_value = {"embeddings": [[0.2, 0.4, 0.6], [0.1, 0.3, 0.5]]}
+        client.generate.return_value = {"response": "0.9"}
+
+        with patch("ollama.Client", return_value=client):
+            result = rerank("query", hits, model_name="embed-model", ollama_host="http://x")
+
+        assert client.generate.called  # query-dependent scoring used
+        assert all(h.rerank_score == pytest.approx(0.9) for h in result)
+
+    def test_scalar_reranker_output_still_accepted(self):
+        from rag.reranker import rerank
+        from rag.retrieval import Hit
+
+        hits = [
+            Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="a", page_start=None, text="doc a"),
+        ]
+        client = MagicMock()
+        client.embed.return_value = {"embeddings": [[2.0]]}
+
+        with patch("ollama.Client", return_value=client):
+            result = rerank("query", hits, model_name="reranker", ollama_host="http://x")
+
+        assert not client.generate.called
+        assert result[0].rerank_score > 0.5  # sigmoid(2.0)
+
+
+class TestPathHitOrdering:
+    """OCR #11: path-match chunks must not outrank genuine BM25 hits."""
+
+    def test_genuine_bm25_hit_ranks_above_path_match(self, tmp_path):
+        from rag.retrieval import _retrieve_with_client
+
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        fid = _insert_folder(db, "/c", ".", "root", 0)
+        f_path = seed_test_files(
+            db, files=[{"name": "kwh_report.pdf", "folder_id": fid}]
+        )[0]
+        f_real = seed_test_files(db, files=[{"name": "notes.txt", "folder_id": fid}])[0]
+        for fid_, text in (
+            (f_path, "boilerplate cover page with no query terms"),
+            (f_real, "the kwh value is 42"),
+        ):
+            db["chunk"].insert(
+                {"file_id": fid_, "text": text, "chunk_index": 0,
+                 "token_count": 6, "metadata_json": "{}"}
+            )
+        db.conn.commit()
+
+        mock_coll = MagicMock()
+        mock_coll.metadata = {"embedding_model": "test-embed"}
+        mock_coll.query.return_value = {
+            "ids": [[]], "metadatas": [[]], "documents": [[]], "distances": [[]]
+        }
+        client = MagicMock()
+
+        def get_collection(name):
+            if name.startswith("chunks__"):
+                return mock_coll
+            raise Exception("absent")
+
+        client.get_collection.side_effect = get_collection
+        with (
+            patch("ollama.Client") as mock_ollama,
+            patch("rag.retrieval._detect_language", return_value="en"),
+        ):
+            mock_ollama.return_value.embed.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
+            # top_k=1: before the fix the path-match boilerplate occupied
+            # BM25 rank 0 and survived truncation; the genuine hit must win.
+            hits, _ = _retrieve_with_client(
+                "kwh", db, client, str(tmp_path / "chroma"), cfg, top_k_chunks=1
+            )
+
+        assert len(hits) == 1
+        assert hits[0].file_id == f_real, "genuine content hit must outrank path-match boilerplate"
+
+
+class TestWorkspaceFilterScope:
+    """OCR #12: an empty companion filter must not broaden to the workspace."""
+
+    def test_nonmatching_path_prefix_with_workspace_returns_no_match(self, tmp_path):
+        from rag.filters import resolve_folder_filter
+
+        db = _seed_db(tmp_path)
+        fid = _insert_folder(db, "/c/a", "Project/A", "A", 0)
+        seed_test_files(
+            db, files=[{"name": "a.txt", "folder_id": fid, "workspace": "team-a"}]
+        )
+
+        result = resolve_folder_filter(
+            db, {"path_prefix": "Project/Nonexistent", "workspace": "team-a"}
+        )
+        assert result is None  # callers treat None as "no matches" (422 / [])
+
+    def test_workspace_only_still_scopes(self, tmp_path):
+        from rag.filters import resolve_folder_filter
+
+        db = _seed_db(tmp_path)
+        fid = _insert_folder(db, "/c/a", "Project/A", "A", 0)
+        ids = seed_test_files(
+            db, files=[{"name": "a.txt", "folder_id": fid, "workspace": "team-a"}]
+        )
+        result = resolve_folder_filter(db, {"workspace": "team-a"})
+        assert result == set(ids)
+
+
+class TestContextNoDoubleWrap:
+    """OCR #13: dense hits already carrying context must not get it twice."""
+
+    def test_assemble_context_skips_already_prefixed(self, tmp_path):
+        from rag.retrieval import Hit, _assemble_context
+
+        db = _seed_db(tmp_path)
+        fid = _insert_folder(db, "/c", ".", "root", 0)
+        f = seed_test_files(db, files=[{"name": "a.txt", "folder_id": fid}])[0]
+        ctx = "This chunk sits in the energy report intro."
+        body = "The kwh value is 42."
+        ct = db["chunk"]
+        ct.insert(
+            {"file_id": f, "text": body, "context_text": ctx, "chunk_index": 0,
+             "token_count": 6, "metadata_json": "{}"}
+        )
+        db.conn.commit()
+        cid = ct.last_rowid
+
+        # Dense-originated hit: Chroma document already contains the context.
+        dense_hit = Hit(chunk_id=cid, file_id=f, folder_id=fid, rel_path="a.txt",
+                        page_start=None, text=f"{ctx}\n\n{body}")
+        _assemble_context([dense_hit], db, augment=True)
+        assert dense_hit.text.count(ctx) == 1
+
+        # BM25-originated hit: raw chunk text gets the context once.
+        bm25_hit = Hit(chunk_id=cid, file_id=f, folder_id=fid, rel_path="a.txt",
+                       page_start=None, text=body)
+        _assemble_context([bm25_hit], db, augment=True)
+        assert bm25_hit.text == f"{ctx}\n\n{body}"
+
+
+class TestRequireCitationsEnforced:
+    """OCR #21: uncited answers must be refused when require_citations=true."""
+
+    def _cfg(self, tmp_path):
+        return _make_cfg(tmp_path)
+
+    def _hits(self):
+        from rag.retrieval import Hit
+
+        return [Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="d.txt",
+                    page_start=None, text="some grounded text")]
+
+    def test_uncited_answer_refused(self, tmp_path):
+        from rag.generation import REFUSAL_TEXT, generate_answer
+
+        cfg = self._cfg(tmp_path)
+        assert cfg.generation_runtime.require_citations is True
+        with patch("rag.generation.ollama.Client") as mc:
+            mc.return_value.chat.return_value = {
+                "message": {"content": "An answer from parametric knowledge."}
+            }
+            result = generate_answer("q", self._hits(), cfg)
+        assert result["refused"] is True
+        assert result["answer"] == REFUSAL_TEXT
+        assert result["citations"] == []
+
+    def test_cited_answer_passes(self, tmp_path):
+        from rag.generation import generate_answer
+
+        cfg = self._cfg(tmp_path)
+        with patch("rag.generation.ollama.Client") as mc:
+            mc.return_value.chat.return_value = {"message": {"content": "Grounded [1]."}}
+            result = generate_answer("q", self._hits(), cfg)
+        assert result["refused"] is False
+        assert len(result["citations"]) == 1
+
+    def test_flag_disabled_allows_uncited(self, tmp_path):
+        from rag.generation import generate_answer
+
+        cfg = self._cfg(tmp_path)
+        cfg.generation_runtime.require_citations = False
+        with patch("rag.generation.ollama.Client") as mc:
+            mc.return_value.chat.return_value = {"message": {"content": "Uncited."}}
+            result = generate_answer("q", self._hits(), cfg)
+        assert result["refused"] is False
+        assert result["answer"] == "Uncited."

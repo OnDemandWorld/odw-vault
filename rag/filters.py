@@ -63,7 +63,13 @@ def resolve_folder_filter(db: sqlite_utils.Database, folder_filter: dict) -> set
         allowed_ids.update(r["id"] for r in rows)
 
     # Compose the workspace constraint (intersection) with the union above.
+    # OCR audit #12: when path/folder/category keys were supplied but matched
+    # nothing, the result must stay empty (callers treat None/empty as "no
+    # matches") — never broaden to the whole workspace.
     if workspace_ids is not None:
-        allowed_ids = (allowed_ids & workspace_ids) if allowed_ids else workspace_ids
+        other_keys = any(
+            k in folder_filter for k in ("path_prefix", "folder_id", "inferred_category")
+        )
+        allowed_ids = (allowed_ids & workspace_ids) if other_keys else workspace_ids
 
     return allowed_ids if allowed_ids else None

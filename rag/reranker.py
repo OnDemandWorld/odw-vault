@@ -121,19 +121,17 @@ def _score_batch(
         )
         embeddings = response.get("embeddings", [])
 
-        if embeddings and len(embeddings) == len(documents):
-            # For cross-encoder rerankers, the embedding output is
-            # typically a single scalar score per document.
-            # Extract the first dimension as the relevance score.
-            scores: list[float] = []
-            for emb in embeddings:
-                if isinstance(emb, list) and len(emb) > 0:
-                    # Sigmoid normalization for single-value output
-                    raw = emb[0] if len(emb) == 1 else sum(emb) / len(emb)
-                    scores.append(_sigmoid(raw))
-                else:
-                    scores.append(0.0)
-
+        # OCR audit #10: only a genuine scalar reranker output (exactly one
+        # dimension per document) is a relevance score. Multi-dimensional
+        # embeddings are NOT scores — averaging their dimensions yields a
+        # query-independent ~0.5 ranking. Fall through to query-dependent
+        # generation scoring in that case.
+        if (
+            embeddings
+            and len(embeddings) == len(documents)
+            and all(isinstance(e, list) and len(e) == 1 for e in embeddings)
+        ):
+            scores = [_sigmoid(emb[0]) for emb in embeddings]
             elapsed = (time.monotonic() - t0) * 1000
             logger.debug("Reranker batch scored in %.1fms", elapsed)
             return scores

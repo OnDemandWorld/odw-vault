@@ -124,6 +124,18 @@ def generate_answer(
     # 8. Resolve citations to hit metadata
     citations = resolve_citations(citation_numbers, hits)
 
+    # OCR audit #21: enforce the citation-strict contract. With context
+    # available but zero resolvable citations, the answer is ungrounded —
+    # refuse instead of returning it as a confident success.
+    refused = False
+    if (
+        getattr(cfg.generation_runtime, "require_citations", False)
+        and hits
+        and not citations
+    ):
+        answer_text = REFUSAL_TEXT
+        refused = True
+
     elapsed = (time.monotonic() - t0) * 1000
 
     return {
@@ -131,7 +143,7 @@ def generate_answer(
         "citations": citations,
         "generation_ms": round(elapsed, 1),
         "model": model_name,
-        "refused": False,
+        "refused": refused,
     }
 
 

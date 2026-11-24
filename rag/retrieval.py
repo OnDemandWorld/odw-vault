@@ -202,9 +202,11 @@ def _retrieve_with_client(
     # 6b. Path-matching BM25: find chunks from files whose path contains query tokens
     # This catches cases like "kwh" which appear in file paths but not chunk text
     path_hits = _path_match_retrieve(db, query, candidate_file_ids, excluded_ids, n_results=30)
-    # Merge path_hits into bm25_hits — path_hits go FIRST so they get high RRF rank
+    # OCR audit #11: path hits are a recall supplement, not relevance-ranked
+    # results — append AFTER genuine BM25 hits so cover/TOC chunks cannot
+    # occupy the top RRF ranks and push the actual answer out of top_k.
     bm25_chunk_ids = {h.chunk_id for h in bm25_hits}
-    bm25_hits = [ph for ph in path_hits if ph.chunk_id not in bm25_chunk_ids] + bm25_hits
+    bm25_hits = bm25_hits + [ph for ph in path_hits if ph.chunk_id not in bm25_chunk_ids]
 
     metrics["bm25_hits"] = len(bm25_hits)
 
@@ -857,7 +859,10 @@ def _assemble_context(hits: list[Hit], db, augment: bool = False) -> None:
             contexts = {r["id"]: r["context_text"] for r in rows}
             for h in hits:
                 ctx = contexts.get(h.chunk_id)
-                if ctx:
+                # OCR audit #13: dense hits already carry the context — the
+                # Chroma document is stored as context + chunk text. Prepending
+                # again would duplicate it in the generation prompt.
+                if ctx and not h.text.startswith(ctx):
                     h.text = f"{ctx}\n\n{h.text}"
         except Exception:
             pass  # best-effort augmentation
