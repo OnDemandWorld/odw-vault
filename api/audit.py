@@ -69,8 +69,18 @@ def _normalize_bound(raw: str, *, end: bool) -> str:
     """
     value = raw.strip()
     if len(value) == 10:
-        return f"{value} 23:59:59" if end else f"{value} 00:00:00"
-    return value.replace("T", " ", 1) if "T" in value else value
+        value = f"{value} 23:59:59" if end else f"{value} 00:00:00"
+    elif "T" in value:
+        value = value.replace("T", " ", 1)
+    # OCR audit #84: reject unparseable bounds — SQLite datetime() returns
+    # NULL for them, which silently produced an empty 200 result set.
+    from datetime import datetime
+
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"Invalid time bound: {raw!r}") from None
+    return value
 
 
 def query_audit_records(

@@ -1195,7 +1195,9 @@
     "root_cause": "The refuse branch hardcodes metrics.total_ms to retrieval_ms (which can be None) instead of the actual elapsed time, and its done payload lacks the conversation_id field the normal done event includes (line 927).",
     "suggested_fix": "Use the measured elapsed milliseconds for total_ms and include conversation_id, matching the normal-path shape.",
     "failure_scenario": "/query/stream with a filter matching nothing and refuse_on_empty_context=true: done has total_ms:null and no conversation_id — the chat panel cannot attach the refusal to the conversation and latency displays break.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: refusal done event carries measured total_ms (int) and conversation_id, matching the normal shape. Test: SSE done-payload assertions PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 857 passed, 0 failed, exit 0"
   },
   {
     "id": 81,
@@ -1208,7 +1210,9 @@
     "root_cause": "_query_impl prechecks the generation host when it differs from the embedding host (449-458) and returns 503 before doing work. query_stream only checks cfg.ollama.host and Chroma; a dead generation endpoint is discovered inside event_generator after retrieval and conversation writes, yielding a generic SSE error with no query_log row.",
     "suggested_fix": "Factor the /query prechecks into a shared helper and call it from both handlers.",
     "failure_scenario": "Cloud generation endpoint unreachable but local Ollama up: /query returns a clean 503 while /query/stream performs full retrieval, saves a dangling user message, then emits 'Internal error while generating the answer'.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: _precheck_generation_endpoint shared by /query and /query/stream — dead generation endpoint returns 503 before retrieval/conversation writes. Test: 503 + retrieve-not-called PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 857 passed, 0 failed, exit 0"
   },
   {
     "id": 82,
@@ -1221,7 +1225,9 @@
     "root_cause": "Every POST /eval/run adds an entry to the process-global _eval_runs dict that is never pruned; the 409 guard rejects new runs while any entry is 'running'. A hung or silently-dead daemon thread leaves the entry 'running' forever. Related: #9.",
     "suggested_fix": "Cap/evict finished entries (keep last N) and record started_at so a 'running' entry older than a configurable maximum is treated as stale and superseded.",
     "failure_scenario": "Long-lived server accumulates hundreds of full result dicts in memory; after one run wedges, every subsequent POST /eval/run returns 409 until restart.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: running entries older than 1h treated as stale (no permanent 409); finished entries pruned to last 50. Tests: stale-unblock + pruning PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 857 passed, 0 failed, exit 0"
   },
   {
     "id": 83,
@@ -1234,7 +1240,9 @@
     "root_cause": "_run_eval_background stores traceback.format_exc()[-2000:] in _eval_runs and GET /eval/run/{run_id} returns it verbatim. With default no-auth deployment, any caller can read internal file paths, library versions, and code structure.",
     "suggested_fix": "Log the traceback server-side and return only a generic error message (or gate the trace field behind active VAULT_API_KEY).",
     "failure_scenario": "An eval run fails on a missing model file; unauthenticated GET /eval/run/{id} returns the last 2000 chars of the traceback, disclosing absolute server paths and module layout.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: eval traceback logged server-side; status response carries only the error message. Test: no 'trace' key PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 857 passed, 0 failed, exit 0"
   },
   {
     "id": 84,
@@ -1247,7 +1255,9 @@
     "root_cause": "Bounds are normalized with SQLite datetime(?), which returns NULL for unparseable strings; ts >= NULL / ts <= NULL is never true, so the query returns zero rows with a 200 instead of signaling a bad filter. Related: #37.",
     "suggested_fix": "Validate/normalize bounds in Python (as _normalize_date_bound does) and raise 422 on unparseable values.",
     "failure_scenario": "GET /audit/export?start=01/01/2026 (US-style date) returns an empty compliance report with status 200; the caller believes there was no activity rather than seeing a filter error.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: _normalize_bound validates via datetime.fromisoformat (ValueError); /audit/export maps it to 422. Test: US-style date -> 422 PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 857 passed, 0 failed, exit 0"
   },
   {
     "id": 85,

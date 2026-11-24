@@ -2346,3 +2346,171 @@ class TestLowPhaseFixes:
         kwargs = mock_ocr.call_args.kwargs
         assert kwargs.get("force_ocr") is True
         assert "force_perform" not in kwargs
+
+
+class TestLowApiFixes:
+    """OCR #80/#81/#82/#83/#84."""
+
+    def _stream_cfg(self, tmp_path):
+        cfg = MagicMock()
+        cfg.ollama.host = "http://localhost:11434"
+        cfg.chroma_root_path = str(tmp_path / "chroma")
+        cfg.models.embedding.collection_suffix = "test"
+        cfg.models.embedding.name = "test-embed"
+        cfg.models.generation.name = "test-gen"
+        cfg.models.generation.endpoint = None
+        cfg.models.reranker.enabled = False
+        cfg.models.contextual_retrieval.enabled = False
+        cfg.generation_runtime.refuse_on_empty_context = True
+        return cfg
+
+    def _stream_db(self, tmp_path):
+        import sqlite3
+
+        import sqlite_utils
+
+        conn = sqlite3.connect(str(tmp_path / "s.db"), check_same_thread=False)
+        db = sqlite_utils.Database(conn)
+        migrate(db)
+        return db, conn
+
+    def test_refusal_done_has_real_total_ms_and_conversation(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from api.main import app
+
+        db, conn = self._stream_db(tmp_path)
+        cfg = self._stream_cfg(tmp_path)
+        with (
+            patch("api.main._load_config", return_value=cfg),
+            patch("api.main._get_db", return_value=db),
+            patch("api.main.chromadb.PersistentClient") as mc,
+            patch("api.main.ollama.Client") as mo,
+            patch("api.main.retrieve", return_value=([], {"retrieval_ms": 1.0, "query_lang": "en"})),
+            patch("rag.generation._make_client") as mk,
+        ):
+            from unittest.mock import AsyncMock
+
+            mk.return_value.close = AsyncMock()
+            mc.return_value.get_collection.return_value = MagicMock()
+            mo.return_value.list.return_value = {"models": []}
+            r = TestClient(app).post("/query/stream", json={"query": "q"})
+        assert r.status_code == 200
+        done = None
+        for block in r.text.split("\r\n\r\n"):
+            if block.startswith("event: done"):
+                done = json.loads(block.split("data: ", 1)[1])
+        assert done is not None
+        assert isinstance(done["metrics"]["total_ms"], int)
+        assert done.get("conversation_id")
+        conn.close()
+
+    def test_stream_prechecks_generation_endpoint(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from api.main import app
+
+        db, conn = self._stream_db(tmp_path)
+        cfg = self._stream_cfg(tmp_path)
+        cfg.models.generation.endpoint = MagicMock()
+        cfg.models.generation.endpoint.host = "http://dead-generation:11434"
+
+        good = MagicMock()
+        good.list.return_value = {"models": []}
+        bad = MagicMock()
+        bad.list.side_effect = Exception("unreachable")
+        bad.__enter__ = MagicMock(return_value=bad)
+        bad.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch("api.main._load_config", return_value=cfg),
+            patch("api.main._get_db", return_value=db),
+            patch("api.main.ollama.Client", side_effect=[good, bad]),
+            patch("api.main.retrieve") as mock_retrieve,
+        ):
+            r = TestClient(app).post("/query/stream", json={"query": "q"})
+        assert r.status_code == 503
+        assert "Generation" in r.json()["detail"]
+        mock_retrieve.assert_not_called()
+        conn.close()
+
+    def test_stale_running_eval_does_not_block(self, tmp_path):
+        import time
+
+        from fastapi.testclient import TestClient
+
+        import api.main as api_main
+        from api.main import app
+
+        db, conn = self._stream_db(tmp_path)
+        api_main._eval_runs.clear()
+        api_main._eval_runs["wedged"] = {
+            "status": "running", "started_at": time.monotonic() - 7200,
+        }
+        with (
+            patch("api.main._get_db", return_value=db),
+            patch("api.main._run_eval_background"),
+        ):
+            r = TestClient(app).post("/eval/run")
+        assert r.status_code == 200
+        api_main._eval_runs.clear()
+        conn.close()
+
+    def test_finished_eval_runs_pruned(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        import api.main as api_main
+        from api.main import app
+
+        db, conn = self._stream_db(tmp_path)
+        api_main._eval_runs.clear()
+        for i in range(60):
+            api_main._eval_runs[f"old-{i}"] = {"status": "done", "result": {}}
+        with (
+            patch("api.main._get_db", return_value=db),
+            patch("api.main._run_eval_background"),
+        ):
+            r = TestClient(app).post("/eval/run")
+        assert r.status_code == 200
+        assert len(api_main._eval_runs) <= 51
+        api_main._eval_runs.clear()
+        conn.close()
+
+    def test_eval_error_has_no_traceback(self, tmp_path):
+        import time
+
+        from fastapi.testclient import TestClient
+
+        import api.main as api_main
+        from api.main import app
+
+        db, conn = self._stream_db(tmp_path)
+        api_main._eval_runs.clear()
+        with (
+            patch("api.main._get_db", return_value=db),
+            patch("api.main._load_config"),
+            patch("eval.runner.run_eval", side_effect=RuntimeError("boom")),
+        ):
+            client = TestClient(app)
+            r = client.post("/eval/run")
+            run_id = r.json()["run_id"]
+            deadline = time.monotonic() + 5
+            while api_main._eval_runs.get(run_id, {}).get("status") == "running":
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            status = client.get(f"/eval/run/{run_id}").json()
+        assert status["status"] == "error"
+        assert "trace" not in status
+        api_main._eval_runs.clear()
+        conn.close()
+
+    def test_audit_export_bad_bounds_422(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from api.main import app
+
+        db, conn = self._stream_db(tmp_path)
+        with patch("api.main._get_db", return_value=db):
+            r = TestClient(app).get("/audit/export", params={"start": "01/01/2026"})
+        assert r.status_code == 422
+        conn.close()

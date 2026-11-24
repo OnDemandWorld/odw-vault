@@ -453,16 +453,7 @@ def _query_impl(req: QueryRequest):
     # V-8: precheck the GENERATION endpoint too — it can differ from the
     # embedding host (cloud Ollama default in config.example.toml); a dead
     # generation endpoint previously surfaced as a raw 500 after retries.
-    gen_host = getattr(cfg.models.generation.endpoint, "host", None)
-    if gen_host and gen_host != cfg.ollama.host:
-        try:
-            with ollama.Client(host=gen_host, timeout=10) as _c:
-                _c.list()
-        except Exception:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Generation model endpoint ({gen_host}) is not reachable",
-            ) from None
+    _precheck_generation_endpoint(cfg)
 
     # Check Chroma collection
     suffix = cfg.models.embedding.collection_suffix
@@ -669,6 +660,23 @@ def _query_impl(req: QueryRequest):
 # ---------------------------------------------------------------------------
 
 
+def _precheck_generation_endpoint(cfg) -> None:
+    """503 early when the generation endpoint differs from the embedding
+    host and is unreachable (V-8). OCR audit #81: shared by /query AND
+    /query/stream — the stream path used to discover dead endpoints only
+    mid-stream, after retrieval and conversation writes."""
+    gen_host = getattr(cfg.models.generation.endpoint, "host", None)
+    if gen_host and gen_host != cfg.ollama.host:
+        try:
+            with ollama.Client(host=gen_host, timeout=10) as _c:
+                _c.list()
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Generation model endpoint ({gen_host}) is not reachable",
+            ) from None
+
+
 @app.post("/query/stream")
 def query_stream(req: QueryRequest):
     cfg = _load_config()
@@ -680,6 +688,9 @@ def query_stream(req: QueryRequest):
             _c.list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
+
+    # OCR audit #81: same generation-endpoint precheck as /query.
+    _precheck_generation_endpoint(cfg)
 
     # Check Chroma
     suffix = cfg.models.embedding.collection_suffix
@@ -852,10 +863,13 @@ def query_stream(req: QueryRequest):
                 # OCR audit #33: persist on a worker thread like the normal
                 # path — a direct sqlite commit here blocks the event loop
                 # (up to busy_timeout) and freezes all concurrent streams.
+                # OCR audit #80: report the real elapsed time and attach the
+                # conversation, matching the normal done-event shape.
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
                 query_log_id = await run_in_threadpool(
                     _persist_stream_query,
                     REFUSAL_TEXT,
-                    int((time.monotonic() - t0) * 1000),
+                    elapsed_ms,
                     0,
                 )
                 yield ServerSentEvent(event="citations", data=json.dumps([]))
@@ -864,8 +878,9 @@ def query_stream(req: QueryRequest):
                     data=json.dumps(
                         {
                             "query_log_id": query_log_id,
-                            "metrics": {"retrieval_ms": retrieval_ms, "generation_ms": 0.0, "total_ms": retrieval_ms},
+                            "metrics": {"retrieval_ms": retrieval_ms, "generation_ms": 0.0, "total_ms": elapsed_ms},
                             "refused": True,
+                            "conversation_id": conversation_id,
                         }
                     ),
                 )
@@ -1176,6 +1191,10 @@ def list_models():
 # runs in-process and expose status for polling.
 _eval_runs: dict[str, dict] = {}
 _eval_lock = threading.Lock()
+# OCR audit #82: a wedged worker must not block eval forever, and finished
+# result dicts must not accumulate without bound on a long-lived server.
+_EVAL_RUN_TTL_SECONDS = 3600
+_EVAL_KEEP_FINISHED = 50
 
 
 def _run_eval_background(run_id: str) -> None:
@@ -1196,8 +1215,11 @@ def _run_eval_background(run_id: str) -> None:
                 "error": "evaluation module unavailable",
             }
     except Exception as exc:  # noqa: BLE001
+        # OCR audit #83: tracebacks go to the server log, not to
+        # unauthenticated callers (paths/library layout disclosure).
+        logger.error("Eval run %s failed:\n%s", run_id, traceback.format_exc())
         with _eval_lock:
-            _eval_runs[run_id] = {"status": "error", "error": f"{exc}", "trace": traceback.format_exc()[-2000:]}
+            _eval_runs[run_id] = {"status": "error", "error": f"{exc}"}
 
 
 @app.post("/eval/run")
@@ -1206,9 +1228,18 @@ def run_eval():
 
     run_id = str(_uuid.uuid4())
     with _eval_lock:
-        if any(r["status"] == "running" for r in _eval_runs.values()):
+        now = time.monotonic()
+        if any(
+            r["status"] == "running"
+            and now - r.get("started_at", now) < _EVAL_RUN_TTL_SECONDS
+            for r in _eval_runs.values()
+        ):
             raise HTTPException(status_code=409, detail="An eval run is already in progress")
-        _eval_runs[run_id] = {"status": "running"}
+        # Prune oldest finished entries (insertion-ordered dict).
+        finished = [rid for rid, r in _eval_runs.items() if r["status"] != "running"]
+        for rid in finished[:-_EVAL_KEEP_FINISHED] if len(finished) > _EVAL_KEEP_FINISHED else []:
+            del _eval_runs[rid]
+        _eval_runs[run_id] = {"status": "running", "started_at": now}
     threading.Thread(target=_run_eval_background, args=(run_id,), daemon=True).start()
     return {"run_id": run_id, "status": "running"}
 
@@ -1977,9 +2008,13 @@ def export_audit(
         raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
 
     db = _get_db()
-    rows = query_audit_records(
-        db, start=start, end=end, actor=actor, action=action, limit=limit
-    )
+    try:
+        rows = query_audit_records(
+            db, start=start, end=end, actor=actor, action=action, limit=limit
+        )
+    except ValueError as exc:
+        # OCR audit #84: bad time bounds are a client error, not an empty report.
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     filters = {
         "start": start,
         "end": end,
