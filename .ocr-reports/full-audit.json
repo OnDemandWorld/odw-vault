@@ -205,7 +205,9 @@
     "root_cause": "reembed=True deletes embedding_ref rows and upserts only chunks passing is_dup_primary=1 AND excluded=0, but never deletes Chroma ids for chunks that no longer pass the filter. run_embed_gc only drops whole collections; dense retrieval has no excluded/dup metadata filter, so stale vectors remain retrievable.",
     "suggested_fix": "On reembed, compute the eligible external-id set and batch-delete collection ids not in it; or store excluded/is_dup_primary in metadata and filter at query time. Related: #1, #15.",
     "failure_scenario": "File embedded, later marked dup-secondary or excluded, then `vault embed --reembed`: the old vector stays in the collection and queries keep returning duplicate/excluded content via dense retrieval.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: reembed deletes Chroma vectors whose chunks are no longer eligible (batched), incl. the all-ineligible early-return path. Tests: TestReembedStaleVectorGC (2) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 838 passed, 0 failed, exit 0"
   },
   {
     "id": 15,
@@ -218,7 +220,9 @@
     "root_cause": "DELETE FROM chunk cascades to embedding_ref (db.py:271), removing SQLite references, but nothing deletes the corresponding c_<chunk_id> vectors from Chroma. New chunks get fresh AUTOINCREMENT ids, so old vectors are never overwritten.",
     "suggested_fix": "On rechunk, delete the affected Chroma ids in the same operation (or collect them for phase-11 cleanup), or enforce a mandatory reembed after rechunk. Related: #14.",
     "failure_scenario": "`vault chunk --rechunk` without reembed: dense retrieval returns stale vectors whose JOIN back to chunk finds no row — results silently shrink and the collection accumulates orphans indefinitely.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: rechunk deletes the old chunks' Chroma vectors (via embedding_ref join, best-effort) before the cascade DELETE. Test: TestRechunkVectorCleanup PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 838 passed, 0 failed, exit 0"
   },
   {
     "id": 16,
@@ -921,7 +925,9 @@
     "root_cause": "The probe's _touch() returns exactly 'ok' or 'cross-thread', and line 187 asserts results == ['cross-thread'] or results == ['ok'] — accepting both possible outcomes. The test cannot detect a connection created on the wrong thread.",
     "suggested_fix": "Assert results == ['cross-thread'] only, or drop this test since test_worker_builds_own_connection_from_factory already verifies thread affinity.",
     "failure_scenario": "If CorpusWatcher started handing the caller's connection to the worker, or used check_same_thread=False on the main thread, this regression test still passes and the cross-thread SQLite crash resurfaces undetected.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: assertion tightened to results == ['cross-thread'] (factory connection uses check_same_thread=True; off-thread access must fail). tests/test_review_round4_fixes.py PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 838 passed, 0 failed, exit 0"
   },
   {
     "id": 63,
@@ -934,7 +940,9 @@
     "root_cause": "Both tests use a fresh test_db with no folder rows (run_phase1 never called). run_phase5 returns files_processed=0 on an empty folder query, so mock_ollama is never invoked. Assertions >= 0 and <= 1 are satisfied by zero work.",
     "suggested_fix": "Insert folder rows before run_phase5; assert files_processed == expected, inferred_category/inference_prompt_hash written, and mock_ollama.call_count; for max_folders seed >1 folders and assert exactly 1 inferred.",
     "failure_scenario": "A regression in the phase-5 success path (results never persisted, cache skipping everything, max_folders off-by-one) passes these unit tests; max_folders limiting is covered nowhere.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: test_inference_success/test_max_folders seed real folders WITH files and assert exact processed counts + mock call counts (2 and 1). PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 838 passed, 0 failed, exit 0"
   },
   {
     "id": 64,
@@ -947,7 +955,9 @@
     "root_cause": "TestHealthCache patches only _load_config. /health then constructs a real ollama.Client (HTTP to localhost:11434) and a real chromadb.PersistentClient(path='/tmp/nonexistent-chroma'), creating that directory outside tmp_path. The only assertion r1.json() == r2.json() holds whether or not the TTL cache exists; nothing asserts the probe ran once.",
     "suggested_fix": "Patch api.main.ollama.Client and chromadb.PersistentClient, point chroma_root_path at tmp_path, and assert the cache by call counts (one probe within TTL, two after expiry/reset).",
     "failure_scenario": "Deleting the _health_cache short-circuit leaves this test green while every run makes a real localhost HTTP request and creates /tmp/nonexistent-chroma — flaky where port 11434 is firewalled or /tmp restricted.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: health-cache test mocks ollama.Client/chroma.PersistentClient/_get_db (no real probes, no /tmp writes) and asserts cache by call counts (1 load/probe for 2 GETs). PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 838 passed, 0 failed, exit 0"
   },
   {
     "id": 65,
@@ -960,7 +970,9 @@
     "root_cause": "Line 196 asserts 'dry-run' not in result.output or result.exit_code in (0, 2). Neither the archives command nor run_phase0 ever prints the literal 'dry-run' in invoke output, so the first disjunct is always true. A crash (exit_code 1 with traceback) passes.",
     "suggested_fix": "Seed a real archive, invoke archives --dry-run, assert exit_code == 0, no archive_expansion rows, and no .extracted directory created.",
     "failure_scenario": "If the archives command raised for any input (e.g. config parsing regression), CliRunner returns exit_code 1 with a traceback and this test still passes.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: archives --dry-run test seeds a real zip + config and asserts exit 0, zero archive_expansion rows, no .extracted dir. PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 838 passed, 0 failed, exit 0"
   },
   {
     "id": 66,
@@ -973,7 +985,9 @@
     "root_cause": "test_idempotent asserts r2['files_processed'] >= 0 — a count can never be negative, so re-hashing every file on every walk passes. test_hash_failure likewise asserts >= 0, relies on chmod(0o000) (ineffective as root), and never checks the failure table. test_oversized_file only asserts conditionally (if big:).",
     "suggested_fix": "Assert r2['files_processed'] == 0 for the unchanged re-walk (the correct assertion exists in test_review_fixes_round2); for hash failure mock sha256_file and assert a failure row with phase='walk'.",
     "failure_scenario": "A regression making phase 1 re-hash the entire corpus on every run, or silently swallowing hash errors, leaves these tests green; the named behaviors are only covered by the round-2 regression file.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: walk idempotency asserts r2 processed == 0; hash-failure test forces (path,None,error) via inline executor and asserts a walk failure row. PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 838 passed, 0 failed, exit 0"
   },
   {
     "id": 67,
@@ -986,7 +1000,9 @@
     "root_cause": "test_query_passes_none_when_flag_absent reads cli.py as text and asserts the exact substring 'use_reranker=(False if no_rerank else None)' exists. It passes if the expression appears in dead code or a comment, and fails on any semantically identical refactor.",
     "suggested_fix": "Invoke the CLI query command via CliRunner with patched retrieve/generate seams and assert retrieve.call_args.kwargs['use_reranker'] is None without --no-rerank and False with it.",
     "failure_scenario": "Reformatting the call across two lines fails the test despite correct behavior; moving the expression behind an always-false branch passes it while the CLI always forces the reranker off.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: CLI reranker-default tests invoke the real query command via CliRunner with patched retrieve/generate; assert use_reranker None without flag, False with --no-rerank. PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 838 passed, 0 failed, exit 0"
   },
   {
     "id": 68,

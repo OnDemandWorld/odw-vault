@@ -17,7 +17,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -184,7 +184,10 @@ class TestWatcherThreadAffinity:
             # A connection created inside the worker is usable from another
             # thread ONLY if check_same_thread is disabled; the default here
             # means accessing off-thread must fail, proving creation thread.
-            assert results == ["cross-thread"] or results == ["ok"]
+            # OCR audit #62: the factory connection uses the default
+            # check_same_thread=True — off-thread access MUST fail.
+            # (The old disjunction accepted both outcomes: always true.)
+            assert results == ["cross-thread"]
         finally:
             watcher.stop()
 
@@ -362,6 +365,40 @@ class TestBm25Batching:
 
 
 class TestCliRerankerDefault:
-    def test_query_passes_none_when_flag_absent(self):
-        src = (Path(__file__).resolve().parent.parent / "cli.py").read_text()
-        assert "use_reranker=(False if no_rerank else None)" in src
+    """OCR audit #67: invoke the real CLI query command (the old test grepped
+    cli.py source text — it passed for dead code and failed on refactors)."""
+
+    def _invoke(self, tmp_path, monkeypatch, extra):
+        import tomllib
+
+        import cli
+        import tomli_w
+        from click.testing import CliRunner
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        example = tomllib.loads(
+            (Path(__file__).resolve().parent.parent / "config.example.toml").read_text()
+        )
+        example["paths"]["corpus_root"] = str(corpus)
+        example["paths"]["cache_root"] = str(corpus / ".rag-cache")
+        example["paths"]["chroma_root"] = str(tmp_path / "chroma")
+        (tmp_path / "config.toml").write_text(tomli_w.dumps(example), encoding="utf-8")
+        monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+
+        with (
+            patch("chromadb.PersistentClient"),
+            patch("rag.retrieval.retrieve", return_value=([], {})) as mock_retrieve,
+            patch("rag.generation.generate_answer", return_value={
+                "answer": "ok", "citations": [], "generation_ms": 1.0,
+            }),
+        ):
+            result = CliRunner().invoke(cli.main, ["query", "q", "--json", *extra])
+        assert result.exit_code == 0, result.output
+        return mock_retrieve.call_args.kwargs["use_reranker"]
+
+    def test_query_passes_none_when_flag_absent(self, tmp_path, monkeypatch):
+        assert self._invoke(tmp_path, monkeypatch, []) is None
+
+    def test_query_passes_false_with_no_rerank(self, tmp_path, monkeypatch):
+        assert self._invoke(tmp_path, monkeypatch, ["--no-rerank"]) is False

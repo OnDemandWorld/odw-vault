@@ -225,21 +225,46 @@ class TestPhase5Run:
             folder_meta=FolderMetaConfig(max_filenames_in_prompt=30),
         )
 
+    def _seed_folders(self, test_db, root, n):
+        """OCR audit #63: seed real folders WITH files (the old tests ran on
+        an empty DB — run_phase5 processed nothing and >=0 assertions were
+        vacuous)."""
+        ft = test_db["folder"]
+        for i in range(n):
+            ft.insert({
+                "path": str(root / f"f{i}"), "rel_path": f"f{i}",
+                "name": f"f{i}", "depth": 0,
+            })
+            test_db["file"].insert({
+                "folder_id": ft.last_rowid,
+                "path": str(root / f"f{i}" / "d.txt"),
+                "rel_path": f"f{i}/d.txt", "name": "d.txt",
+                "size_bytes": 10, "mtime": "2026-01-01T00:00:00Z", "excluded": 0,
+            })
+        test_db.conn.commit()
+
     def test_inference_success(self, test_db, test_corpus, mock_plog, mock_ollama):
         root, _ = test_corpus
         cfg = self._make_config(root)
-        result = run_phase5(test_db, cfg, mock_plog, max_folders=2)
-        assert result["files_processed"] >= 0
+        self._seed_folders(test_db, root, 2)
+        result = run_phase5(test_db, cfg, mock_plog)
+        assert result["files_processed"] == 2
+        assert mock_ollama.call_count == 2
+        inferred = test_db.execute(
+            "SELECT COUNT(*) FROM folder WHERE inferred_category IS NOT NULL"
+        ).fetchone()[0]
+        assert inferred == 2
 
     def test_max_folders(self, test_db, test_corpus, mock_plog, mock_ollama):
         root, _ = test_corpus
         cfg = self._make_config(root)
+        self._seed_folders(test_db, root, 3)
         result = run_phase5(test_db, cfg, mock_plog, max_folders=1)
-        # Should only process 1 folder
+        assert result["files_processed"] == 1
         folders_with_inference = test_db.execute(
             "SELECT COUNT(*) FROM folder WHERE inferred_category IS NOT NULL"
         ).fetchone()
-        assert folders_with_inference[0] <= 1
+        assert folders_with_inference[0] == 1
 
     def test_ollama_failure(self, test_db, test_corpus, mock_plog):
         root, _ = test_corpus
