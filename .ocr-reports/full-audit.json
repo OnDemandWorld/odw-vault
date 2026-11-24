@@ -231,7 +231,9 @@
     "root_cause": "chromadb's SharedSystemClient caches one System per persist_directory with a refcount (verified in installed chromadb). api/main.py:125-133 keeps a PersistentClient alive for the watcher's lifetime; retrieve()'s per-call client shares that cached System and close() only decrements the refcount — the System is never reloaded, defeating the round-10 per-query-reload fix whenever watcher.enabled=true.",
     "suggested_fix": "Do not keep a process-lifetime Chroma client in the API/watcher; open/close per sync operation, or invalidate/reopen the shared System after writes, or sync against a different chroma path and swap atomically.",
     "failure_scenario": "API runs with watcher enabled; operator runs `vault embed`/`vault sync` in a separate CLI process. API queries keep reading the stale in-memory System: new documents never appear in dense results and deleted ids can trigger 'Error finding id'.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: CorpusWatcher accepts chroma_factory; client opened per flush/startup-sync and closed after (System released between syncs). API lifespan passes a factory instead of a process-lifetime client. Test: TestWatcherFixes.test_factory_mode_opens_and_closes_client_per_flush PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 790 passed, 0 failed, exit 0 (watchdog installed -> formerly-skipped watcher suite now runs)"
   },
   {
     "id": 17,
@@ -244,7 +246,9 @@
     "root_cause": "_handle_delete looks up file WHERE path = ? using the raw watchdog event path built from str(cfg.corpus_root_path), which is not resolved (config.py:273-274). IncrementalIndexer.sync_file stores resolved absolute paths (indexer.py:205). On macOS /var->/private/var, symlinked roots, or relative corpus_root, the spellings differ and the lookup finds nothing. on_moved's delete(src) half (line 63) has the same defect.",
     "suggested_fix": "Resolve event paths (Path(path).resolve()) before enqueueing or before the delete lookup, mirroring sync_file's canonicalization.",
     "failure_scenario": "corpus_root='./data/corpus' with watcher enabled: deleting a file enqueues 'data/corpus/f.pdf' while the DB holds the absolute path; the deleted file's chunks and vectors remain searchable forever.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: _enqueue canonicalizes event paths via Path.resolve() matching sync_file storage. Test: symlink-root delete lookup PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 790 passed, 0 failed, exit 0 (watchdog installed -> formerly-skipped watcher suite now runs)"
   },
   {
     "id": 18,
@@ -257,7 +261,9 @@
     "root_cause": "stop() joins the worker with timeout=10s then unconditionally closes self._chroma_client. A sync_file flush (hash+extract+summarize+embed) can exceed 10s; the running worker's indexer holds the now-closed client, and the final force-drain (line 250) runs after stop() proceeds. The closed client may be one the API created and shared.",
     "suggested_fix": "Signal stop, wait for the worker to actually finish (or check _stop_event between items), close the Chroma client only after worker exit, and never close a client the watcher does not own.",
     "failure_scenario": "API shutdown mid-embedding of a large file: join times out, client closed, worker's next coll.add raises; the file is left partially embedded (vectors without embedding_ref rows or vice versa), failure only logged.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: stop() checks worker.is_alive() after join timeout; never closes the Chroma client mid-flush. Tests: 2 stop-ordering tests PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 790 passed, 0 failed, exit 0 (watchdog installed -> formerly-skipped watcher suite now runs)"
   },
   {
     "id": 19,
@@ -270,7 +276,9 @@
     "root_cause": "The chunk query selects c.id, c.text, c.context_text, c.file_id, f.folder_id, f.rel_path, f.category — no c.start_page. The guard at line 854 (`if ch.get(\"start_page\") is not None`) is always false, so the V-3 page-citation metadata fix applied by phase11_embed.py is silently absent for every file indexed through IncrementalIndexer (uploads, watcher, sync).",
     "suggested_fix": "Add c.start_page to the SELECT list in _run_embedding.",
     "failure_scenario": "A PDF uploaded via the API gets Chroma vectors with no start_page; any consumer reading dense-hit metadata sees page_start=None and citations rely entirely on the fallback backfill query.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: c.start_page added to _run_embedding SELECT; metadata guard now fires. Test: TestIndexerPageMetadataAndDedup.test_embedding_metadata_includes_start_page PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 790 passed, 0 failed, exit 0 (watchdog installed -> formerly-skipped watcher suite now runs)"
   },
   {
     "id": 20,
@@ -283,7 +291,9 @@
     "root_cause": "sync_file inserts every new file with is_dup_primary=1 without checking for an existing row with the same sha256 and never invokes dedup logic. _run_embedding embeds all its chunks (no is_dup_primary/excluded filter, unlike phase 11). The API upload path (api/main.py:1495) does the same.",
     "suggested_fix": "On insert, look up an existing file with the same sha256; if found mark the new row is_dup_primary=0 with the same dup_group_id (or skip embedding non-primary files in _run_embedding).",
     "failure_scenario": "The same PDF uploaded twice under different names: both rows primary, both fully chunked+embedded; retrieval fills top_k slots with byte-identical chunks from two paths, halving effective result diversity.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: sync_file twin-check (same sha256 primary) marks new/updated copies dup-secondary in BOTH insert and update branches (covers API uploads hashed at sync); _run_embedding filters is_dup_primary=1 AND excluded=0. Tests: 2 dedup tests PASS; test_indexer/test_upload_sync PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 790 passed, 0 failed, exit 0 (watchdog installed -> formerly-skipped watcher suite now runs)"
   },
   {
     "id": 21,

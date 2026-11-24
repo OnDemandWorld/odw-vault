@@ -934,3 +934,181 @@ class TestRequireCitationsEnforced:
             result = generate_answer("q", self._hits(), cfg)
         assert result["refused"] is False
         assert result["answer"] == "Uncited."
+
+
+class TestWatcherFixes:
+    """OCR #16/#17/#18: per-flush Chroma client, canonical paths, safe stop."""
+
+    def _cfg(self, tmp_path, corpus):
+        from tests.test_watcher import _make_app_config
+
+        cache = corpus / ".rag-cache"
+        cache.mkdir(exist_ok=True)
+        chroma = tmp_path / "chroma"
+        chroma.mkdir(exist_ok=True)
+        return _make_app_config(corpus, cache, chroma, debounce_seconds=0.0)
+
+    def test_factory_mode_opens_and_closes_client_per_flush(self, tmp_path):
+        from rag.watcher import CorpusWatcher
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        cfg = self._cfg(tmp_path, corpus)
+        db = _seed_db(tmp_path)
+        client = MagicMock()
+        factory = MagicMock(return_value=client)
+
+        w = CorpusWatcher(cfg, db, None, chroma_factory=factory)
+        with patch.object(w._indexer, "sync_file") as mock_sync:
+            w._enqueue(str(corpus / "a.txt"), "sync")
+            w._flush_ready(force=True)
+
+        factory.assert_called_once()
+        client.close.assert_called_once()
+        assert w._indexer.chroma_client is None
+        mock_sync.assert_called_once()
+
+    def test_delete_lookup_matches_resolved_path_via_symlink_root(self, tmp_path):
+        from rag.watcher import CorpusWatcher
+
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        f = real / "gone.txt"
+        f.write_text("x", encoding="utf-8")
+
+        cfg = self._cfg(tmp_path, link)
+        db = _seed_db(tmp_path)
+        fid = seed_test_files(
+            db, files=[{"name": "gone.txt", "path": str(f.resolve()), "rel_path": "gone.txt"}]
+        )[0]
+
+        w = CorpusWatcher(cfg, db, MagicMock())
+        with patch.object(w._indexer, "remove_file") as mock_remove:
+            # Event arrives with the symlinked spelling; DB stores resolved.
+            w._enqueue(str(link / "gone.txt"), "delete")
+            w._flush_ready(force=True)
+
+        mock_remove.assert_called_once_with(fid)
+
+    def test_stop_does_not_close_client_while_worker_alive(self, tmp_path):
+        from rag.watcher import CorpusWatcher
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        cfg = self._cfg(tmp_path, corpus)
+        client = MagicMock()
+        w = CorpusWatcher(cfg, _seed_db(tmp_path), client)
+        w._worker = MagicMock()
+        w._worker.is_alive.return_value = True
+
+        w.stop()
+
+        client.close.assert_not_called()
+
+    def test_stop_closes_client_when_worker_finished(self, tmp_path):
+        from rag.watcher import CorpusWatcher
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        cfg = self._cfg(tmp_path, corpus)
+        client = MagicMock()
+        w = CorpusWatcher(cfg, _seed_db(tmp_path), client)
+        w._worker = MagicMock()
+        w._worker.is_alive.return_value = False
+
+        w.stop()
+
+        client.close.assert_called_once()
+
+
+class TestIndexerPageMetadataAndDedup:
+    """OCR #19/#20: start_page metadata and duplicate-content handling."""
+
+    def _env(self, tmp_path):
+        from tests.test_indexer import _make_app_config, _make_db
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        cache = corpus / ".rag-cache"
+        cache.mkdir()
+        chroma = tmp_path / "chroma"
+        chroma.mkdir()
+        return corpus, _make_app_config(corpus, cache, chroma), _make_db(tmp_path)
+
+    def test_embedding_metadata_includes_start_page(self, tmp_path):
+        from rag.indexer import IncrementalIndexer
+        from tests.test_indexer import _make_chroma_mock
+
+        corpus, cfg, db = self._env(tmp_path)
+        f = corpus / "doc.pdf"
+        f.write_bytes(b"%PDF fake")
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        fid = seed_test_files(
+            db, files=[{"name": "doc.pdf", "path": str(f.resolve()), "folder_id": 1}]
+        )[0]
+        ct = db["chunk"]
+        ct.insert(
+            {"file_id": fid, "text": "page three content", "chunk_index": 0,
+             "start_page": 3, "token_count": 3, "metadata_json": "{}"}
+        )
+        db.conn.commit()
+
+        chroma_client, coll = _make_chroma_mock()
+        coll.metadata = {"embedding_model": "test-embed", "dim": 3}
+        indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+        with patch("rag.phase11_embed._ollama_embed", return_value=[[0.1, 0.2, 0.3]]):
+            indexer._run_embedding(fid)
+
+        assert coll.add.called
+        metadatas = coll.add.call_args.kwargs["metadatas"]
+        assert metadatas[0]["start_page"] == 3
+
+    def test_identical_content_marked_dup_secondary(self, tmp_path):
+        from rag.indexer import IncrementalIndexer
+        from tests.test_indexer import _make_chroma_mock
+
+        corpus, cfg, db = self._env(tmp_path)
+        (corpus / "a.txt").write_text("identical content here", encoding="utf-8")
+        (corpus / "b.txt").write_text("identical content here", encoding="utf-8")
+
+        chroma_client, _ = _make_chroma_mock()
+        indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+        with (
+            patch.object(IncrementalIndexer, "_run_extraction"),
+            patch.object(IncrementalIndexer, "_run_summarization"),
+            patch.object(IncrementalIndexer, "_run_chunking"),
+            patch.object(IncrementalIndexer, "_run_embedding"),
+        ):
+            r1 = indexer.sync_file(corpus / "a.txt")
+            r2 = indexer.sync_file(corpus / "b.txt")
+
+        assert r1["status"] == "success"
+        assert r2["status"] == "success"
+        assert db["file"].get(r1["file_id"])["is_dup_primary"] == 1
+        assert db["file"].get(r2["file_id"])["is_dup_primary"] == 0
+
+    def test_dup_secondary_chunks_not_embedded(self, tmp_path):
+        from rag.indexer import IncrementalIndexer
+        from tests.test_indexer import _make_chroma_mock
+
+        corpus, cfg, db = self._env(tmp_path)
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        fid = seed_test_files(
+            db, files=[{"name": "dup.txt", "folder_id": 1, "is_dup_primary": 0}]
+        )[0]
+        db["chunk"].insert(
+            {"file_id": fid, "text": "dup content", "chunk_index": 0,
+             "token_count": 2, "metadata_json": "{}"}
+        )
+        db.conn.commit()
+
+        chroma_client, coll = _make_chroma_mock()
+        indexer = IncrementalIndexer(db, cfg, chroma_client=chroma_client)
+        with patch("rag.phase11_embed._ollama_embed", return_value=[[0.1, 0.2, 0.3]]):
+            indexer._run_embedding(fid)
+
+        coll.add.assert_not_called()

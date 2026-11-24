@@ -122,13 +122,16 @@ async def _lifespan(application: FastAPI):
         if cfg.watcher.enabled:
             from rag.watcher import CorpusWatcher
 
-            chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
+            # OCR audit #16: no process-lifetime Chroma client — the watcher
+            # opens/closes one per flush so retrieval's per-query reload sees
+            # external sync writes (a pinned SharedSystem never reloads).
             _watcher = CorpusWatcher(
                 cfg,
                 _get_db(),
-                chroma_client,
+                None,
                 db_factory=_get_db,
                 startup_sync=cfg.watcher.startup_sync,
+                chroma_factory=lambda: chromadb.PersistentClient(path=str(cfg.chroma_root_path)),
             )
             _watcher.start()
             logger.info("Corpus watcher started via API server")

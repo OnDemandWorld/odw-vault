@@ -227,6 +227,24 @@ class IncrementalIndexer:
         pronom_id, mime_type, category, extract_strategy = _identify_format(file_path)
         stat = file_path.stat()
 
+        # OCR audit #20: identical content already indexed under another
+        # path — mark this copy dup-secondary so it is not double-embedded.
+        # Applies to both new inserts and updates (API uploads arrive with
+        # hash_status='pending' and are hashed here for the first time).
+        twin = next(
+            iter(
+                self.db.query(
+                    "SELECT id, dup_group_id FROM file "
+                    "WHERE sha256 = ? AND is_dup_primary = 1 AND excluded = 0 AND path != ? "
+                    "LIMIT 1",
+                    [new_hash, str(file_path)],
+                )
+            ),
+            None,
+        )
+        dup_primary = 0 if twin else 1
+        dup_group_id = twin["dup_group_id"] if twin else None
+
         if existing:
             file_id = existing["id"]
             # Clean up old derived data (Chroma + SQLite) before reprocessing
@@ -236,12 +254,14 @@ class IncrementalIndexer:
             self.db.execute(
                 """UPDATE file SET sha256=?, size_bytes=?, extension=?,
                        pronom_id=?, mime_type=?, category=?, extract_strategy=?,
-                       mtime=?, hash_status='done', identify_status='done'
+                       mtime=?, hash_status='done', identify_status='done',
+                       is_dup_primary=?, dup_group_id=?
                     WHERE id=?""",
                 [
                     new_hash, stat.st_size, file_path.suffix.lower(),
                     pronom_id, mime_type, category, extract_strategy,
                     mtime_iso,
+                    dup_primary, dup_group_id,
                     file_id,
                 ],
             )
@@ -263,7 +283,8 @@ class IncrementalIndexer:
                     "mime_type": mime_type,
                     "category": category,
                     "extract_strategy": extract_strategy,
-                    "is_dup_primary": 1,
+                    "is_dup_primary": dup_primary,
+                    "dup_group_id": dup_group_id,
                     "excluded": 0,
                     "hash_status": "done",
                     "identify_status": "done",
@@ -809,11 +830,12 @@ class IncrementalIndexer:
 
         chunks = list(
             self.db.query(
-                """SELECT c.id, c.text, c.context_text, c.file_id,
+                """SELECT c.id, c.text, c.context_text, c.file_id, c.start_page,
                           f.folder_id, f.rel_path, f.category
                    FROM chunk c
                    JOIN file f ON f.id = c.file_id
                    WHERE c.file_id = ?
+                     AND f.is_dup_primary = 1 AND f.excluded = 0
                      AND c.id NOT IN (
                          SELECT chunk_id FROM embedding_ref WHERE embedding_model = ?
                      )
