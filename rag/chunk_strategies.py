@@ -326,6 +326,19 @@ class ParagraphStrategy(ChunkStrategy):
                 rel.append((s, found))
                 search_from = found + len(s)
 
+            # OCR audit #74: a sentence-less paragraph yields one giant
+            # "sentence" — hard-split it so no chunk exceeds chunk_size
+            # (embedding truncates at 8192 chars; the tail would never be
+            # dense-retrievable).
+            sized: list[tuple[str, int]] = []
+            for s, s_start in rel:
+                if len(s) <= chunk_size:
+                    sized.append((s, s_start))
+                else:
+                    for off in range(0, len(s), chunk_size):
+                        sized.append((s[off : off + chunk_size], s_start + off))
+            rel = sized
+
             buf: list[tuple[str, int]] = []
             buf_len = 0
             for s, s_start in rel:

@@ -2256,3 +2256,93 @@ class TestLowRagCoreFixes:
             result = indexer.sync_file(f)
         assert result["status"] == "partial"
         assert "embeddings" in result["error"]
+
+
+class TestLowPhaseFixes:
+    """OCR #73/#74/#76/#77/#78."""
+
+    def test_on_moved_skips_ignored_destinations(self, tmp_path):
+        from types import SimpleNamespace
+
+        from rag.watcher import CorpusWatcher, _SyncHandler
+        from tests.test_watcher import _make_app_config
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        cache = corpus / ".rag-cache"
+        cache.mkdir()
+        chroma = tmp_path / "chroma"
+        chroma.mkdir()
+        cfg = _make_app_config(corpus, cache, chroma, debounce_seconds=0.0)
+        w = CorpusWatcher(cfg, _seed_db(tmp_path), MagicMock())
+        handler = _SyncHandler(w)
+
+        handler.on_moved(SimpleNamespace(
+            is_directory=False,
+            src_path=str(corpus / "a.txt"),
+            dest_path=str(cache / "a.txt"),
+        ))
+        actions = {p: a for p, (a, _t) in w._pending.items()}
+        assert str((corpus / "a.txt").resolve()) in actions  # delete(src) kept
+        assert not any(".rag-cache" in p for p in actions)   # sync(dest) skipped
+
+    def test_paragraph_hard_splits_sentenceless_blob(self):
+        from rag.chunk_strategies import ParagraphStrategy
+
+        blob = "x" * 40000  # no punctuation, no newlines
+        spans = ParagraphStrategy().chunk(blob, chunk_size=2000)
+        assert spans
+        assert max(len(s.text) for s in spans) <= 2000
+        assert sum(len(s.text) for s in spans) >= 40000 - 2000  # coverage preserved
+
+    def test_transcribe_folder_with_apostrophe_no_crash(self, tmp_path):
+        from rag.phase8b_transcribe import run_transcribe
+
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        result = run_transcribe(db, cfg, folder="O'Brien/2024")
+        assert result["files_processed"] == 0
+
+    def test_extract_strategy_with_apostrophe_no_crash(self, tmp_path):
+        from rag.phase8_extract import run_extract
+
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        result = run_extract(db, cfg, strategy="weird'strategy")
+        assert result["files_processed"] == 0
+
+    def test_summarize_sends_num_predict(self):
+        from rag.phase9_summarize import _call_ollama
+
+        with patch("rag.phase9_summarize.ollama.Client") as mc:
+            mc.return_value.chat.return_value = {"message": {"content": "summary"}}
+            mc.return_value.__enter__.return_value = mc.return_value
+            _call_ollama("p", "m", "http://x", 0.2, 400)
+        opts = mc.return_value.chat.call_args.kwargs["options"]
+        assert opts["num_predict"] == 400
+
+    def test_context_sends_num_predict(self):
+        from rag.phase10_5_context import _call_ollama_native
+
+        with patch("rag.phase10_5_context.ollama.Client") as mc:
+            mc.return_value.chat.return_value = {"message": {"content": "context"}}
+            mc.return_value.__enter__.return_value = mc.return_value
+            _call_ollama_native("p", "m", "http://x", 0.2, 150)
+        opts = mc.return_value.chat.call_args.kwargs["options"]
+        assert opts["num_predict"] == 150
+
+    def test_ocr_uses_real_force_ocr_flag(self, tmp_path):
+        from rag.extractors.ocr_extractor import extract_ocr
+
+        f = tmp_path / "scan.pdf"
+        f.write_bytes(b"%PDF fake")
+        with (
+            patch("ocrmypdf.ocr") as mock_ocr,
+            patch("rag.extractors.ocr_extractor.fitz.open") as mock_fitz,
+        ):
+            mock_fitz.return_value.page_count = 1
+            mock_fitz.return_value.__iter__ = lambda self: iter([])
+            extract_ocr(str(f))
+        kwargs = mock_ocr.call_args.kwargs
+        assert kwargs.get("force_ocr") is True
+        assert "force_perform" not in kwargs

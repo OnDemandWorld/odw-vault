@@ -61,8 +61,12 @@ class _SyncHandler(FileSystemEventHandler):
     def on_moved(self, event: FileSystemEvent) -> None:
         # Treat move as delete(src) + sync(dest)
         if not event.is_directory:
-            self._watcher._enqueue(event.src_path, "delete")
-            self._watcher._enqueue(event.dest_path, "sync")
+            # OCR audit #73: honor skip rules on both ends — a move into
+            # .rag-cache / hidden / ignored locations must not be indexed.
+            if not self._watcher._should_skip(str(event.src_path)):
+                self._watcher._enqueue(event.src_path, "delete")
+            if not self._watcher._should_skip(str(event.dest_path)):
+                self._watcher._enqueue(event.dest_path, "sync")
 
     def _handle(self, event: FileSystemEvent, action: str) -> None:
         if event.is_directory:

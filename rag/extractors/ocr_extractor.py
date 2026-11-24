@@ -34,7 +34,9 @@ def extract_ocr(
                 ocr_output,
                 language=language,
                 deskew=True,
-                force_perform=True,
+                # OCR audit #78: force_perform is not an ocrmypdf option
+                # (silently ignored); force_ocr is the real flag.
+                force_ocr=True,
                 progress_bar=False,
             )
 

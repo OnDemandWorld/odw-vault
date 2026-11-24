@@ -127,6 +127,8 @@ def _call_ollama_native(
             options={
                 "temperature": temperature,
                 "num_ctx": 16384,
+                # OCR audit #77: honor max_tokens (was accepted but never sent).
+                "num_predict": max_tokens,
             },
         )
     text = response.get("message", {}).get("content", "").strip()

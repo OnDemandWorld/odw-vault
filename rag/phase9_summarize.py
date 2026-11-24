@@ -52,6 +52,9 @@ def _call_ollama(prompt: str, model: str, host: str, temperature: float, max_tok
             options={
                 "temperature": temperature,
                 "num_ctx": 16384,
+                # OCR audit #77: honor max_tokens — the knob was accepted
+                # but never sent, so summaries grew unbounded.
+                "num_predict": max_tokens,
             },
         )
     text = response.get("message", {}).get("content", "").strip()

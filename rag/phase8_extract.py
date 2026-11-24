@@ -165,8 +165,13 @@ def run_extract(
         "extract_strategy NOT IN ('skip', 'manual', 'unsupported', 'whisper')",
     ]
 
+    # OCR audit #76: bind user-supplied filters instead of interpolating
+    # them into SQL (apostrophes crashed the query; crafted values could
+    # alter it).
+    params: list = []
     if strategy:
-        where_parts.append(f"extract_strategy='{strategy}'")
+        where_parts.append("extract_strategy = ?")
+        params.append(strategy)
 
     if not reextract:
         # Exclude files that already have an extraction row
@@ -178,7 +183,7 @@ def run_extract(
     if limit:
         query += f" LIMIT {limit}"
 
-    files = list(db.query(query))
+    files = list(db.query(query, params))
 
     if not files:
         msg = "No files eligible for extraction."

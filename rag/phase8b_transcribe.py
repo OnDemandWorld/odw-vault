@@ -166,8 +166,12 @@ def run_transcribe(
         "id NOT IN (SELECT file_id FROM extraction WHERE tool='whisper.cpp' AND succeeded=1)",
     ]
 
+    # OCR audit #76: bind the folder filter (an apostrophe in a folder name
+    # used to crash the query with an unterminated literal).
+    params: list = []
     if folder:
-        where_parts.append(f"rel_path LIKE '{folder}/%'")
+        where_parts.append("rel_path LIKE ?")
+        params.append(f"{folder}/%")
 
     where_clause = " AND ".join(where_parts)
 
@@ -175,7 +179,7 @@ def run_transcribe(
     if limit:
         query += f" LIMIT {limit}"
 
-    files = list(db.query(query))
+    files = list(db.query(query, params))
 
     if not files:
         msg = "No audio/video files eligible for transcription."

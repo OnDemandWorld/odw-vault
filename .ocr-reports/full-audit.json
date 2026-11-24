@@ -1090,7 +1090,9 @@
     "root_cause": "on_moved enqueues sync(dest_path) without calling _should_skip, unlike _handle for created/modified. A file moved into .rag-cache, a dot-directory, or an ignore_patterns match is still synced; a move outside corpus_root makes sync_file raise in relative_to.",
     "suggested_fix": "Apply _should_skip to both src and dest in on_moved.",
     "failure_scenario": "User drags a scratch file into corpus/.rag-cache/ (derived artifacts that must never be indexed); the watcher indexes it anyway, polluting retrieval with cache content.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: on_moved applies _should_skip to both src and dest. Test: move into .rag-cache enqueues delete(src) only. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 851 passed, 0 failed, exit 0"
   },
   {
     "id": 74,
@@ -1103,7 +1105,9 @@
     "root_cause": "Over-long paragraphs are split by _split_sentences, but a paragraph with no sentence terminators or newlines yields a single 'sentence' emitted whole regardless of chunk_size (no hard character split, unlike RecursiveStrategy). Embedding truncates to 8192 chars, so the tail is never embedded.",
     "suggested_fix": "Hard-split any single sentence longer than chunk_size (reuse the recursive strategy's character fallback) before merging.",
     "failure_scenario": "A minified/OCR'd document with a 40,000-character punctuation-free line: one chunk stores it, only the first 8192 chars get a vector — dense retrieval can never find content in the remaining ~32k chars.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: paragraph strategy hard-splits sentence-less blobs at chunk_size with correct offsets. Test: 40k blob -> all spans <= 2000. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 851 passed, 0 failed, exit 0"
   },
   {
     "id": 75,
@@ -1131,7 +1135,9 @@
     "root_cause": "where_parts.append(f\"rel_path LIKE '{folder}/%'\") embeds the CLI --folder value unescaped. A single quote breaks SQL syntax; crafted values can alter the query (same f-string pattern as phase8's --strategy at line 166).",
     "suggested_fix": "Use a bound parameter: append \"rel_path LIKE ?\" and pass folder + '/%' as a parameter.",
     "failure_scenario": "`vault transcribe --folder \"O'Brien/2024\"` raises sqlite3.OperationalError (unterminated literal) and aborts before processing anything.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: folder (transcribe) and strategy (extract) filters bound as SQL parameters. Tests: apostrophe values run cleanly. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 851 passed, 0 failed, exit 0"
   },
   {
     "id": 77,
@@ -1144,7 +1150,9 @@
     "root_cause": "_call_ollama receives max_tokens but never sets options.num_predict, so the model generates unbounded output. The comment at line 137 ('Validate: non-empty and under max_tokens') has no corresponding check. Same omission in phase10_5_context._call_ollama_native (127-130).",
     "suggested_fix": "Pass options={'num_predict': max_tokens, ...}; implement or remove the claimed length validation.",
     "failure_scenario": "With max_tokens=400 (default), a verbose model emits multi-thousand-token summaries: slower runs, larger DB rows, summary embeddings beyond the intended budget — the config knob has no effect.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: num_predict=max_tokens sent in phase9 _call_ollama and phase10.5 _call_ollama_native. Tests: options assertions (400/150). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 851 passed, 0 failed, exit 0"
   },
   {
     "id": 78,
@@ -1157,7 +1165,9 @@
     "root_cause": "ocrmypdf 17.7.0 has no force_perform option (verified in installed api.py); unknown kwargs move to options.extra_attrs and are ignored. The real flag is force_ocr. The call runs in default mode, which raises PriorOcrFoundError when the input PDF already contains any text.",
     "suggested_fix": "Replace force_perform=True with force_ocr=True (or skip_text=True if preserving existing text is desired).",
     "failure_scenario": "A PDF triaged as pdf-scanned because sampled pages lacked text, but an unsampled page carries a text watermark: ocrmypdf raises PriorOcrFoundError and extraction fails where forced OCR would have succeeded.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: force_perform -> force_ocr (real ocrmypdf flag). Test: kwargs assertion. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 851 passed, 0 failed, exit 0"
   },
   {
     "id": 79,
