@@ -228,17 +228,15 @@ def run_chunk(
         db["chunk"].insert_all(chunks_to_insert)
         db.conn.commit()
 
-        # Populate FTS5 table (external content table needs explicit inserts).
-        # The rowid must match chunk.id for content='chunk' to work.
+        # OCR audit #24: the migration-4 AFTER INSERT trigger already syncs
+        # chunk_fts — the old explicit per-chunk INSERT here doubled every
+        # posting (and left orphans after a crash before the final rebuild).
         inserted_chunks = list(
             db.query(
                 "SELECT id, text FROM chunk WHERE file_id = ? ORDER BY chunk_index",
                 [file_id],
             )
         )
-        for ch in inserted_chunks:
-            db.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?, ?)", [ch["id"], ch["text"]])
-        db.conn.commit()
 
         # V1.2 M2: populate the additive Chinese BM25 index for any Chinese
         # chunks (English chunks are skipped cheaply; default path unaffected).

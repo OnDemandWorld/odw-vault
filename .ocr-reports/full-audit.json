@@ -321,7 +321,9 @@
     "root_cause": "Selection excludes only skip/manual/unsupported, but audio/video files carry extract_strategy='whisper' (format_policy seeds). EXTRACTOR_MAP (lines 31-38) omits whisper — it exists only in the divergent, unused rag/extractors/__init__.py::_STRATEGY_MAP. _extract_one returns 'no extractor for strategy: whisper' for every A/V file.",
     "suggested_fix": "Add extract_strategy != 'whisper' to the selection (transcription is phase 8b's job) or route whisper to phase8b; reconcile the two strategy maps into one.",
     "failure_scenario": "`vault extract` before `vault transcribe` (natural phase order): every A/V file gets a succeeded=0 extraction row and a permanent failure row; v_extraction_status counts them as failed forever and --reextract re-fails them even after successful transcription.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: whisper added to the excluded strategies in phase-8 selection (transcription is phase 8b). Test: TestExtractPhaseFixes.test_whisper_files_not_selected_by_extract PASS (no extraction/failure rows). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 796 passed, 0 failed, exit 0"
   },
   {
     "id": 23,
@@ -334,7 +336,9 @@
     "root_cause": "_write_extraction_artifact catches all exceptions and returns None. run_extract treats succeeded=True regardless: with artifact_path None, text_for_db stays None and it inserts succeeded=1, char_count>0, text_extracted=NULL. No failure row recorded — violates 'all failures go to the failure table'.",
     "suggested_fix": "Propagate the write error as err from _extract_one, or record_failure and mark succeeded=0 when text exists but the artifact/DB write fails; optionally fall back to storing text directly in the DB.",
     "failure_scenario": "Disk full or permission error on .rag-cache: every file 'extracts successfully' with NULL text; phase 10 filters text_extracted IS NOT NULL, so the corpus silently becomes unsearchable with zero extract-phase failure rows to diagnose it.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: succeeded extraction with char_count>0 but missing/unreadable artifact now flips to succeeded=0 + failure row instead of NULL-text success. Test: test_artifact_write_failure_recorded_as_failure PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 796 passed, 0 failed, exit 0"
   },
   {
     "id": 24,
@@ -347,7 +351,9 @@
     "root_cause": "pipeline/db.py migration 4 (lines 505-517) creates AFTER INSERT/DELETE/UPDATE triggers maintaining chunk_fts. insert_all already fires chunk_fts_ai per row; lines 213-214 then insert the same (rowid, text) again. Only the end-of-run 'rebuild' (line 243) masks the duplication, and inserts commit per file — a crash before rebuild leaves two postings per chunk. A later trigger-driven 'delete' removes only one copy, leaving orphan postings. (Merged duplicate reports from rag/phase10_chunk.py and pipeline/db.py reviews.)",
     "suggested_fix": "Delete the explicit per-chunk chunk_fts INSERT loop (triggers handle insert/delete/update); keep the final rebuild as a cheap repair step. Do not keep both sync mechanisms.",
     "failure_scenario": "Long `vault chunk` run killed mid-way: chunk_fts holds 2 copies of each inserted chunk, doubling BM25 contribution; later file deletion removes one copy, leaving phantom terms pointing at deleted rowids until a manual rebuild.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: removed the explicit per-chunk chunk_fts INSERT loop; migration-4 triggers are the single sync mechanism (final rebuild kept as repair). Test: TestChunkFtsNoDoubleInsert PASS (execute-spy + MATCH posting count). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 796 passed, 0 failed, exit 0"
   },
   {
     "id": 25,
@@ -360,7 +366,9 @@
     "root_cause": "The non-regenerate query (line 198) selects only chunks WHERE context_text IS NULL; context_prompt_hash is always set/cleared together with context_text, so the hash-equality check at 246-251 can never match. Chunks with an existing context from an old prompt are never reconsidered; --regenerate reprocesses everything without comparing hashes.",
     "suggested_fix": "In normal mode select chunks where context_text IS NULL OR context_prompt_hash != <hash of current template/model>; for --regenerate optionally skip rows whose stored hash already equals the new one.",
     "failure_scenario": "Operator edits the context prompt template (or switches model) and runs `vault context`: 0 chunks processed, stale contexts served indefinitely; --regenerate instead pays full LLM cost for every chunk.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: run_context selects chunks with context_text IS NULL OR context_prompt_hash IS NOT NULL; the per-row hash check is now live — prompt/model changes invalidate stored contexts, matching hashes skip the LLM. Tests: 2 cache tests PASS; test_skips_already_contextualized updated to the live-hash contract. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 796 passed, 0 failed, exit 0"
   },
   {
     "id": 26,
@@ -373,7 +381,9 @@
     "root_cause": "validate_and_clean clears every context < 50 chars (context_text NULL), and cli.py's context command runs it after every run_context (cli.py:531). run_context selects exactly context_text IS NULL, so cleared chunks are regenerated next run. No attempt counter or permanent-skip marking for genuinely short chunks (copyright footers, single table cells).",
     "suggested_fix": "Persist an attempt counter and stop clearing/regenerating after N attempts, or store a sentinel context for known-unaugmentable chunks instead of NULL.",
     "failure_scenario": "A copyright-line chunk yields a 30-char context every time: each `vault context` invocation regenerates then clears it — unbounded wasted LLM calls on every run, 'cleared_for_rerun' never reaches zero.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: validate_and_clean marks unusable contexts with an empty-string sentinel (hash kept) instead of NULL — downstream filters exclude it, the hash cache skips it, prompt changes still invalidate. Test: test_short_context_sentinel_converges PASS (second pass clears 0, no LLM call). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 796 passed, 0 failed, exit 0"
   },
   {
     "id": 27,

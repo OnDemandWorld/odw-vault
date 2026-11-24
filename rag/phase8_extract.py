@@ -159,7 +159,10 @@ def run_extract(
         "is_dup_primary=1",
         "excluded=0",
         "extract_strategy IS NOT NULL",
-        "extract_strategy NOT IN ('skip', 'manual', 'unsupported')",
+        # OCR audit #22: whisper files belong to phase 8b (transcribe) —
+        # the dispatcher has no whisper extractor and used to record a
+        # permanent failure row for every audio/video file.
+        "extract_strategy NOT IN ('skip', 'manual', 'unsupported', 'whisper')",
     ]
 
     if strategy:
@@ -237,6 +240,18 @@ def run_extract(
                     if len(text_for_db) > MAX_EXTRACT_TEXT_DB:
                         text_for_db = text_for_db[:MAX_EXTRACT_TEXT_DB]
 
+                # OCR audit #23: text was extracted but the artifact is
+                # missing/unreadable (write failure swallowed upstream) —
+                # recording succeeded=1 with NULL text silently loses the
+                # document. Record a failure instead.
+                if (char_count or 0) > 0 and text_for_db is None:
+                    succeeded = False
+                    error_msg = (
+                        "extraction artifact missing/unreadable after write "
+                        "(disk full or permissions on .rag-cache?)"
+                    )
+
+            if succeeded:
                 db["extraction"].insert(
                     {
                         "file_id": file_id,

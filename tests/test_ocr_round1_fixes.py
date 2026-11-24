@@ -1112,3 +1112,167 @@ class TestIndexerPageMetadataAndDedup:
             indexer._run_embedding(fid)
 
         coll.add.assert_not_called()
+
+
+class TestExtractPhaseFixes:
+    """OCR #22/#23: whisper dispatch and artifact-write failure handling."""
+
+    def _env(self, tmp_path):
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        cache = corpus / ".rag-cache"
+        cache.mkdir()
+        cfg = _make_cfg(tmp_path)
+        cfg.paths.corpus_root = str(corpus)
+        cfg.paths.cache_root = str(cache)
+        db = _seed_db(tmp_path)
+        return corpus, cfg, db
+
+    def test_whisper_files_not_selected_by_extract(self, tmp_path):
+        from rag.phase8_extract import run_extract
+
+        corpus, cfg, db = self._env(tmp_path)
+        f = corpus / "a.mp3"
+        f.write_bytes(b"fake audio")
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        seed_test_files(
+            db,
+            files=[
+                {"name": "a.mp3", "path": str(f), "folder_id": 1,
+                 "extract_strategy": "whisper", "category": "audio"}
+            ],
+        )
+        result = run_extract(db, cfg)
+        assert db["extraction"].count == 0
+        assert db["failure"].count == 0
+        assert result["files_processed"] == 0
+
+    def test_artifact_write_failure_recorded_as_failure(self, tmp_path):
+        from rag.phase8_extract import EXTRACTOR_MAP, run_extract
+
+        corpus, cfg, db = self._env(tmp_path)
+        f = corpus / "a.txt"
+        f.write_text("real extracted content", encoding="utf-8")
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        seed_test_files(
+            db,
+            files=[{"name": "a.txt", "path": str(f), "folder_id": 1,
+                    "extract_strategy": "textutil"}],
+        )
+
+        with (
+            patch.dict(EXTRACTOR_MAP, {"textutil": lambda fp: ("extracted text", {}, True, None)}),
+            patch("rag.phase8_extract._write_extraction_artifact", return_value=None),
+        ):
+            result = run_extract(db, cfg)
+
+        assert result["files_failed"] == 1
+        row = next(iter(db["extraction"].rows))
+        assert row["succeeded"] == 0
+        assert row["text_extracted"] is None
+        assert db["failure"].count == 1
+
+
+class TestChunkFtsNoDoubleInsert:
+    """OCR #24: triggers alone maintain chunk_fts (no explicit inserts)."""
+
+    def test_no_manual_fts_inserts_and_match_works(self, tmp_path):
+        from rag.phase10_chunk import run_chunk
+
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        db["folder"].insert({"path": "t", "rel_path": "t", "name": "t", "depth": 0})
+        db.conn.commit()
+        fids = seed_test_files(db, files=[{"name": "t.txt", "folder_id": 1}])
+        seed_test_extractions(db, fids, text="Unique zebra phrase. Another sentence here.")
+
+        calls = []
+        orig = db.execute
+
+        def spy(sql, params=None):
+            calls.append(sql)
+            return orig(sql, params)
+
+        with patch.object(db, "execute", side_effect=spy):
+            _total, files = run_chunk(db, cfg)
+
+        assert files == 1
+        assert not any("INSERT INTO chunk_fts(rowid" in s for s in calls)
+        rows = list(db.query("SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'zebra'"))
+        # One posting per matching chunk — double inserts would duplicate rowids.
+        expected = db["chunk"].count_where("text LIKE '%zebra%'")
+        assert len(rows) == expected
+
+
+class TestContextCacheAndConvergence:
+    """OCR #25/#26: prompt-hash invalidation and sentinel convergence."""
+
+    def _seed(self, tmp_path, context, hash_):
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        cfg.models.contextual_retrieval.enabled = True
+        db["folder"].insert({"path": "t", "rel_path": "t", "name": "t", "depth": 0})
+        db.conn.commit()
+        fids = seed_test_files(db, files=[{"name": "t.txt", "folder_id": 1}])
+        seed_test_extractions(db, fids, text="Document body text for context.")
+        ct = db["chunk"]
+        ct.insert(
+            {"file_id": fids[0], "text": "chunk body", "chunk_index": 0,
+             "token_count": 2, "metadata_json": "{}",
+             "context_text": context, "context_prompt_hash": hash_}
+        )
+        db.conn.commit()
+        return db, cfg, ct.last_rowid
+
+    def test_prompt_change_invalidates_stored_context(self, tmp_path):
+        from rag.phase10_5_context import run_context
+
+        db, cfg, cid = self._seed(tmp_path, "An old context from the previous prompt.", "oldhash")
+        with (
+            patch("rag.phase10_5_context._build_prompt", return_value=("p", "newhash")),
+            patch("rag.phase10_5_context._call_ollama",
+                  return_value="A brand new sufficiently long context sentence.") as mock_llm,
+        ):
+            processed, failed = run_context(db, cfg)
+
+        assert (processed, failed) == (1, 0)
+        mock_llm.assert_called_once()
+        assert db["chunk"].get(cid)["context_prompt_hash"] == "newhash"
+
+    def test_matching_hash_skips_llm_call(self, tmp_path):
+        from rag.phase10_5_context import run_context
+
+        db, cfg, _cid = self._seed(tmp_path, "A current context that matches the prompt.", "samehash")
+        with (
+            patch("rag.phase10_5_context._build_prompt", return_value=("p", "samehash")),
+            patch("rag.phase10_5_context._call_ollama") as mock_llm,
+        ):
+            processed, failed = run_context(db, cfg)
+
+        assert (processed, failed) == (0, 0)
+        mock_llm.assert_not_called()
+
+    def test_short_context_sentinel_converges(self, tmp_path):
+        from rag.phase10_5_context import run_context, validate_and_clean
+
+        db, cfg, cid = self._seed(tmp_path, "too short", "h1")
+        r1 = validate_and_clean(db)
+        assert r1["too_short"] == 1
+        row = db["chunk"].get(cid)
+        assert row["context_text"] == ""          # sentinel, not NULL
+        assert row["context_prompt_hash"] == "h1"  # hash kept for the cache
+
+        # Second validation pass: nothing left to clear (converged).
+        r2 = validate_and_clean(db)
+        assert r2["cleared_for_rerun"] == 0
+
+        # And run_context with the same prompt hash skips it — no LLM call.
+        with (
+            patch("rag.phase10_5_context._build_prompt", return_value=("p", "h1")),
+            patch("rag.phase10_5_context._call_ollama") as mock_llm,
+        ):
+            processed, _ = run_context(db, cfg)
+        assert processed == 0
+        mock_llm.assert_not_called()
