@@ -312,6 +312,37 @@ class IncrementalIndexer:
             )
             return {"status": "error", "file_id": file_id, "error": str(exc)}
 
+        # OCR audit #72: stages swallow their own exceptions into the failure
+        # table — verify derivatives so a file with failed extraction or no
+        # embeddings is not reported (and counted) as a clean success.
+        ext = next(
+            iter(self.db.query(
+                "SELECT succeeded FROM extraction WHERE file_id = ? ORDER BY id DESC LIMIT 1",
+                [file_id],
+            )),
+            None,
+        )
+        if ext is None or not ext["succeeded"]:
+            return {
+                "status": "partial", "file_id": file_id, "action": action,
+                "error": "extraction missing or failed",
+            }
+        file_row = self.db["file"].get(file_id)
+        if file_row["is_dup_primary"] and not file_row["excluded"]:
+            n_chunks = self.db["chunk"].count_where("file_id = ?", [file_id])
+            if n_chunks:
+                n_embedded = next(iter(self.db.query(
+                    "SELECT COUNT(*) AS c FROM embedding_ref er "
+                    "JOIN chunk c ON er.chunk_id = c.id "
+                    "WHERE c.file_id = ? AND er.embedding_model = ? AND er.is_current = 1",
+                    [file_id, self.cfg.models.embedding.name],
+                )))["c"]
+                if n_embedded == 0:
+                    return {
+                        "status": "partial", "file_id": file_id, "action": action,
+                        "error": "chunks present but no current embeddings",
+                    }
+
         logger.info("Synced file %s (id=%d, action=%s)", file_path, file_id, action)
         return {"status": "success", "file_id": file_id, "action": action}
 
@@ -781,7 +812,9 @@ class IncrementalIndexer:
             if page_count and page_count > 0:
                 total = max(len(text), 1)
                 start_page = max(1, int((char_start / total) * page_count) + 1)
-                end_page = max(1, int((char_end / total) * page_count) + 1)
+                # OCR audit #71: clamp — the final chunk otherwise maps to
+                # page_count + 1, a page that does not exist.
+                end_page = min(page_count, max(1, int((char_end / total) * page_count) + 1))
 
             chunks_to_insert.append(
                 {

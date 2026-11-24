@@ -132,8 +132,11 @@ def _retrieve_with_client(
         _qr = _qc.embed(model=cfg.models.embedding.name, input=[query])
         _query_emb = _qr["embeddings"][0]
     except Exception as _e:
+        # OCR audit #68: an embedding-endpoint outage must surface as a
+        # service error (API maps RuntimeError to 503), not as an empty
+        # result indistinguishable from "no matches" / a content refusal.
         logger.error("Failed to embed query for retrieval: %s", _e)
-        return [], metrics
+        raise RuntimeError(f"Query embedding failed: {_e}") from _e
     finally:
         if _qc is not None:
             _qc.close()
@@ -494,10 +497,15 @@ def _find_files_by_path(db, query: str, excluded_ids: set[int]) -> set[int]:
     if not tokens:
         return set()
 
-    conditions = " OR ".join("f.rel_path LIKE ?" for _ in tokens)
+    # OCR audit #69: escape LIKE wildcards — a '%'/'_' token (e.g. "100%")
+    # otherwise matches every file and balloons the candidate set.
+    conditions = " OR ".join("f.rel_path LIKE ? ESCAPE '\\'" for _ in tokens)
     exc = ",".join("?" for _ in excluded_ids) if excluded_ids else ""
     exc_clause = f" AND f.id NOT IN ({exc})" if exc else ""
-    params = [f"%{t}%" for t in tokens]
+    params = [
+        "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        for t in tokens
+    ]
     if excluded_ids:
         params.extend(excluded_ids)
 

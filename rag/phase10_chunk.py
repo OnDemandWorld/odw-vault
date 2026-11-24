@@ -213,7 +213,9 @@ def run_chunk(
                     page_start = int((char_start / max(len(text), 1)) * page_count) + 1
                     page_end = int((char_end / max(len(text), 1)) * page_count) + 1
                     start_page = max(1, page_start)
-                    end_page = max(1, page_end)
+                    # OCR audit #75: clamp to the real page count (the last
+                    # chunk otherwise gets end_page = page_count + 1).
+                    end_page = min(page_count, max(1, page_end))
 
                 chunks_to_insert.append(
                     {

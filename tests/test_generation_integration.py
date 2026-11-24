@@ -126,7 +126,7 @@ class TestFormatChunks:
     def test_single_hit_without_page(self):
         hit = Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="doc.txt", page_start=None, text="hello")
         result = _format_chunks([hit])
-        assert "[1] doc.txt\nhello" in result
+        assert "[1] doc.txt\n<excerpt>\nhello" in result  # OCR #70 spotlighting
 
     def test_multiple_hits_separated(self):
         hits = [

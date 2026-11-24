@@ -401,7 +401,11 @@ class TestSyncRepairPass:
         ):
             summary = indexer.sync_all()
 
-        assert summary["retried"] == 1, "file with un-embedded chunk must be requeued"
+        # OCR audit #72: with embedding mocked out the sync honestly reports
+        # "partial" (counted as retry_failed) — the file WAS requeued and
+        # embedding re-attempted, which is what this regression guards.
+        assert summary["retried"] + summary["retry_failed"] == 1, \
+            "file with un-embedded chunk must be requeued"
         assert summary["new"] == 0 and summary["modified"] == 0
         assert embed_calls, "the repair pass must re-run embedding for it"
 

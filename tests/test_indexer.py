@@ -176,7 +176,17 @@ class TestIncrementalSkipUnchanged:
 
         chroma_client, _ = _make_chroma_mock()
 
-        with patch("rag.indexer.IncrementalIndexer._run_extraction"), \
+        def fake_extraction(file_id, file_path, strategy):
+            # OCR audit #72: sync_file now verifies derivatives — seed a
+            # succeeded extraction so the skip-unchanged contract is tested
+            # against a realistically-processed file.
+            db["extraction"].insert({
+                "file_id": file_id, "tool": "textutil",
+                "text_extracted": "text " * 100, "char_count": 500, "succeeded": 1,
+            })
+            db.conn.commit()
+
+        with patch("rag.indexer.IncrementalIndexer._run_extraction", side_effect=fake_extraction), \
              patch("rag.indexer.IncrementalIndexer._run_summarization"), \
              patch("rag.indexer.IncrementalIndexer._run_chunking"), \
              patch("rag.indexer.IncrementalIndexer._run_embedding"):
