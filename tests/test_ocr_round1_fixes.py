@@ -1628,3 +1628,132 @@ BLOCK
 if(_citHTML !== '<div>new sources</div>') throw new Error('payload not rendered');
 """.replace("BLOCK", block)
         self._run_node(harness)
+
+
+class TestEvalRecallTopK:
+    """OCR #46: recall@10 must see a true top-10."""
+
+    def test_eval_retrieve_requests_at_least_10(self, tmp_path):
+        from eval.runner import run_eval
+
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        assert cfg.retrieval.top_k_chunks == 8
+        db["eval_question"].insert(
+            {"question": "q?", "expected_file_ids_json": "[1]", "category": "general"}
+        )
+        db.conn.commit()
+
+        with (
+            patch("eval.runner.chromadb.PersistentClient"),
+            patch("eval.runner.retrieve", return_value=([], {})) as mock_retrieve,
+            patch("eval.runner.generate_answer", return_value={
+                "answer": "a", "citations": [], "generation_ms": 1.0,
+                "model": "m", "refused": False,
+            }),
+        ):
+            run_eval(db, cfg)
+
+        assert mock_retrieve.call_args.kwargs["top_k_chunks"] >= 10
+
+
+class TestMessageFeedbackTargeting:
+    """OCR #44: feedback targets the clicked message, not always the newest."""
+
+    def _seed_conv(self, db):
+        import sqlite3
+
+        from ui.gradio_app import _ensure_conv_tables
+
+        # The UI's _get_db connections use sqlite3.Row (PRAGMA reads index by name).
+        db.conn.row_factory = sqlite3.Row
+        _ensure_conv_tables()
+        db.conn.execute("INSERT INTO conversation (id, title) VALUES ('c1', 't')")
+        for i, ts in enumerate(("2026-01-01 00:00:01", "2026-01-01 00:00:02", "2026-01-01 00:00:03")):
+            db.conn.execute(
+                "INSERT INTO message (conversation_id, role, content, created_at) "
+                "VALUES ('c1', 'assistant', ?, ?)",
+                (f"answer {i}", ts),
+            )
+        db.conn.commit()
+
+    def test_index_targets_specific_message(self, tmp_path):
+        from ui.gradio_app import _record_message_feedback
+
+        db = _seed_db(tmp_path)
+        with patch("ui.gradio_app._get_db", return_value=db):
+            self._seed_conv(db)
+            _record_message_feedback("c1", "up", 0)
+
+        rows = list(db.query(
+            "SELECT content, feedback FROM message WHERE conversation_id='c1' ORDER BY created_at"
+        ))
+        assert rows[0]["feedback"] == "up"
+        assert rows[1]["feedback"] is None
+        assert rows[2]["feedback"] is None
+
+    def test_legacy_no_index_targets_newest(self, tmp_path):
+        from ui.gradio_app import _record_message_feedback
+
+        db = _seed_db(tmp_path)
+        with patch("ui.gradio_app._get_db", return_value=db):
+            self._seed_conv(db)
+            _record_message_feedback("c1", "down")
+
+        rows = list(db.query(
+            "SELECT content, feedback FROM message WHERE conversation_id='c1' ORDER BY created_at"
+        ))
+        assert rows[2]["feedback"] == "down"
+        assert rows[0]["feedback"] is None
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("node") is None, reason="node not installed"
+)
+class TestConversationReplayAndStreamSeq:
+    """OCR #42/#45: assistant replay and stream invalidation."""
+
+    def _run_node(self, script: str):
+        import subprocess
+
+        proc = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=30
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    def test_select_conversation_replays_assistant_turns(self):
+        js = _ui_js_source()
+        sel = _extract_js_function(js, "_selectConversation")
+        script = sel + """
+var _S = {H: [], streamSeq: 0};
+var _currentConvId = null;
+function _addMsg(){}
+var MSGS = [
+  {role:'user', content:'q1'},
+  {role:'assistant', content:'a1'},
+  {role:'user', content:'q2'}
+];
+function fetch(){
+  return {
+    then: function(cb){
+      var out = cb({ json: function(){ return {messages: MSGS}; } });
+      return { then: function(cb2){ cb2(out); return { catch: function(){} }; }, catch: function(){} };
+    },
+    catch: function(){}
+  };
+}
+var _stubEl = { innerHTML:'', scrollTop:0, scrollHeight:0, style:{},
+  classList:{ add:function(){}, remove:function(){} } };
+var document = {
+  getElementById: function(){ return _stubEl; },
+  querySelectorAll: function(){ return []; }
+};
+var window = { innerWidth: 1024 };
+_selectConversation('c1');
+if(_S.H.length !== 3) throw new Error('history length ' + _S.H.length);
+var roles = _S.H.map(function(m){ return m.role; }).join(',');
+if(roles !== 'user,assistant,user') throw new Error('roles: ' + roles);
+if(_S.H[1].content[0].text !== 'a1') throw new Error('assistant content lost');
+if(_S.streamSeq < 1) throw new Error('stream not invalidated on switch');
+"""
+        self._run_node(script)

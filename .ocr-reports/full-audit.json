@@ -621,7 +621,9 @@
     "root_cause": "_selectConversation() pushes only user messages into _S.H; assistant messages are rendered but not added. Follow-up sends replay a user-only window.",
     "suggested_fix": "Also push {role:'assistant', content:[{text:m.content,type:'text'}]} into _S.H for assistant messages.",
     "failure_scenario": "User reloads a conversation and asks 'expand on that': the model never sees its prior answers. With the Anthropic protocol the replay becomes consecutive user messages, violating role alternation and returning HTTP 400 for the whole turn.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: _selectConversation pushes assistant turns into _S.H (role alternation preserved). Test: TestConversationReplayAndStreamSeq (node, real function) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 815 passed, 0 failed, exit 0"
   },
   {
     "id": 43,
@@ -634,7 +636,9 @@
     "root_cause": "_record_query_log keys the query_log row by len(_LATEST_HISTORY)-1, where _LATEST_HISTORY is a single module global overwritten by every completed turn from any user/tab (lines 705-706). _turn_log_ids also grows without bound.",
     "suggested_fix": "Key feedback by (conversation_id, message index) or return the query_log id to the client and pass it back on like; never use cross-session globals; bound/clean the mapping.",
     "failure_scenario": "Two users chat concurrently: A's history has 10 messages, B finishes a 3-message turn; index 2 maps to B's query_log row. A's thumbs-up on their own message updates B's row — feedback attributed to the wrong query; long-running servers leak one dict entry per turn.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "skipped",
+    "verification_notes": "SKIPPED (design decision required): correct fix needs a protocol change — return query_log ids to the client and key feedback by (conversation_id, message), replacing the process-global _LATEST_HISTORY/_turn_log_ids mapping in the legacy Gradio chatbot path. Intertwined with the custom-JS UI feedback flow; needs a coordinated design pass with Jack. Residual risk documented: concurrent sessions can misattribute feedback."
   },
   {
     "id": 44,
@@ -647,7 +651,9 @@
     "root_cause": "_sendFeedback (JS lines 2708-2715) sends only {feedback} to /conversations/{id}/feedback; _record_message_feedback updates the most recent assistant message regardless of which message's thumbs button was clicked.",
     "suggested_fix": "Include the message id (or turn index) in the feedback payload and update that specific row; return message ids from /conversations/{id}/messages.",
     "failure_scenario": "In a 5-turn conversation the user thumbs-down the 2nd answer; the UPDATE lands on the 5th. Per-message feedback data (and any eval using human_grade) is systematically wrong for all but the latest turn.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: feedback payload carries the clicked assistant message ordinal (_assistantIndexOf); _record_message_feedback targets it via LIMIT 1 OFFSET (legacy no-index fallback kept). Tests: TestMessageFeedbackTargeting (2) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 815 passed, 0 failed, exit 0"
   },
   {
     "id": 45,
@@ -660,7 +666,9 @@
     "root_cause": "The SSE pump keeps running after _selectConversation/_newChat: it assigns _S.H = h (old stream's history) on every frame and writes into the detached message element. No per-stream generation token or abort on conversation switch.",
     "suggested_fix": "Tag each send with a stream id; ignore frames whose id no longer matches the active stream; abort/cancel the reader on conversation switch/new chat.",
     "failure_scenario": "User asks Q in conversation A then clicks B while tokens stream: _S.H is reset to B's messages then overwritten frame-by-frame with A's history; the next question in B replays A's turns and is saved under B's id, mixing conversations.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: streamSeq token — _send tags each stream; pump and history-adoption ignore superseded frames; _newChat/_selectConversation bump the sequence. Test: node test asserts invalidation on switch; pump guard verified by review (closure not standalone-extractable). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 815 passed, 0 failed, exit 0"
   },
   {
     "id": 46,
@@ -673,7 +681,9 @@
     "root_cause": "run_eval calls retrieve() without top_k_chunks; retrieval truncates hits to cfg.retrieval.top_k_chunks (default 8, config.py:189). _recall_for_hits(hits, expected, 10) then slices at most 8 hits.",
     "suggested_fix": "Pass top_k_chunks=max(10, cfg.retrieval.top_k_chunks) in the eval retrieve call so recall@10 sees a true top-10.",
     "failure_scenario": "With default config, an expected file ranked 9th or 10th is never retrieved; recall_at_10 equals recall_at_8 for every question and model comparisons systematically understate recall@10.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: run_eval passes top_k_chunks=max(10, cfg.retrieval.top_k_chunks). Test: TestEvalRecallTopK PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 815 passed, 0 failed, exit 0"
   },
   {
     "id": 47,

@@ -119,6 +119,9 @@ def run_eval(
                 chroma_path=chroma_path,
                 cfg=cfg,
                 use_augmentation=False if no_augment else None,
+                # OCR audit #46: recall@10 needs a true top-10 — the default
+                # top_k_chunks=8 silently capped the metric at recall@8.
+                top_k_chunks=max(10, cfg.retrieval.top_k_chunks),
             )
 
             # 2. Compute recall
