@@ -2628,3 +2628,102 @@ class TestLowUiFixes:
             legacy._on_feedback(history, SimpleNamespace(liked=True, index=1))
         row = next(iter(db["query_log"].rows))
         assert row["feedback"] == "up"
+
+
+class TestLowMiscFixes:
+    """OCR #90/#91/#92/#93/#94."""
+
+    def test_legacy_stream_uses_generation_endpoint(self):
+        import ui.gradio_app_legacy as legacy
+
+        from rag.retrieval import Hit
+
+        hit = Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="d.txt",
+                  page_start=None, text="t")
+        cfg = MagicMock()
+        cfg.models.generation.name = "cloud-model"
+        cfg.models.generation.endpoint.host = "https://ollama.com"
+        cfg.models.generation.endpoint.api_key = "sk-test"
+        cfg.models.generation.thinking = False
+
+        with (
+            patch.object(legacy, "_cfg", cfg),
+            patch("ui.gradio_app_legacy.ollama.Client") as mc,
+        ):
+            mc.return_value.chat.return_value = iter([{"message": {"content": "hi"}}])
+            list(legacy._stream_tokens("q", [hit]))
+
+        kwargs = mc.call_args.kwargs
+        assert kwargs["host"] == "https://ollama.com"
+        assert kwargs["headers"]["Authorization"] == "Bearer sk-test"
+
+    def test_benchmark_posts_four_args_and_counts_chars(self):
+        from ui.benchmark import benchmark_gradio_api
+
+        posted = {}
+
+        class FakeResp:
+            def json(self):
+                return {"event_id": "e1"}
+
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def iter_lines(self):
+                history = [{"role": "assistant",
+                            "content": [{"text": "hello ", "type": "text"},
+                                        {"text": "world", "type": "text"}]}]
+                yield "data: " + json.dumps([history, ""])
+
+        def fake_post(url, json=None, timeout=None):
+            posted["data"] = json["data"]
+            return FakeResp()
+
+        with (
+            patch("ui.benchmark.httpx.post", side_effect=fake_post),
+            patch("ui.benchmark.httpx.stream", return_value=FakeStream()),
+        ):
+            results = benchmark_gradio_api(["q"], "http://x")
+
+        assert len(posted["data"]) == 4
+        assert results[0].get("response_length") == len("hello world")
+
+    def test_benchmark_gpt_oss_summary_unpacks_four(self):
+        import ast
+
+        src = (Path(__file__).resolve().parent.parent / "ui" / "benchmark_gpt_oss.py").read_text()
+        tree = ast.parse(src)
+        summary_loops = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.For) and isinstance(n.target, ast.Tuple)
+            and any(getattr(e, "id", "") == "model_name" for e in n.target.elts)
+        ]
+        assert summary_loops
+        assert all(len(n.target.elts) == 4 for n in summary_loops)
+
+    def test_phase3_requires_db_path(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase3_triage import run_phase3
+
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(tmp_path), cache_root=str(tmp_path)))
+        db["folder"].insert({"path": "t", "rel_path": "t", "name": "t", "depth": 0})
+        db.conn.commit()
+        seed_test_files(db, files=[{"name": "a.txt", "folder_id": 1}])  # triage pending
+        with pytest.raises(ValueError, match="db_path"):
+            run_phase3(db, cfg, MagicMock())
+
+    def test_walk_missing_root_fails_loudly(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase1_walk import run_phase1
+
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(
+            corpus_root=str(tmp_path / "does-not-exist"), cache_root=str(tmp_path)
+        ))
+        with pytest.raises(ValueError, match="Corpus root"):
+            run_phase1(db, cfg, MagicMock())

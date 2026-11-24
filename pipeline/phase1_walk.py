@@ -87,6 +87,10 @@ def run_phase1(
     """Walk corpus and hash all files."""
     root = config.corpus_root_path
     root_resolved = root.resolve()
+    # OCR audit #94: a missing root used to "succeed" with 0 files (os.walk
+    # yields nothing) and propagate an empty corpus to report/approve.
+    if not root_resolved.is_dir():
+        raise ValueError(f"Corpus root does not exist or is not a directory: {root}")
     max_size = config.walk.max_file_size_bytes
     n_workers = workers or config.walk.hash_workers or os.cpu_count() or 4
 

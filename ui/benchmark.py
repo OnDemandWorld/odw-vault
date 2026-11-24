@@ -219,7 +219,9 @@ def benchmark_gradio_api(queries: list[str], base_url: str) -> list[dict]:
         try:
             resp = httpx.post(
                 f"{base_url}/gradio_api/call/chat",
-                json={"data": [q, [], "All folders"]},
+                # OCR audit #91: /chat declares 4 inputs (msg, chatbot,
+                # folder, conv_id) — Gradio 6 rejects a 3-element payload.
+                json={"data": [q, [], "All folders", ""]},
                 timeout=120,
             )
             t_post_end = time.monotonic()
@@ -250,7 +252,16 @@ def benchmark_gradio_api(queries: list[str], base_url: str) -> list[dict]:
                                 h = d[0]
                                 last = h[-1]
                                 if last and last.get("content"):
-                                    final_text = last["content"]
+                                    # OCR audit #91: messages-format content is
+                                    # a parts list — count characters, not parts.
+                                    content = last["content"]
+                                    if isinstance(content, list):
+                                        final_text = "".join(
+                                            p.get("text", "") for p in content
+                                            if isinstance(p, dict)
+                                        )
+                                    else:
+                                        final_text = str(content)
                         except Exception:
                             pass
         except Exception as e:

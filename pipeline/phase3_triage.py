@@ -223,7 +223,13 @@ def run_phase3(
 
     n_workers = workers or min(os.cpu_count() or 4, 8)
     if db_path is None:
-        db_path = config.cache_root_path / "corpus.db"
+        # OCR audit #93: the old fallback (cache_root/corpus.db) pointed at a
+        # nonexistent DB — workers created a stray empty file and every
+        # UPDATE failed with 'no such table: file'. Fail loudly instead.
+        raise ValueError(
+            "run_phase3 requires db_path (the real corpus.db location); "
+            "there is no safe default."
+        )
 
     # Accumulate results in main thread, then batch-update
     results: list[tuple[int, dict | None, bool]] = []

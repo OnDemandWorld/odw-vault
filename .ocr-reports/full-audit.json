@@ -1345,7 +1345,9 @@
     "root_cause": "_stream_tokens builds ollama.Client(host=_ollama_host) from cfg.ollama.host, ignoring cfg.models.generation.endpoint (host/api_key) that the modern UI's _make_client honors.",
     "suggested_fix": "Use the generation endpoint config (host + Authorization header) as in ui/gradio_app.py:_make_client.",
     "failure_scenario": "With generation configured for Ollama Cloud (endpoint host + API key), the legacy UI sends requests to local Ollama; if the model only exists in the cloud, every query fails with model-not-found.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: legacy _stream_tokens honors generation endpoint host + Bearer key. Test: client kwargs assertions PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 869 passed, 0 failed, exit 0"
   },
   {
     "id": 91,
@@ -1358,7 +1360,9 @@
     "root_cause": "benchmark_gradio_api sends {data:[q, [], 'All folders']} but /chat now declares 4 inputs (msg, chatbot, folder, conv_id). Gradio 6 validate_inputs raises on too-few args (verified in installed gradio 6.19.0). Additionally final_text = last['content'] is a messages-format parts list, so response_length counts parts, not characters.",
     "suggested_fix": "Send a 4th element (conversation id) and extract text from content parts for response_length.",
     "failure_scenario": "Running ui/benchmark.py against the current UI: Phase 3 reports an error row for all 15 queries and no end-to-end timings — the headline metric is unusable.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: benchmark posts 4-element /chat payload; response_length counts characters from messages-format parts. Test: mocked Gradio API round-trip PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 869 passed, 0 failed, exit 0"
   },
   {
     "id": 92,
@@ -1371,7 +1375,9 @@
     "root_cause": "models entries are (client, model_name, label, opts) (lines 90-94) but the summary iterates 'for model_name, label, _ in models', raising 'too many values to unpack (expected 3)'.",
     "suggested_fix": "Unpack four values: for _client, model_name, label, _opts in models.",
     "failure_scenario": "The script spends minutes running all cloud/local queries, then crashes at the summary stage before printing any results — all benchmark work is lost.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: summary loop unpacks 4-tuples. Test: AST check on the real loop PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 869 passed, 0 failed, exit 0"
   },
   {
     "id": 93,
@@ -1384,7 +1390,9 @@
     "root_cause": "When db_path is None the fallback is config.cache_root_path / 'corpus.db', but the real database lives at PROJECT_ROOT/corpus.db (cli.py:35). The CLI always passes db_path, so this is latent; any programmatic invocation without db_path opens/creates an empty DB in the cache and every worker UPDATE fails with 'no such table: file'.",
     "suggested_fix": "Default to the same PROJECT_ROOT/corpus.db resolution the CLI uses, or make db_path required.",
     "failure_scenario": "A script calls run_phase3 without db_path: a stray empty .rag-cache/corpus.db is created and all files reported failed while the real DB is untouched.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: run_phase3 raises ValueError without db_path (no stray cache/corpus.db). Test PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 869 passed, 0 failed, exit 0"
   },
   {
     "id": 94,
@@ -1397,7 +1405,9 @@
     "root_cause": "os.walk on a nonexistent root yields nothing (no onerror), so run_phase1 reports 'Walk complete: 0 files' with pipeline_run status 'done'. Config paths (config.py:250-255) are used as-is: config.example.toml ships relative './SourceData'/'./.rag-cache', resolving against process CWD, not project root.",
     "suggested_fix": "Validate root.is_dir() at phase start and fail loudly; anchor relative config paths to PROJECT_ROOT or require absolute paths in validation.",
     "failure_scenario": "Corpus directory renamed/deleted, or user runs `vault walk` from $HOME with the example config: phase 'succeeds' with 0 files and the empty result propagates to report/approve with no error.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: run_phase1 raises on missing/non-dir corpus root (no silent 0-file success). Test PASS. Residual: relative config paths remain CWD-dependent (config-wide anchoring needs a separate decision). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 869 passed, 0 failed, exit 0"
   },
   {
     "id": 95,

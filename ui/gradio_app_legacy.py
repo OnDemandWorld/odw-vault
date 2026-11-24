@@ -133,7 +133,16 @@ def _stream_tokens(
         system_content = f"{system_prefix}\n{system_content}"
 
     model_name = _cfg.models.generation.name
-    client = ollama.Client(host=_ollama_host)
+    # OCR audit #90: honor the configured generation endpoint (host + key) —
+    # cloud-only models failed with model-not-found against local Ollama.
+    ep = getattr(_cfg.models.generation, "endpoint", None)
+    if ep and getattr(ep, "host", ""):
+        kwargs = {"host": ep.host}
+        if getattr(ep, "api_key", ""):
+            kwargs["headers"] = {"Authorization": f"Bearer {ep.api_key}"}
+        client = ollama.Client(**kwargs)
+    else:
+        client = ollama.Client(host=_ollama_host)
 
     full_text = ""
     for chunk in client.chat(
