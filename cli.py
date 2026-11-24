@@ -38,6 +38,15 @@ def get_db_path(ctx: click.Context) -> Path:
     return PROJECT_ROOT / "corpus.db"
 
 
+def _require_initialized(ctx: click.Context) -> None:
+    """OCR audit #54: refuse to open/create corpus.db before init — sqlite3
+    .connect silently creates an empty DB, letting approve fabricate success
+    and blocking a later init with 'already exists'."""
+    if not is_db_initialized(get_db_path(ctx)):
+        click.echo("Error: corpus.db not initialized. Run 'vault init' first.", err=True)
+        ctx.exit(2)
+
+
 @click.group()
 def main():
     """Local RAG Pre-Flight Pipeline — inventory, identify, and triage document corpora."""
@@ -283,6 +292,7 @@ def exclude(target: str, item_id: int, reason: str) -> None:
     """Phase 7: Mark a file or folder as excluded."""
     from pipeline.phase7_exclude import run_phase7_exclude
 
+    _require_initialized(click.get_current_context())
     config = get_config(click.get_current_context())
     db = open_db(get_db_path(click.get_current_context()))
     run_phase7_exclude(db, config, target, item_id, reason)
@@ -300,6 +310,7 @@ def exclude_batch(
     """Phase 7: Batch exclude from CSV."""
     from pipeline.phase7_exclude import run_phase7_exclude_batch
 
+    _require_initialized(click.get_current_context())
     config = get_config(click.get_current_context())
     db = open_db(get_db_path(click.get_current_context()))
     if csv_path:
@@ -326,6 +337,7 @@ def exclude_batch(
 @click.option("--by", required=True)
 def approve(by: str) -> None:
     """Final sign-off on pre-flight."""
+    _require_initialized(click.get_current_context())
     db = open_db(get_db_path(click.get_current_context()))
     from pipeline.helpers import now_iso
 
@@ -337,6 +349,7 @@ def approve(by: str) -> None:
 @main.command()
 def status() -> None:
     """Print per-phase status as JSON."""
+    _require_initialized(click.get_current_context())
     db = open_db(get_db_path(click.get_current_context()))
     config_row = next(iter(db.query("SELECT value FROM config WHERE key='corpus_root'")), None)
     corpus_root = config_row["value"] if config_row else "unknown"

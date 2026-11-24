@@ -87,10 +87,20 @@ def run_phase7_exclude_batch(
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            target = row["target"].strip()
-            item_id = int(row["id"].strip())
-            reason = row["reason"].strip()
-            table = "folder" if target == "folder" else "file"
+            # OCR audit #53: validate each row — an unrecognized target used
+            # to silently map to the file table, and one malformed row
+            # aborted the rest of the batch after earlier rows committed.
+            try:
+                target = (row.get("target") or "").strip()
+                item_id = int((row.get("id") or "").strip())
+                reason = (row.get("reason") or "").strip()
+            except (ValueError, AttributeError):
+                skipped += 1
+                continue
+            if target not in ("file", "folder"):
+                skipped += 1
+                continue
+            table = target
             try:
                 existing = db[table].get(item_id)
             except NotFoundError:

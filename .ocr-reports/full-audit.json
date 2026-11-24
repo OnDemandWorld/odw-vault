@@ -771,7 +771,9 @@
     "root_cause": "_detect_language runs for categories document/spreadsheet/data/email/ebook, which include ZIP-container formats (docx, xlsx, epub) and binary .db/.sqlite. It opens the file as utf-8 errors='ignore' and feeds the first 4096 bytes (ZIP headers + XML fragments) to lingua, producing arbitrary language labels.",
     "suggested_fix": "Restrict raw-read detection to plain-text formats, or detect language on extracted text after phase 8; skip binary containers.",
     "failure_scenario": "A corpus of 1000 Chinese .docx files: detection runs on ZIP binary garbage, labels many files ENGLISH (or random); the report's Language Distribution and any language-aware routing are systematically wrong.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: _detect_language skips ZIP/OLE2/SQLite magic bytes (binary containers). Tests: TestLanguageDetectionBinarySkip (3) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 831 passed, 0 failed, exit 0"
   },
   {
     "id": 53,
@@ -784,7 +786,9 @@
     "root_cause": "table = 'folder' if target == 'folder' else 'file' — no validation against {file, folder} (single exclude uses click.Choice, batch does not). row['target']/row['id']/row['reason'] KeyErrors and int() ValueErrors propagate, aborting remaining rows after earlier rows were committed; no failure recorded.",
     "suggested_fix": "Validate target in {'file','folder'} (skip+count invalid rows), wrap per-row parsing in try/except, report malformed-row counts.",
     "failure_scenario": "CSV row 'Folder,42,secret' (capital F) excludes FILE id 42 instead of folder 42 with no warning; a non-numeric id halfway through aborts the rest of the batch with a traceback.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: batch CSV validates target in {file,folder}, per-row try/except, malformed rows counted as skipped. Test: TestBatchExcludeValidation PASS (capital-F row skipped, not misrouted). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 831 passed, 0 failed, exit 0"
   },
   {
     "id": 54,
@@ -797,7 +801,9 @@
     "root_cause": "These commands call open_db directly (unlike _run_phase's is_db_initialized check). sqlite3.connect creates an empty corpus.db if missing; sqlite_utils insert auto-creates tables, so approve creates a bogus config-only DB and prints 'Pre-flight approved'. status then crashes with 'no such table: config'; the stray corpus.db makes a subsequent init fail with 'already exists'.",
     "suggested_fix": "Add the is_db_initialized guard (exit with 'Run init first') to approve, status, exclude, exclude_batch, and the eval/models commands before opening the DB.",
     "failure_scenario": "Fresh checkout: `vault status` -> traceback + empty corpus.db created; `vault approve --by me` -> 'Pre-flight approved' against a schema-less DB; `vault init` then refused because corpus.db 'already exists'.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: _require_initialized guard on status/approve/exclude/exclude-batch — exit 2 with 'Run init first', no stray corpus.db. Tests: TestCliInitGuards (2) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 831 passed, 0 failed, exit 0"
   },
   {
     "id": 55,
@@ -810,7 +816,9 @@
     "root_cause": "sf is invoked with the corpus root directory rather than the pending file list, so every run — even for one new file — re-reads every file, including the default cache_root inside the corpus (.rag-cache/models can hold multi-GB models). The fixed 3600s timeout applies to the whole scan.",
     "suggested_fix": "Pass the pending file paths to sf (it accepts multiple paths) or batch them; exclude the cache directory from the scan.",
     "failure_scenario": "100 GB corpus, 1 new file: `vault identify` re-scans 100 GB including model binaries, taking up to the 1-hour timeout and failing with 'Siegfried timeout' though only one file needed identification.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: Siegfried invoked with pending file paths in batches of 500 (argv-safe), never the corpus root/.rag-cache. Test: TestSiegfriedPendingOnly PASS; test_phase2_identify 13 PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 831 passed, 0 failed, exit 0"
   },
   {
     "id": 56,
@@ -823,7 +831,9 @@
     "root_cause": "The comment treats unar and Siegfried as 'external services', but they are local subprocess binaries: patoolib needs an archive handler (none installed in python:3.11-slim) and phase2 raises RuntimeError when sf is not on PATH or in the project root. Only ffmpeg is installed.",
     "suggested_fix": "apt-get install unar (and p7zip-full if needed); download the Siegfried binary into the image at the resolved project root; or document the image as serve-only and gate pre-flight commands with a clear error.",
     "failure_scenario": "Inside the container `vault archives` fails with patool 'no archive handler' for every zip/rar and `vault identify` raises 'Siegfried not found: sf' — the advertised pre-flight pipeline is unusable in the shipped image.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed (partial): Dockerfile installs unar + p7zip-full (patool backends). Siegfried remains user-provided (mount at /app/sf) with the existing clear runtime error — bundling a pinned binary needs a release-URL decision. Docker build not run (no daemon in review env). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 831 passed, 0 failed, exit 0"
   },
   {
     "id": 57,

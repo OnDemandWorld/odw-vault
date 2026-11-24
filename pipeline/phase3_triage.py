@@ -172,6 +172,13 @@ def _detect_language(filepath: str, category: str) -> str | None:
     if category not in ("document", "spreadsheet", "pdf-text", "data", "email", "ebook"):
         return None
     try:
+        # OCR audit #52: skip binary containers — reading ZIP (docx/xlsx/
+        # pptx/epub), OLE2 (legacy doc/xls) or SQLite bytes as UTF-8 produces
+        # garbage language labels. Detect on extracted text instead (ph. 8+).
+        with open(filepath, "rb") as f:
+            magic = f.read(8)
+        if magic[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"\xd0\xcf\x11\xe0") or magic[:6] == b"SQLite":
+            return None
         with open(filepath, encoding="utf-8", errors="ignore") as f:
             text = f.read(4096)
         if len(text) < 50:

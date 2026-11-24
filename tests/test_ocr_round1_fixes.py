@@ -7,6 +7,7 @@ See .ocr-reports/full-audit.json for the finding details.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1931,3 +1932,118 @@ class TestPhase3CorruptMediaPersisted:
         run_phase3(db, cfg, MagicMock(), workers=1, db_path=str(db_path))
 
         assert db["file"].get(fid)["is_corrupt"] == 1
+
+
+class TestLanguageDetectionBinarySkip:
+    """OCR #52: binary containers must not be read as UTF-8 text."""
+
+    def test_zip_container_skipped(self, tmp_path):
+        from pipeline.phase3_triage import _detect_language
+
+        f = tmp_path / "doc.docx"
+        f.write_bytes(b"PK\x03\x04" + b"<xml>garbage</xml>" * 50)
+        assert _detect_language(str(f), "document") is None
+
+    def test_sqlite_container_skipped(self, tmp_path):
+        from pipeline.phase3_triage import _detect_language
+
+        f = tmp_path / "data.db"
+        f.write_bytes(b"SQLite format 3\x00" + b"\x00" * 200)
+        assert _detect_language(str(f), "data") is None
+
+    def test_plain_text_still_detected(self, tmp_path):
+        from pipeline.phase3_triage import HAS_LINGUA, _detect_language
+
+        if not HAS_LINGUA:
+            pytest.skip("lingua not installed")
+        f = tmp_path / "doc.txt"
+        f.write_text(
+            "This is a plain English document about engineering and deployment. " * 5,
+            encoding="utf-8",
+        )
+        assert _detect_language(str(f), "document") == "ENGLISH"
+
+
+class TestBatchExcludeValidation:
+    """OCR #53: malformed CSV rows skipped, never misrouted or aborting."""
+
+    def test_invalid_rows_skipped_valid_applied(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase7_exclude import run_phase7_exclude_batch
+
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(tmp_path), cache_root=str(tmp_path)))
+        db["folder"].insert({"path": "t", "rel_path": "t", "name": "t", "depth": 0})
+        db.conn.commit()
+        fids = seed_test_files(
+            db, files=[{"name": "a.txt", "folder_id": 1}, {"name": "b.txt", "folder_id": 1}]
+        )
+
+        csv_path = tmp_path / "ex.csv"
+        csv_path.write_text(
+            "target,id,reason\n"
+            f"Folder,{fids[0]},wrong-table\n"     # capital F -> invalid, skipped
+            "file,not-a-number,bad\n"             # malformed id -> skipped
+            f"file,{fids[1]},valid\n",
+            encoding="utf-8",
+        )
+        applied, skipped = run_phase7_exclude_batch(db, cfg, csv_path)
+
+        assert (applied, skipped) == (1, 2)
+        assert db["file"].get(fids[0])["excluded"] == 0  # NOT misrouted
+        assert db["file"].get(fids[1])["excluded"] == 1
+
+
+class TestCliInitGuards:
+    """OCR #54: status/approve/exclude refuse to run before init."""
+
+    def test_status_without_db_exits_2_and_creates_nothing(self, tmp_path, monkeypatch):
+        import cli
+        from click.testing import CliRunner
+
+        monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+        result = CliRunner().invoke(cli.main, ["status"])
+        assert result.exit_code == 2
+        assert "init" in result.output
+        assert not (tmp_path / "corpus.db").exists()
+
+    def test_approve_without_db_exits_2(self, tmp_path, monkeypatch):
+        import cli
+        from click.testing import CliRunner
+
+        monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+        result = CliRunner().invoke(cli.main, ["approve", "--by", "me"])
+        assert result.exit_code == 2
+        assert not (tmp_path / "corpus.db").exists()
+
+
+class TestSiegfriedPendingOnly:
+    """OCR #55: sf scans pending file paths, not the whole corpus root."""
+
+    def test_sf_invoked_with_pending_paths(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase2_identify import run_phase2
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        f1 = corpus / "a.txt"
+        f1.write_text("a", encoding="utf-8")
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")))
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        seed_test_files(
+            db, files=[{"name": "a.txt", "path": str(f1), "folder_id": 1, "identify_status": "pending"}]
+        )
+
+        sf_out = json.dumps({"files": [{"filename": str(f1), "matches": []}]})
+        proc = MagicMock(returncode=0, stdout=sf_out, stderr="")
+        with (
+            patch("pipeline.phase2_identify.shutil.which", return_value="/usr/bin/sf"),
+            patch("pipeline.phase2_identify.subprocess.run", return_value=proc) as mock_run,
+        ):
+            run_phase2(db, cfg, MagicMock())
+
+        args = mock_run.call_args.args[0]
+        assert str(f1) in args
+        assert str(corpus) not in args  # root dir must NOT be scanned

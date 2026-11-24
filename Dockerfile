@@ -23,11 +23,17 @@ ENV VAULT_HOME=/app
 #   - build-essential / python3-dev: compile native Python deps (fasttext, chromadb)
 #   - ffmpeg: media duration detection (README runtime dep)
 #   - curl: container healthcheck against /health
+# OCR audit #56: unar/p7zip are LOCAL subprocess backends for patool (phase 0),
+# not external services — without them every archive expansion fails in-image.
+# Siegfried (sf) remains user-provided: mount the binary at /app/sf
+# (phase 2 raises a clear error when absent).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3-dev \
     ffmpeg \
     curl \
+    unar \
+    p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --upgrade pip
