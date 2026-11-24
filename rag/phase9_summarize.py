@@ -62,10 +62,12 @@ def _call_ollama(prompt: str, model: str, host: str, temperature: float, max_tok
 
 def _has_existing_summary(db, file_id: int, model: str, prompt_version: str) -> bool:
     """Check whether a summary already exists for this (file_id, model, prompt_version)."""
+    # OCR audit #28: include prompt_version so a prompt bump invalidates
+    # cached summaries (legacy NULL-version rows regenerate once).
     rows = list(
         db.query(
-            "SELECT 1 FROM summary WHERE file_id = ? AND model = ?",
-            [file_id, model],
+            "SELECT 1 FROM summary WHERE file_id = ? AND model = ? AND prompt_version = ?",
+            [file_id, model, prompt_version],
         )
     )
     return len(rows) > 0
@@ -142,6 +144,7 @@ def run_summarize(db, cfg, limit=None, resummarize=False) -> tuple[int, int]:
                 {
                     "file_id": file_id,
                     "model": model,
+                    "prompt_version": prompt_version,
                     "summary_text": summary_text,
                     "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }

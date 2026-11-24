@@ -20,6 +20,7 @@ import chromadb
 import ollama
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
@@ -365,9 +366,12 @@ def _shrink_validation_errors(exc: RequestValidationError) -> list:
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # OCR audit #31: pydantic v2 errors() can embed live exception objects in
+    # ctx (e.g. int_parsing ValueError) — jsonable_encoder coerces them so a
+    # validation error renders as 422 instead of a serialization 500.
     return JSONResponse(
         status_code=422,
-        content={"detail": _shrink_validation_errors(exc)},
+        content={"detail": jsonable_encoder(_shrink_validation_errors(exc))},
     )
 
 

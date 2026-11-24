@@ -396,7 +396,9 @@
     "root_cause": "The selection query has no exclusion for files with a succeeded=1 whisper.cpp extraction row, unlike phase 8's NOT IN subquery. Every run re-transcribes the full eligible set and appends duplicate extraction rows. The accepted workers parameter (line 117, CLI --workers) is never used — the loop is always sequential.",
     "suggested_fix": "Add id NOT IN (SELECT file_id FROM extraction WHERE tool='whisper.cpp' AND succeeded=1) unless --retranscribe; honor or remove the workers option.",
     "failure_scenario": "A run interrupted after 50 of 200 videos restarts from file 1 and re-runs whisper on all 50 done files — hours of redundant work; --workers 4 silently gives no parallelism.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: selection excludes files with succeeded=1 whisper.cpp extraction (resumable); --workers>1 logs an explicit sequential-mode warning. Test: TestTranscribeResumability PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 803 passed, 0 failed, exit 0"
   },
   {
     "id": 28,
@@ -409,7 +411,9 @@
     "root_cause": "_has_existing_summary accepts prompt_version but queries only file_id+model; the summary table has no prompt_version column and the insert stores none. A summary is considered current even when the underlying extraction was re-extracted with different text.",
     "suggested_fix": "Add prompt_version (and extraction_id or source hash) to the summary table, store on insert, and include in the existence check so prompt bumps and re-extractions invalidate stale summaries.",
     "failure_scenario": "Bumping models.summarization.prompt_version v1->v2: `vault summarize` skips every file because a v1 summary exists for the same model; `vault extract --reextract` fixing bad text leaves the old summary built from it in place.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: migration 9 adds summary.prompt_version; _has_existing_summary matches on it; inserts store it (legacy NULL rows regenerate once). Tests: TestSummaryPromptVersionCache (2) PASS; test_db/test_phase9 suites PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 803 passed, 0 failed, exit 0"
   },
   {
     "id": 29,
@@ -422,7 +426,9 @@
     "root_cause": "extract_docling instantiates DocumentConverter() inside the per-file call; phase 8 invokes it once per file inside a ThreadPoolExecutor (default 4 workers), so layout/tableformer/OCR models are re-initialized for every document.",
     "suggested_fix": "Cache one converter per thread (threading.local) and reuse across files; Docling converters are not thread-safe to share, so thread-local is the right granularity.",
     "failure_scenario": "A 1,000-PDF corpus performs 1,000 full Docling pipeline initializations (seconds each, hundreds of MB of weights loaded/discarded per file) — minutes of extraction become hours with heavy memory churn.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: thread-local DocumentConverter cache (_get_converter). Test: TestDoclingConverterReuse PASS (1 construction, 2 conversions). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 803 passed, 0 failed, exit 0"
   },
   {
     "id": 30,
@@ -435,7 +441,9 @@
     "root_cause": "The per-file loop has no try/except. Any exception (database-locked from a concurrent API writer, disk-full, strategy error) propagates out of run_chunk; nothing is written to the failure table and finish_model_run never executes (run row stays stale).",
     "suggested_fix": "Wrap the per-file body in try/except, record_failure(phase='chunk'), continue with the next file, report failed counts; run finish_model_run in a finally.",
     "failure_scenario": "With the API server running, a chunk insert hits a write-lock timeout on file 300 of 2,000: the phase crashes, 1,700 files never chunked, no failure row identifies the offender, model_run left dangling.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: per-file try/except in run_chunk with record_failure(phase='chunk') and continue; failed count logged. Test: TestChunkPerFileIsolation PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 803 passed, 0 failed, exit 0"
   },
   {
     "id": 31,
@@ -448,7 +456,9 @@
     "root_cause": "validation_exception_handler builds JSONResponse directly from exc.errors(). Pydantic v2 errors() can embed live exception objects in ctx (e.g. the original ValueError for int_parsing); _shrink_validation_errors only handles str/list/dict. FastAPI's default handler wraps errors() in jsonable_encoder for exactly this reason. json.dumps then raises TypeError while rendering.",
     "suggested_fix": "Apply fastapi.encoders.jsonable_encoder to the shrunk error list (or exc.errors(include_context=False) with str coercion) before constructing JSONResponse.",
     "failure_scenario": "GET /files/abc (or /queries?page=x) produces an int_parsing error whose ctx carries a ValueError instance; response serialization raises TypeError and the client gets a 500 instead of the intended 422.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: 422 handler wraps shrunk errors in fastapi.encoders.jsonable_encoder. Tests: TestValidation422Serialization (2) PASS (422 not 500 for /files/abc and /queries?page=x). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 803 passed, 0 failed, exit 0"
   },
   {
     "id": 32,

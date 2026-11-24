@@ -1276,3 +1276,119 @@ class TestContextCacheAndConvergence:
             processed, _ = run_context(db, cfg)
         assert processed == 0
         mock_llm.assert_not_called()
+
+
+class TestTranscribeResumability:
+    """OCR #27: already-transcribed files are skipped on re-run."""
+
+    def test_succeeded_transcription_not_reprocessed(self, tmp_path):
+        from rag.phase8b_transcribe import run_transcribe
+
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        db["folder"].insert({"path": "t", "rel_path": "t", "name": "t", "depth": 0})
+        db.conn.commit()
+        fids = seed_test_files(
+            db, files=[{"name": "a.mp3", "folder_id": 1, "category": "audio"}]
+        )
+        db["extraction"].insert(
+            {"file_id": fids[0], "tool": "whisper.cpp", "text_extracted": "done",
+             "char_count": 4, "succeeded": 1}
+        )
+        db.conn.commit()
+
+        result = run_transcribe(db, cfg)
+        assert result["files_processed"] == 0
+        assert result["files_failed"] == 0
+
+
+class TestSummaryPromptVersionCache:
+    """OCR #28: prompt_version participates in the summary cache key."""
+
+    def test_prompt_bump_invalidates_cache(self, tmp_path):
+        from rag.phase9_summarize import _has_existing_summary
+
+        db = _seed_db(tmp_path)
+        db["folder"].insert({"path": "t", "rel_path": "t", "name": "t", "depth": 0})
+        db.conn.commit()
+        fids = seed_test_files(db, files=[{"name": "t.txt", "folder_id": 1}])
+        db["summary"].insert(
+            {"file_id": fids[0], "model": "m", "prompt_version": "v1",
+             "summary_text": "old summary"}
+        )
+        db.conn.commit()
+
+        assert _has_existing_summary(db, fids[0], "m", "v1") is True
+        assert _has_existing_summary(db, fids[0], "m", "v2") is False
+
+    def test_migration_adds_prompt_version_column(self, tmp_path):
+        db = _seed_db(tmp_path)
+        cols = {r["name"] for r in db.query("PRAGMA table_info(summary)")}
+        assert "prompt_version" in cols
+
+
+class TestDoclingConverterReuse:
+    """OCR #29: one DocumentConverter per thread, not per file."""
+
+    def test_converter_constructed_once_per_thread(self):
+        from rag.extractors.docling_extractor import extract_docling
+
+        with patch("docling.document_converter.DocumentConverter") as mc:
+            mc.return_value.convert.return_value.document.export_to_markdown.return_value = "md"
+            mc.return_value.convert.return_value.document.pages = []
+            extract_docling("a.pdf")
+            extract_docling("b.pdf")
+
+        assert mc.call_count == 1
+        assert mc.return_value.convert.call_count == 2
+
+
+class TestChunkPerFileIsolation:
+    """OCR #30: one bad file must not abort the phase; failure recorded."""
+
+    def test_bad_file_isolated_and_recorded(self, tmp_path):
+        from rag.phase10_chunk import run_chunk
+
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        db["folder"].insert({"path": "t", "rel_path": "t", "name": "t", "depth": 0})
+        db.conn.commit()
+        fids = seed_test_files(
+            db, files=[{"name": "a.txt", "folder_id": 1}, {"name": "b.txt", "folder_id": 1}]
+        )
+        seed_test_extractions(db, fids, text="First sentence. Second sentence.")
+
+        with patch(
+            "rag.phase10_chunk.index_zh_chunks",
+            side_effect=[RuntimeError("simulated lock timeout"), None],
+        ):
+            total, processed = run_chunk(db, cfg)
+
+        assert processed == 1
+        assert total >= 1
+        fails = list(db["failure"].rows_where("phase = 'chunk'"))
+        assert len(fails) == 1
+        assert "simulated lock timeout" in fails[0]["error_message"]
+
+
+class TestValidation422Serialization:
+    """OCR #31: non-integer params yield 422, not a serialization 500."""
+
+    def test_non_integer_path_param_returns_422(self):
+        from fastapi.testclient import TestClient
+
+        from api.main import app
+
+        client = TestClient(app)
+        r = client.get("/files/abc")
+        assert r.status_code == 422
+        assert "detail" in r.json()
+
+    def test_non_integer_query_param_returns_422(self):
+        from fastapi.testclient import TestClient
+
+        from api.main import app
+
+        client = TestClient(app)
+        r = client.get("/queries", params={"page": "x"})
+        assert r.status_code == 422

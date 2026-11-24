@@ -10,6 +10,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -18,6 +19,8 @@ from pipeline.config import AppConfig
 from pipeline.db import finish_model_run, heartbeat_model_run, start_model_run
 from pipeline.helpers import record_failure
 from pipeline.logging import PhaseLogger
+
+logger = logging.getLogger(__name__)
 
 
 def _build_config_hash(cfg: AppConfig) -> str:
@@ -146,11 +149,21 @@ def run_transcribe(
     cache_root = cfg.cache_root_path
     model_name = model or tcfg.model
 
+    if workers and workers > 1:
+        logger.warning(
+            "Transcription --workers=%d requested but parallel transcription is "
+            "not implemented; running sequentially",
+            workers,
+        )
+
     # Select audio/video files
     where_parts = [
         "is_dup_primary=1",
         "excluded=0",
         "category IN ('audio', 'video')",
+        # OCR audit #27: resumability — skip files already transcribed
+        # successfully (re-run after an interruption must not redo them).
+        "id NOT IN (SELECT file_id FROM extraction WHERE tool='whisper.cpp' AND succeeded=1)",
     ]
 
     if folder:
