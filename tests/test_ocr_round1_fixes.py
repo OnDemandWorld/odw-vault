@@ -1757,3 +1757,177 @@ if(_S.H[1].content[0].text !== 'a1') throw new Error('assistant content lost');
 if(_S.streamSeq < 1) throw new Error('stream not invalidated on switch');
 """
         self._run_node(script)
+
+
+class TestPhase5Reinfer:
+    """OCR #47: --reinfer works and content changes refresh labels."""
+
+    def _setup(self, tmp_path, stored_hash):
+        from pipeline.config import Config, PathsConfig
+
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(tmp_path), cache_root=str(tmp_path)))
+        ft = db["folder"]
+        ft.insert({
+            "path": str(tmp_path / "f"), "rel_path": "f", "name": "f", "depth": 0,
+            "inferred_category": "personal", "inference_prompt_hash": stored_hash,
+        })
+        db.conn.commit()
+        return db, cfg, ft.last_rowid
+
+    def _run(self, db, cfg, reinfer, prompt_hash):
+        from pipeline.phase5_folder_meta import FolderInference, run_phase5
+
+        result_obj = FolderInference(category="personal", label="L", tags=[], summary="S")
+        with (
+            patch("pipeline.phase5_folder_meta._build_prompt", return_value=("p", prompt_hash)),
+            patch("pipeline.phase5_folder_meta._call_ollama", return_value=result_obj) as mock_llm,
+        ):
+            result = run_phase5(db, cfg, MagicMock(), reinfer=reinfer)
+        return result, mock_llm
+
+    def test_reinfer_reprocesses_inferred_folder(self, tmp_path):
+        db, cfg, _fid = self._setup(tmp_path, "h1")
+        result, mock_llm = self._run(db, cfg, reinfer=True, prompt_hash="h1")
+        assert result["files_processed"] == 1
+        mock_llm.assert_called_once()
+
+    def test_matching_hash_skips_without_reinfer(self, tmp_path):
+        db, cfg, _fid = self._setup(tmp_path, "h1")
+        result, mock_llm = self._run(db, cfg, reinfer=False, prompt_hash="h1")
+        assert result["files_processed"] == 0
+        mock_llm.assert_not_called()
+
+    def test_changed_prompt_hash_refreshes_label(self, tmp_path):
+        db, cfg, fid = self._setup(tmp_path, "oldhash")
+        result, _mock_llm = self._run(db, cfg, reinfer=False, prompt_hash="newhash")
+        assert result["files_processed"] == 1
+        assert db["folder"].get(fid)["inference_prompt_hash"] == "newhash"
+
+
+class TestInitForceSafety:
+    """OCR #48/#49: WAL sidecars removed; config preserved on --force."""
+
+    def _invoke(self, tmp_path, monkeypatch, force):
+        import cli
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir(exist_ok=True)
+        monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+        from click.testing import CliRunner
+
+        args = ["init", "--root", str(corpus)]
+        if force:
+            args.append("--force")
+        return CliRunner().invoke(cli.main, args)
+
+    def test_force_removes_wal_sidecars(self, tmp_path, monkeypatch):
+        (tmp_path / "corpus.db").write_bytes(b"old")
+        (tmp_path / "corpus.db-wal").write_bytes(b"hot wal")
+        (tmp_path / "corpus.db-shm").write_bytes(b"shm")
+        result = self._invoke(tmp_path, monkeypatch, force=True)
+        assert result.exit_code == 0, result.output
+        # init recreates the DB in WAL mode, so fresh sidecars may exist —
+        # the OLD hot WAL must be gone (not recovered into the new DB).
+        wal = tmp_path / "corpus.db-wal"
+        assert not wal.exists() or wal.read_bytes() != b"hot wal"
+        import sqlite3
+
+        conn = sqlite3.connect(str(tmp_path / "corpus.db"))
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        conn.close()
+        assert "file" in tables  # fresh schema, no resurrected user data
+
+    def test_force_preserves_config_customizations(self, tmp_path, monkeypatch):
+        (tmp_path / "config.toml").write_text(
+            '[paths]\ncorpus_root = "/old"\ncache_root = "/old/.rag-cache"\n'
+            'chroma_root = "/data/chroma"\n\n[models.generation]\nname = "custom-model"\n',
+            encoding="utf-8",
+        )
+        result = self._invoke(tmp_path, monkeypatch, force=True)
+        assert result.exit_code == 0, result.output
+        import tomllib
+
+        cfg = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
+        assert cfg["paths"]["chroma_root"] == "/data/chroma"
+        assert cfg["models"]["generation"]["name"] == "custom-model"
+        assert cfg["paths"]["corpus_root"] == str(tmp_path / "corpus")
+
+    def test_repoint_preserves_chroma_root(self, tmp_path, monkeypatch):
+        (tmp_path / "config.toml").write_text(
+            '[paths]\ncorpus_root = "/old"\ncache_root = "/old/.rag-cache"\n'
+            'chroma_root = "/data/chroma"\n',
+            encoding="utf-8",
+        )
+        result = self._invoke(tmp_path, monkeypatch, force=False)
+        assert result.exit_code == 0, result.output
+        import tomllib
+
+        cfg = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
+        assert cfg["paths"]["chroma_root"] == "/data/chroma"
+
+
+class TestPhase0FailureMultiplication:
+    """OCR #50: one bad archive yields one failure per run, not per depth."""
+
+    def _setup(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "bad.zip").write_bytes(b"PK\x03\x04 corrupted")
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")))
+        return db, cfg
+
+    def test_failed_archive_not_retried_per_depth(self, tmp_path):
+        from pipeline.phase0_archives import run_phase0
+
+        db, cfg = self._setup(tmp_path)
+        with patch("patoolib.extract_archive", side_effect=Exception("bad archive")):
+            run_phase0(db, cfg, MagicMock(), max_depth=3)
+
+        fails = list(db["failure"].rows_where("phase = 'archives'"))
+        assert len(fails) == 1
+        expansions = list(db["archive_expansion"].rows_where("succeeded = 0"))
+        assert len(expansions) == 1
+
+    def test_registration_failure_recorded_unlinked(self, tmp_path):
+        from pipeline.phase0_archives import run_phase0
+
+        db, cfg = self._setup(tmp_path)
+        with (
+            patch("patoolib.extract_archive", side_effect=Exception("bad archive")),
+            patch("pipeline.phase0_archives._ensure_file_in_db", return_value=None),
+        ):
+            run_phase0(db, cfg, MagicMock(), max_depth=2)
+
+        fails = list(db["failure"].rows_where("phase = 'archives'"))
+        assert len(fails) == 1
+        assert fails[0]["file_id"] is None
+        assert db["archive_expansion"].count == 0
+
+
+class TestPhase3CorruptMediaPersisted:
+    """OCR #51: is_corrupt reaches the file row for media/images."""
+
+    def test_corrupt_video_marked(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase3_triage import run_phase3
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        bad = corpus / "bad.mp4"
+        bad.write_bytes(b"not a real mp4 at all")
+        db_path = tmp_path / "test.db"
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")))
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        fid = seed_test_files(
+            db, files=[{"name": "bad.mp4", "path": str(bad), "folder_id": 1, "category": "video"}]
+        )[0]
+
+        run_phase3(db, cfg, MagicMock(), workers=1, db_path=str(db_path))
+
+        assert db["file"].get(fid)["is_corrupt"] == 1

@@ -257,16 +257,18 @@ def run_phase3(
                     tdb.conn.commit()  # Ensure triage results are persisted
                 elif category in ("audio", "video"):
                     result = _triage_media(filepath)
+                    # OCR audit #51: persist is_corrupt so v_problem_files and
+                    # the report's Problem Files section see corrupt media.
                     tdb.execute(
-                        "UPDATE file SET duration_seconds=?, triage_json=?, triage_status='done' WHERE id=?",
-                        [result["duration_seconds"], result["triage_json"], file_id],
+                        "UPDATE file SET duration_seconds=?, is_corrupt=?, triage_json=?, triage_status='done' WHERE id=?",
+                        [result["duration_seconds"], result["is_corrupt"], result["triage_json"], file_id],
                     )
                     tdb.conn.commit()
                 elif category == "image":
                     result = _triage_image(filepath)
                     tdb.execute(
-                        "UPDATE file SET triage_json=?, triage_status='done' WHERE id=?",
-                        [result["triage_json"], file_id],
+                        "UPDATE file SET is_corrupt=?, triage_json=?, triage_status='done' WHERE id=?",
+                        [result["is_corrupt"], result["triage_json"], file_id],
                     )
                     tdb.conn.commit()
                 else:

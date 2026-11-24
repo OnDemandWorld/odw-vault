@@ -66,18 +66,28 @@ def init(corpus_root: str, cache_root: str | None, force: bool) -> None:
 
     if db_path.exists() and force:
         db_path.unlink()
+        # OCR audit #48: remove WAL sidecars too — a hot -wal left by a killed
+        # process would be recovered into the fresh DB, resurrecting old data.
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(db_path) + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
 
-    # Write config.toml (preserve existing if present, only update paths)
+    # Write config.toml. OCR audit #49: ALWAYS preserve an existing config
+    # (--force overwrites corpus.db, not user settings) and merge into [paths]
+    # so custom keys like chroma_root survive re-pointing the corpus.
     config_path = PROJECT_ROOT / "config.toml"
-    if config_path.exists() and not force:
-        # Update existing config with new paths
+    if config_path.exists():
         import tomllib
 
         import tomli_w
 
         with open(config_path, "rb") as f:
             existing = tomllib.load(f)
-        existing["paths"] = {"corpus_root": str(root), "cache_root": str(cache)}
+        paths = dict(existing.get("paths", {}))
+        paths["corpus_root"] = str(root)
+        paths["cache_root"] = str(cache)
+        existing["paths"] = paths
         config_path.write_text(tomli_w.dumps(existing), encoding="utf-8")
         click.echo(f"Updated {config_path} with new paths")
     else:

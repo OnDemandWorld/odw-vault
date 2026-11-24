@@ -696,7 +696,9 @@
     "root_cause": "The folder selection SQL requires inferred_category IS NULL OR inference_prompt_hash IS NULL regardless of reinfer. Already-inferred folders are filtered out before the prompt-hash cache check at line 173, making that check dead code. The comment claims extracted-archive folders are excluded but the query has no is_extracted_archive filter.",
     "suggested_fix": "Include reinfer in the WHERE clause and select folders whose recomputed prompt hash differs from inference_prompt_hash; add is_extracted_archive=0 if intended.",
     "failure_scenario": "Switching the Ollama model and running `vault folder-meta --reinfer` -> 'No folders to infer', 0 processed; adding 500 new files to a folder never updates its inferred label.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: phase-5 selects all eligible folders; the per-folder prompt-hash check is the live cache — --reinfer reprocesses, changed prompts refresh labels. Tests: TestPhase5Reinfer (3) PASS; test_phase5_folder_meta PASS. Note: comment's is_extracted_archive claim left as-is (behavior change out of scope). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 824 passed, 0 failed, exit 0"
   },
   {
     "id": 48,
@@ -709,7 +711,9 @@
     "root_cause": "Only db_path.unlink() is called. The DB runs in WAL mode (db.py:44); a corpus.db-wal left by a killed process (or a running API holding the unlinked inode) is recovered by SQLite into the freshly created empty database file, replaying old pages into the 'new' DB.",
     "suggested_fix": "Also unlink corpus.db-wal and corpus.db-shm (and refuse/warn if another process holds the DB open), or checkpoint/truncate the WAL before deleting.",
     "failure_scenario": "A phase killed mid-run leaves a hot WAL; `vault init --force` expecting a clean slate -> SQLite recovers the stale -wal into the new file: old schema/data reappear or 'database disk image is malformed' on first query.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: init --force unlinks corpus.db-wal/-shm before recreating. Test: TestInitForceSafety.test_force_removes_wal_sidecars PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 824 passed, 0 failed, exit 0"
   },
   {
     "id": 49,
@@ -722,7 +726,9 @@
     "root_cause": "With --force, the else-branch writes DEFAULT_CONFIG_TOML wholesale, discarding all user customization (models, endpoints, api_key, watcher, ports) though --force is documented as 'Overwrite existing corpus.db'. Without --force, line 77 replaces the entire [paths] table with only corpus_root/cache_root, deleting a custom chroma_root.",
     "suggested_fix": "On --force preserve the existing config and update only paths; on non-force merge into existing['paths'] instead of replacing it; document any intentional reset.",
     "failure_scenario": "User with a cloud generation endpoint + api_key and chroma_root=/data/chroma runs `vault init --root new-corpus --force`: config reverts to defaults (empty key, ./chroma), breaking generation and orphaning the vector store; re-pointing without --force loses chroma_root.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: init always preserves an existing config and merges into [paths] (chroma_root and model settings survive --force and re-pointing). Tests: 2 config-preservation tests PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 824 passed, 0 failed, exit 0"
   },
   {
     "id": 50,
@@ -735,7 +741,9 @@
     "root_cause": "The `already` set contains only succeeded=1 expansions, so each of the depth_limit passes (default 5) re-attempts every permanently failing archive, appending new archive_expansion + failure rows each time. When _ensure_file_in_db returns None in the except path (200-207) the failure is only logged; its unguarded file_path.stat() (line 93) can raise inside the except handler, aborting the phase and losing the original error.",
     "suggested_fix": "Track failed archives in the per-run skip set; record a failure row with file_id=None when registration fails; wrap stat() in try/except.",
     "failure_scenario": "One password-protected zip with default max_depth=5 -> 5 attempts, 5 failure rows and 5 expansion rows per invocation; the report shows 5x the real problem count and each re-run adds 5 more.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: failed_this_run skip set stops per-depth retry multiplication; registration failures recorded as unlinked failure rows; stat() guarded in _ensure_file_in_db. Tests: TestPhase0FailureMultiplication (2) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 824 passed, 0 failed, exit 0"
   },
   {
     "id": 51,
@@ -748,7 +756,9 @@
     "root_cause": "_triage_media and _triage_image return is_corrupt=1 on failure, but the media UPDATE writes only duration_seconds/triage_json/triage_status and the image UPDATE only triage_json/triage_status. Only the PDF branch persists is_corrupt; file.error_message is never set by triage.",
     "suggested_fix": "Include is_corrupt=? in the media and image UPDATEs and set error_message for failed triage.",
     "failure_scenario": "Corrupt MP4/PNG: a failure row is recorded but file.is_corrupt stays NULL, so v_problem_files and the report's Problem Files section omit it; workload estimates and problem-file reviews miss the corrupt media.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: media/image triage UPDATEs persist is_corrupt. Test: TestPhase3CorruptMediaPersisted PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 824 passed, 0 failed, exit 0"
   },
   {
     "id": 52,
