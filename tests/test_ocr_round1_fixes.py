@@ -1773,8 +1773,10 @@ class TestPhase5Reinfer:
             "path": str(tmp_path / "f"), "rel_path": "f", "name": "f", "depth": 0,
             "inferred_category": "personal", "inference_prompt_hash": stored_hash,
         })
-        db.conn.commit()
-        return db, cfg, ft.last_rowid
+        folder_id = ft.last_rowid
+        # min_files_to_infer=1 (default) skips empty folders — seed a file.
+        seed_test_files(db, files=[{"name": "d.txt", "folder_id": folder_id}])
+        return db, cfg, folder_id
 
     def _run(self, db, cfg, reinfer, prompt_hash):
         from pipeline.phase5_folder_meta import FolderInference, run_phase5
@@ -2047,3 +2049,63 @@ class TestSiegfriedPendingOnly:
         args = mock_run.call_args.args[0]
         assert str(f1) in args
         assert str(corpus) not in args  # root dir must NOT be scanned
+
+
+class TestDeadConfigKnobs:
+    """OCR #58: skip_patterns, pdf_sample_pages, min_files_to_infer honored."""
+
+    def test_walk_skip_patterns_applied(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase1_walk import _should_skip_file
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        cfg = Config(paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")))
+        assert _should_skip_file("Thumbs.db", corpus / "Thumbs.db", cfg) is True
+        assert _should_skip_file("scratch.tmp", corpus / "scratch.tmp", cfg) is True
+        assert _should_skip_file("real.pdf", corpus / "real.pdf", cfg) is False
+
+    def test_pdf_sample_pages_honored(self, tmp_path):
+        import fitz
+
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase3_triage import _triage_pdf
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        cfg = Config(paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")))
+        cfg.triage.pdf_sample_pages = 5
+
+        pdf = corpus / "doc.pdf"
+        doc = fitz.open()
+        for i in range(10):
+            page = doc.new_page()
+            page.insert_text((72, 72), f"Page {i} text content here")
+        doc.save(str(pdf))
+        doc.close()
+
+        out = _triage_pdf(str(pdf), cfg)
+        sampled = json.loads(out["triage_json"])["sampled_pages"]
+        assert len(sampled) == 5
+
+    def test_min_files_to_infer_skips_empty_folders(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase5_folder_meta import run_phase5
+
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(tmp_path), cache_root=str(tmp_path)))
+        cfg.folder_meta.min_files_to_infer = 2
+        db["folder"].insert({"path": str(tmp_path / "f"), "rel_path": "f", "name": "f", "depth": 0})
+        db.conn.commit()
+
+        with patch("pipeline.phase5_folder_meta._call_ollama") as mock_llm:
+            result = run_phase5(db, cfg, MagicMock())
+
+        assert result["files_processed"] == 0
+        mock_llm.assert_not_called()
+
+    def test_dockerfile_runs_as_non_root(self):
+        dockerfile = Path(__file__).resolve().parent.parent / "Dockerfile"
+        text = dockerfile.read_text(encoding="utf-8")
+        assert "USER vault" in text
+        assert "useradd" in text

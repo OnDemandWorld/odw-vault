@@ -57,6 +57,13 @@ RUN pip install --no-cache-dir .
 # a volume mount: -v "$PWD/config.toml:/app/config.toml"
 COPY config.example.toml ./config.toml
 
+# OCR audit #57: run as a non-root user — the API processes untrusted uploads
+# and archive contents; a compromise must not yield root with access to the
+# mounted config (API keys) and corpus volumes. Mounted volumes must be
+# readable/writable by UID 10001.
+RUN useradd --create-home --uid 10001 vault && chown -R vault:vault /app
+USER vault
+
 EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \

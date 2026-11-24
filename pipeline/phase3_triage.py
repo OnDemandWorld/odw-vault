@@ -88,7 +88,15 @@ def _triage_pdf_body(doc, filepath: str, config: Config, out: dict) -> dict:
         out["category_override"] = "pdf-scanned"
         return out
 
-    sample_pages = sorted({0, n // 2, max(0, n - 1)})
+    # OCR audit #58: honor triage.pdf_sample_pages (default 3 keeps the
+    # legacy first/middle/last sampling exactly).
+    _k = max(1, getattr(config.triage, "pdf_sample_pages", 3))
+    if _k == 3:
+        sample_pages = sorted({0, n // 2, max(0, n - 1)})
+    elif n <= _k:
+        sample_pages = list(range(n))
+    else:
+        sample_pages = sorted({int(i * (n - 1) / (_k - 1)) for i in range(_k)})
     chars_total = 0
     text_sample = []
     for i in sample_pages:

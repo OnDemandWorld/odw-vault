@@ -9,8 +9,6 @@ Tests cover:
 
 from __future__ import annotations
 
-import json
-import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +24,6 @@ from rag.conversation import (
     get_or_create_conversation,
     list_conversations,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -311,46 +308,69 @@ class TestRetrievalUsesLastMessageOnly:
     """Verify that the retrieval function receives only the latest query,
     not the full conversation history."""
 
-    def test_retrieval_receives_current_query(self):
-        """The retrieve() function should be called with the current query only."""
-        # This tests the API-level behavior: when a conversation has history,
-        # the /query endpoint should pass only req.query to retrieve(),
-        # not the full conversation text.
+    def test_retrieval_receives_current_query(self, tmp_path):
+        """OCR audit #59: drive the REAL POST /query with a seeded conversation.
 
-        # We verify this by checking the generate_answer call signature
-        # in the API code — it receives req.query (the current message)
-        # while history is passed separately to generate_answer.
+        retrieve() must receive only the current query; generate_answer must
+        receive the prior turns as history. (The old test called its own mocks
+        and asserted on them — a tautology that could never catch a regression.)
+        """
+        import sqlite3
 
-        # Simulate the flow:
-        current_query = "What is the latest status?"
-        history = [
-            {"role": "user", "content": "What happened yesterday?"},
-            {"role": "assistant", "content": "Here is what happened..."},
-        ]
+        import sqlite_utils
+        from fastapi.testclient import TestClient
 
-        # The retrieve() function should receive current_query only
-        # The generate_answer() function should receive both current_query and history
-        mock_retrieve = MagicMock(return_value=([], {}))
-        mock_generate = MagicMock(return_value={
-            "answer": "test",
-            "citations": [],
-            "generation_ms": 100,
-            "model": "test",
-        })
+        from api.main import app
+        from pipeline.db import migrate
+        from rag.conversation import add_message, create_conversation
+        from rag.retrieval import Hit
 
-        # Simulate the API flow
-        mock_retrieve(query=current_query)
-        mock_generate(query=current_query, hits=[], cfg=None, history=history)
+        conn = sqlite3.connect(str(tmp_path / "t.db"), check_same_thread=False)
+        db = sqlite_utils.Database(conn)
+        migrate(db)
+        conv_id = create_conversation(db, user="user1")
+        add_message(db, conv_id, "user", "What happened yesterday?")
+        add_message(db, conv_id, "assistant", "Here is what happened...")
 
-        # Verify retrieve got only the current query
-        retrieve_call = mock_retrieve.call_args
-        assert retrieve_call.kwargs["query"] == current_query
+        cfg = MagicMock()
+        cfg.ollama.host = "http://localhost:11434"
+        cfg.chroma_root_path = str(tmp_path / "chroma")
+        cfg.models.embedding.collection_suffix = "test"
+        cfg.models.embedding.name = "test-embed"
+        cfg.models.generation.name = "test-gen"
+        cfg.models.generation.endpoint = None
+        cfg.models.reranker.enabled = False
+        cfg.models.contextual_retrieval.enabled = False
+        cfg.generation_runtime.refuse_on_empty_context = False
 
-        # Verify generate got both query and history
-        generate_call = mock_generate.call_args
-        assert generate_call.kwargs["query"] == current_query
-        assert generate_call.kwargs["history"] == history
-        assert len(generate_call.kwargs["history"]) == 2
+        hit = Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="d.txt",
+                  page_start=None, text="status text")
+        with (
+            patch("api.main._load_config", return_value=cfg),
+            patch("api.main._get_db", return_value=db),
+            patch("api.main.chromadb.PersistentClient") as mc,
+            patch("api.main.ollama.Client") as mo,
+            patch("api.main.retrieve", return_value=([hit], {"retrieval_ms": 1.0, "query_lang": "en"})) as mock_retrieve,
+            patch("api.main.generate_answer", return_value={
+                "answer": "The latest status is X [1].",
+                "citations": [], "generation_ms": 5.0, "model": "test-gen", "refused": False,
+            }) as mock_generate,
+        ):
+            mc.return_value.get_collection.return_value = MagicMock()
+            mo.return_value.list.return_value = {"models": []}
+            r = TestClient(app).post(
+                "/query",
+                json={"query": "What is the latest status?", "conversation_id": conv_id},
+            )
+
+        assert r.status_code == 200, r.text
+        assert mock_retrieve.call_args.kwargs["query"] == "What is the latest status?"
+        hist = mock_generate.call_args.kwargs["history"]
+        assert any(m["role"] == "user" and "yesterday" in m["content"] for m in hist)
+        assert any(m["role"] == "assistant" for m in hist)
+        # The just-added current message must not be replayed as history.
+        assert not any("latest status" in m["content"] for m in hist)
+        conn.close()
 
     def test_query_log_stores_conversation_id(self, db):
         """query_log should record the conversation_id for each query."""

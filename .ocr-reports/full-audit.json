@@ -846,7 +846,9 @@
     "root_cause": "No USER directive; the process runs as root while config.toml (which can hold models.generation.endpoint.api_key) is volume-mounted, and CMD binds the API to all interfaces. A compromise of the FastAPI/Gradio surface (which processes untrusted uploaded documents and archive contents) yields root in the container with access to the mounted config and corpus volumes.",
     "suggested_fix": "Create a non-root user, chown /app, add USER vault; keep the 0.0.0.0 bind only behind documented auth/reverse-proxy guidance; prefer env-var secrets over a mounted config file.",
     "failure_scenario": "An RCE via a malicious uploaded document or archive extractor runs as root inside the container, reading the mounted config.toml API key and writing to any mounted corpus/cache volume.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: Dockerfile creates UID-10001 vault user, chowns /app, USER vault before EXPOSE/CMD. Test: test_dockerfile_runs_as_non_root PASS (structural; no docker daemon in review env). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 837 passed, 0 failed, exit 0"
   },
   {
     "id": 58,
@@ -859,7 +861,9 @@
     "root_cause": "_should_skip_file only checks is_hidden_or_system (dot-prefix + macOS SYSTEM_FILES, which excludes Thumbs.db) and the cache dir. Nothing reads walk.skip_patterns, triage.pdf_sample_pages (phase3 hardcodes 3 sample pages at line 91), or folder_meta.min_files_to_infer. CLAUDE.md explicitly claims Thumbs.db is skipped.",
     "suggested_fix": "Apply fnmatch against config.walk.skip_patterns in _should_skip_file/_should_skip_dir; honor pdf_sample_pages and min_files_to_infer, or remove the knobs from config/DEFAULT_CONFIG_TOML.",
     "failure_scenario": "Windows-origin corpus with Thumbs.db and *.tmp files: they are hashed, identified, triaged, and embedded despite skip_patterns listing them; pdf_sample_pages=10 still gives 3-page sampling.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: walk applies fnmatch(skip_patterns); phase3 honors pdf_sample_pages (default 3 keeps legacy sampling); phase5 honors min_files_to_infer. Tests: TestDeadConfigKnobs (3) PASS; phase1/3/5 suites PASS (test_ollama_failure updated to seed a file). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 837 passed, 0 failed, exit 0"
   },
   {
     "id": 59,
@@ -872,7 +876,9 @@
     "root_cause": "The test creates MagicMock retrieve/generate stand-ins, calls them itself with arguments it chose, then asserts the mocks received exactly those arguments. Neither api.main./query nor rag.retrieval.retrieve nor generate_answer is imported or executed.",
     "suggested_fix": "Drive POST /query with a conversation_id against a seeded test DB (as test_api_query.py does) and assert mock_retrieve.call_args received only req.query; or delete and rely on the real stream-path assertions.",
     "failure_scenario": "If /query were changed to concatenate the full conversation into the retrieval query (the exact bug the docstring claims to guard against), this test still passes and the regression ships marked covered.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: test_retrieval_receives_current_query rewritten to drive real POST /query with a seeded conversation; asserts retrieve got only the current query and generate got prior turns (current message excluded). PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 837 passed, 0 failed, exit 0"
   },
   {
     "id": 60,
@@ -885,7 +891,9 @@
     "root_cause": "All four tests define their own MockConfig classes and compute the gating expression inside the test body, then assert on that local variable. rag/retrieval.py is never called. The copied expression uses cfg.reranker while the product gate (retrieval.py:209-210) reads cfg.models.reranker.",
     "suggested_fix": "Call retrieve() with a real AppConfig and a patched rag.retrieval.rerank, asserting rerank is/is not called for the four combinations of config enabled and use_reranker override.",
     "failure_scenario": "If retrieve() dropped the use_reranker override or read the wrong config attribute, all four tests still pass; the reranker enable/disable contract has zero real coverage despite four green tests.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: TestRerankerConfigToggle rewritten — 4 tests call real _retrieve_with_client with patched rag.reranker.rerank across config/override combinations. PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 837 passed, 0 failed, exit 0"
   },
   {
     "id": 61,
@@ -898,7 +906,9 @@
     "root_cause": "None of the 13 tests imports api.main or uses TestClient. Tests insert query_log rows themselves and read them back, or write their own LIMIT/OFFSET and LIKE queries ('Simulate the API logic', line 119) and assert SQLite returns what SQLite returns. The actual /queries handler (pagination defaults, keyword escaping, date normalization, user filtering) is never executed.",
     "suggested_fix": "Rewrite against GET /queries with patch('api.main._get_db') as in test_review_fixes_round2.py, asserting page/size/total/items and filter behavior from the endpoint response.",
     "failure_scenario": "The endpoint's pagination offset math, LIKE escaping, or date filtering could be broken (as the LIKE-wildcard bug fixed in round 2 actually was) while all 13 'query history' tests stay green.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: pagination/search suites rewritten against real GET /queries (page/size/total, keyword escaping incl. literal '100%', inclusive end-date, combined filters). 11 endpoint tests PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 837 passed, 0 failed, exit 0"
   },
   {
     "id": 62,

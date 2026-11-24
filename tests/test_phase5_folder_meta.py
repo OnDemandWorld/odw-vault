@@ -246,7 +246,8 @@ class TestPhase5Run:
         cfg = self._make_config(root)
 
         # Insert a folder row so phase5 has something to process
-        test_db["folder"].insert(
+        ft = test_db["folder"]
+        ft.insert(
             {
                 "path": str(root),
                 "rel_path": ".",
@@ -255,6 +256,20 @@ class TestPhase5Run:
                 "depth": 0,
             }
         )
+        # OCR audit #58: min_files_to_infer=1 (default) now skips empty
+        # folders — seed a file so the inference path actually runs.
+        test_db["file"].insert(
+            {
+                "folder_id": ft.last_rowid,
+                "path": str(root / "doc.txt"),
+                "rel_path": "doc.txt",
+                "name": "doc.txt",
+                "size_bytes": 10,
+                "mtime": "2026-01-01T00:00:00Z",
+                "excluded": 0,
+            }
+        )
+        test_db.conn.commit()
 
         def failing_ollama(*args, **kwargs):
             raise Exception("Connection refused")

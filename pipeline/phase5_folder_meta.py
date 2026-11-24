@@ -169,6 +169,17 @@ def run_phase5(
         task = progress.add_task(f"Inferring {len(folders)} folders...", total=len(folders))
 
         for folder in folders:
+            # OCR audit #58: honor folder_meta.min_files_to_infer (was dead).
+            _min_files = config.folder_meta.min_files_to_infer
+            if _min_files > 0:
+                _fc = next(iter(db.query(
+                    "SELECT COUNT(*) AS c FROM file WHERE folder_id = ? AND excluded = 0",
+                    [folder["id"]],
+                )))["c"]
+                if _fc < _min_files:
+                    progress.update(task, advance=1)
+                    continue
+
             prompt, prompt_hash = _build_prompt(folder, db, config)
 
             # Check cache

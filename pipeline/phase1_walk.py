@@ -7,6 +7,7 @@ ProcessPoolExecutor.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -28,6 +29,11 @@ def _should_skip_file(name: str, path: Path, config: Config) -> bool:
     """Determine if a file should be skipped during walk."""
     if is_hidden_or_system(name):
         return True
+    # OCR audit #58: honor walk.skip_patterns (Thumbs.db, *.tmp, ...) —
+    # the config knob was previously dead and CLAUDE.md claimed it worked.
+    for pattern in config.walk.skip_patterns:
+        if fnmatch.fnmatch(name, pattern):
+            return True
     return path.resolve().is_relative_to(config.cache_root_path.resolve())
 
 
