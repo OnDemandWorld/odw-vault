@@ -2404,8 +2404,14 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     t = t.replace(/((?:<li>.*<\\/li>\\n?)+)/g, '<ul>$1</ul>');
     // Ordered lists
     t = t.replace(/^\\d+\\. (.+)$/gm, '<li>$1</li>');
-    // Links
-    t = t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // Links — OCR audit #5: allow only http(s)/mailto schemes and escape
+    // quotes so a crafted URL cannot break out of the href attribute.
+    t = t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, function(m, label, url){
+      var u = String(url).trim();
+      if(!/^(https?:|mailto:)/i.test(u)) return label;
+      u = u.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      return '<a href="' + u + '" target="_blank" rel="noopener">' + label + '</a>';
+    });
     // Citation markers - make clickable
     t = t.replace(/\\[([\\d,\\s]+)\\]/g, function(m, nums){
       var parts = nums.split(/[,\\s]+/).filter(Boolean);
@@ -2521,9 +2527,12 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       var c = conversations[i];
       var active = c.id === _currentConvId ? ' active' : '';
       var title = (c.title || 'Untitled').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      html += '<div class="conv-item' + active + '" data-conv-id="' + c.id + '">' +
+      // OCR audit #6: conversation ids are client-supplied — escape before
+      // interpolating into attributes (stored XSS via innerHTML).
+      var cid = _escHtml(String(c.id));
+      html += '<div class="conv-item' + active + '" data-conv-id="' + cid + '">' +
               '<span class="conv-item__title">' + title + '</span>' +
-              '<button class="conv-item__delete" data-conv-id="' + c.id + '" title="Delete">&times;</button>' +
+              '<button class="conv-item__delete" data-conv-id="' + cid + '" title="Delete">&times;</button>' +
               '</div>';
     }
     list.innerHTML = html;

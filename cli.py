@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pipeline.env  # isort: skip  # noqa: F401
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -14,8 +15,10 @@ import click
 from pipeline.config import DEFAULT_CONFIG_TOML, Config, load_app_config, load_config
 from pipeline.db import cleanup_stale_runs, is_db_initialized, migrate, open_db
 
-# Project root is the directory containing cli.py
-PROJECT_ROOT = Path(__file__).resolve().parent
+# Project root is the directory containing cli.py. OCR audit #8: when pip
+# installs cli.py as a py-module (e.g. the Docker image), __file__ lives in
+# site-packages — VAULT_HOME anchors config/seeds/corpus.db to the real root.
+PROJECT_ROOT = Path(os.environ.get("VAULT_HOME") or Path(__file__).resolve().parent).resolve()
 
 
 def get_config(ctx: click.Context) -> Config:

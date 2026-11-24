@@ -48,36 +48,45 @@ def _transcribe_file(
     try:
         from pywhispercpp.model import Model
 
-        model = Model(model=model_name, fname_audio=filepath)
-        model.print_system_info()
+        # OCR audit #7: use the real pywhispercpp API (Model + transcribe).
+        # Resolve the model locally and fail loudly when absent — the old
+        # code path could silently download models, violating the offline
+        # guarantee.
+        models_dir = cache_root / "models"
+        if Path(model_name).is_file():
+            model_path = str(Path(model_name).resolve())
+        else:
+            candidates = [models_dir / model_name, models_dir / f"{model_name}.bin"]
+            local = next((p for p in candidates if p.is_file()), None)
+            if local is None:
+                return False, None, {
+                    "error": (
+                        f"whisper model '{model_name}' not found in {models_dir}. "
+                        f"Place ggml-{model_name}.bin there (offline mode — no downloads)."
+                    )
+                }
+            model_path = str(local.resolve())
 
-        # Run transcription with parameters
-        params = model.new_full_params(
-            language=None if language == "auto" else language,
-            n_threads=threads,
-            no_timestamps=False,
-            word_timestamps=word_timestamps,
-        )
+        params = {
+            "n_threads": threads,
+            "token_timestamps": word_timestamps,
+            "print_progress": False,
+        }
+        if language and language != "auto":
+            params["language"] = language
+        model = Model(model=model_path, models_dir=str(models_dir), **params)
+        raw_segments = model.transcribe(filepath)
 
-        model.process(
-            fname_audio=filepath,
-            params=params,
-            new_segment_callback=lambda seg: None,  # placeholder
-        )
-
-        # Extract results
+        # Extract results. Segment.t0/t1 are centiseconds in whisper.cpp.
         segments = []
-        for seg in model.segments:
-            seg_data = {
-                "text": seg.text,
-                "start": seg.start,
-                "end": seg.end,
-            }
-            if word_timestamps and hasattr(seg, "words"):
-                seg_data["words"] = [
-                    {"text": w.text, "start": w.start, "end": w.end} for w in seg.words
-                ]
-            segments.append(seg_data)
+        for seg in raw_segments:
+            segments.append(
+                {
+                    "text": seg.text,
+                    "start": seg.t0 / 100.0,
+                    "end": seg.t1 / 100.0,
+                }
+            )
 
         transcript = {
             "sha256": sha256,

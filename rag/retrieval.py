@@ -149,9 +149,12 @@ def _retrieve_with_client(
         candidate_file_ids = set(allowed_file_ids)
 
     # Exclude derived/meta files from search (preflight_report.md
-    # contains folder listings that poison keyword matching)
+    # contains folder listings that poison keyword matching).
+    # OCR audit #1: also honor phase-7 exclusions — file.excluded=1 and
+    # folder.excluded=1 (folder exclusion may predate the file cascade).
     _excluded_file_ids = db.query(
-        "SELECT id FROM file WHERE rel_path = 'preflight_report.md'"
+        "SELECT f.id FROM file f LEFT JOIN folder fo ON f.folder_id = fo.id "
+        "WHERE f.rel_path = 'preflight_report.md' OR f.excluded = 1 OR fo.excluded = 1"
     )
     excluded_ids = {r["id"] for r in _excluded_file_ids}
 
@@ -183,6 +186,11 @@ def _retrieve_with_client(
         dense_candidates,
         candidate_file_ids,
     )
+    # OCR audit #1: when no narrowing/filter binds (candidate_file_ids is
+    # None) the dense query searches the whole collection — excluded files'
+    # vectors must be dropped here. Chroma metadata carries no excluded flag.
+    if excluded_ids:
+        dense_hits = [h for h in dense_hits if h.file_id not in excluded_ids]
     metrics["dense_hits"] = len(dense_hits)
 
     # 6. BM25 chunk retrieval

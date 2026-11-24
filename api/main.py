@@ -1755,42 +1755,65 @@ def delete_file(file_id: int):
     file_row = file_rows[0]
     rel_path = file_row["rel_path"]
 
-    # Delete from disk — containment check so a tampered rel_path
-    # cannot unlink files outside the corpus root.
-    corpus_root = cfg.corpus_root_path
-    file_path = corpus_root / rel_path
-    if (
-        file_path.exists()
-        and file_path.resolve().is_relative_to(corpus_root.resolve())
-    ):
-        file_path.unlink()
+    # OCR audit #4: collect vector refs BEFORE the DB transaction (the rows
+    # are deleted inside it), commit the DB atomically, and only then touch
+    # Chroma and disk — a failed request must never destroy the original.
+    embedding_refs = list(db.query(
+        """SELECT er.id, er.collection, er.external_id
+           FROM embedding_ref er
+           JOIN chunk c ON er.chunk_id = c.id
+           WHERE c.file_id = ?""",
+        [file_id],
+    ))
+    # Summary vectors live in summaries__ keyed by summary_id — without
+    # this join they are orphaned in Chroma forever (the file rows below
+    # are the only record of their ids).
+    summary_refs = list(db.query(
+        """SELECT ser.collection, ser.external_id
+           FROM summary_embedding_ref ser
+           JOIN summary s ON ser.summary_id = s.id
+           WHERE s.file_id = ?""",
+        [file_id],
+    ))
+    embedding_refs.extend(summary_refs)
 
-    # Delete from Chroma
+    # Delete from SQLite — atomic, with FK-reference cleanup first.
+    # archive_expansion.archive_file_id, folder.source_archive_file_id and
+    # file.extracted_from_archive_id reference file(id) WITHOUT cascade;
+    # leaving them dangling made DELETE FROM file raise IntegrityError.
+    from rag.tokenization import remove_zh_index_for_file
+
+    try:
+        remove_zh_index_for_file(db, file_id)
+        db.execute("DELETE FROM archive_expansion WHERE archive_file_id = ?", [file_id])
+        db.execute(
+            "UPDATE folder SET source_archive_file_id = NULL WHERE source_archive_file_id = ?",
+            [file_id],
+        )
+        db.execute(
+            "UPDATE file SET extracted_from_archive_id = NULL WHERE extracted_from_archive_id = ?",
+            [file_id],
+        )
+        db.execute("DELETE FROM embedding_ref WHERE chunk_id IN (SELECT id FROM chunk WHERE file_id = ?)", [file_id])
+        db.execute("DELETE FROM chunk WHERE file_id = ?", [file_id])
+        db.execute("DELETE FROM extraction WHERE file_id = ?", [file_id])
+        db.execute(
+            "DELETE FROM summary_embedding_ref WHERE summary_id IN "
+            "(SELECT id FROM summary WHERE file_id = ?)",
+            [file_id],
+        )
+        db.execute("DELETE FROM summary WHERE file_id = ?", [file_id])
+        db.execute("DELETE FROM failure WHERE file_id = ?", [file_id])
+        db.execute("DELETE FROM file WHERE id = ?", [file_id])
+        db.conn.commit()
+    except Exception:
+        db.conn.rollback()
+        raise
+
+    # Delete from Chroma (best-effort, after the DB commit)
     try:
         chroma_path = str(cfg.chroma_root_path)
         with chromadb.PersistentClient(path=chroma_path) as chroma_client:
-            # Find embedding_ref entries for this file's chunks
-            embedding_refs = list(db.query(
-                """SELECT er.id, er.collection, er.external_id
-                   FROM embedding_ref er
-                   JOIN chunk c ON er.chunk_id = c.id
-                   WHERE c.file_id = ?""",
-                [file_id],
-            ))
-
-            # Summary vectors live in summaries__ keyed by summary_id — without
-            # this join they are orphaned in Chroma forever (the file rows below
-            # are the only record of their ids).
-            summary_refs = list(db.query(
-                """SELECT ser.collection, ser.external_id
-                   FROM summary_embedding_ref ser
-                   JOIN summary s ON ser.summary_id = s.id
-                   WHERE s.file_id = ?""",
-                [file_id],
-            ))
-            for ref in summary_refs:
-                embedding_refs.append(ref)
-
             # Group by collection and delete
             collections_to_delete: dict[str, list[str]] = {}
             for ref in embedding_refs:
@@ -1808,22 +1831,15 @@ def delete_file(file_id: int):
     except Exception as e:
         logger.warning("Failed to connect to Chroma: %s", e)
 
-    # Delete from SQLite (cascade)
-    from rag.tokenization import remove_zh_index_for_file
-
-    remove_zh_index_for_file(db, file_id)
-    db.execute("DELETE FROM embedding_ref WHERE chunk_id IN (SELECT id FROM chunk WHERE file_id = ?)", [file_id])
-    db.execute("DELETE FROM chunk WHERE file_id = ?", [file_id])
-    db.execute("DELETE FROM extraction WHERE file_id = ?", [file_id])
-    db.execute(
-        "DELETE FROM summary_embedding_ref WHERE summary_id IN "
-        "(SELECT id FROM summary WHERE file_id = ?)",
-        [file_id],
-    )
-    db.execute("DELETE FROM summary WHERE file_id = ?", [file_id])
-    db.execute("DELETE FROM failure WHERE file_id = ?", [file_id])
-    db.execute("DELETE FROM file WHERE id = ?", [file_id])
-    db.conn.commit()
+    # Delete from disk LAST — containment check so a tampered rel_path
+    # cannot unlink files outside the corpus root.
+    corpus_root = cfg.corpus_root_path
+    file_path = corpus_root / rel_path
+    if (
+        file_path.exists()
+        and file_path.resolve().is_relative_to(corpus_root.resolve())
+    ):
+        file_path.unlink()
 
     # Best-effort audit trail (V1.3 F-Vault-1) — never blocks the response.
     record_audit(

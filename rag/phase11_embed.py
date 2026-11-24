@@ -157,6 +157,20 @@ def _embed_chunks(
         rows = list(db.query(sql, [model]))
 
     if not rows:
+        # OCR audit #14: with reembed, every previously-eligible chunk may now
+        # be ineligible (excluded/deduped/deleted) — drop its stale vectors.
+        if reembed:
+            try:
+                _stale_coll = client.get_collection(collection_name)
+                _stale_ids = _stale_coll.get(include=[])["ids"]
+                if _stale_ids:
+                    _stale_coll.delete(ids=_stale_ids)
+                    logger.info(
+                        "Re-embed GC: removed %d stale vectors (no eligible chunks)",
+                        len(_stale_ids),
+                    )
+            except Exception:
+                logger.debug("Re-embed GC: collection absent or unreadable")
         logger.info("No chunks to embed.")
         return 0
 
@@ -200,6 +214,19 @@ def _embed_chunks(
     # When re-embedding, remove old refs for this model so new rows won't duplicate
     if reembed:
         db.execute("DELETE FROM embedding_ref WHERE embedding_model = ?", [model])
+        # OCR audit #14: also delete Chroma vectors whose chunks are no longer
+        # eligible (excluded, deduped, or deleted since the last embed) —
+        # otherwise they stay dense-retrievable forever.
+        eligible_ids = {f"c_{r['chunk_id']}" for r in rows}
+        try:
+            existing_ids = coll.get(include=[])["ids"]
+            stale_ids = [eid for eid in existing_ids if eid not in eligible_ids]
+            for i in range(0, len(stale_ids), batch_size):
+                coll.delete(ids=stale_ids[i : i + batch_size])
+            if stale_ids:
+                logger.info("Re-embed GC: removed %d stale vectors", len(stale_ids))
+        except Exception as e:
+            logger.warning("Re-embed GC: failed to clean stale vectors: %s", e)
 
     embedded = 0
     for i in range(0, len(rows), batch_size):

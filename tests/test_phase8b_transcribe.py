@@ -51,15 +51,19 @@ class TestEnsureTranscriptDir:
 
 class TestTranscribeFile:
     def test_import_error(self, tmp_path):
+        from unittest.mock import patch
+
         cache = tmp_path / "cache"
         cache.mkdir()
         p = tmp_path / "audio.wav"
         p.write_bytes(b"fake audio")
 
-        succeeded, _path, err = _transcribe_file(
-            str(p), "abc123", cache, model_name="large-v3"
-        )
-        # pywhispercpp is not installed, so this should fail with ImportError
+        # OCR audit #99: force ImportError deterministically instead of
+        # assuming pywhispercpp is absent from the environment.
+        with patch.dict("sys.modules", {"pywhispercpp.model": None}):
+            succeeded, _path, err = _transcribe_file(
+                str(p), "abc123", cache, model_name="large-v3"
+            )
         assert succeeded is False
         assert err is not None
         assert "pywhispercpp" in err.get("error", "")

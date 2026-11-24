@@ -15,6 +15,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# OCR audit #8: `pip install .` places cli.py in site-packages, so the CLI
+# cannot derive the project root from __file__. Anchor it explicitly.
+ENV VAULT_HOME=/app
+
 # System dependencies:
 #   - build-essential / python3-dev: compile native Python deps (fasttext, chromadb)
 #   - ffmpeg: media duration detection (README runtime dep)

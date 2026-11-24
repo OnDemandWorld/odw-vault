@@ -118,6 +118,32 @@ def run_chunk(
     if rechunk:
         file_ids = [r["file_id"] for r in rows]
         placeholders = ",".join("?" for _ in file_ids)
+        # OCR audit #15: DELETE FROM chunk cascades to embedding_ref but not
+        # to Chroma — remove the vectors first (best-effort) so rechunk does
+        # not leave orphaned, still-retrievable vectors behind.
+        try:
+            refs = list(
+                db.query(
+                    f"SELECT er.collection, er.external_id FROM embedding_ref er "
+                    f"JOIN chunk c ON er.chunk_id = c.id "
+                    f"WHERE c.file_id IN ({placeholders})",
+                    file_ids,
+                )
+            )
+            if refs:
+                import chromadb
+
+                with chromadb.PersistentClient(path=str(cfg.chroma_root_path)) as _cc:
+                    by_coll: dict[str, list[str]] = {}
+                    for r in refs:
+                        by_coll.setdefault(r["collection"], []).append(r["external_id"])
+                    for cname, eids in by_coll.items():
+                        try:
+                            _cc.get_collection(cname).delete(ids=eids)
+                        except Exception as e:
+                            logger.warning("Rechunk: Chroma cleanup failed for %s: %s", cname, e)
+        except Exception as e:
+            logger.warning("Rechunk: Chroma vector cleanup skipped: %s", e)
         # V1.2 M2: clear the additive Chinese index for these files first
         # (standalone FTS table has no auto-sync trigger). Best-effort.
         try:

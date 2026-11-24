@@ -345,6 +345,9 @@ class IncrementalIndexer:
             }
 
         disk_files: dict[str, str] = {}  # absolute path -> sha256
+        # OCR audit #3: paths that exist but could not be read during this
+        # scan must never be classified as deleted (data-loss guard).
+        scan_errors: set[str] = set()
         hashed_count = 0
         skipped_hash = 0
 
@@ -364,11 +367,13 @@ class IncrementalIndexer:
                     fp_str = str(fp.resolve())
                 except OSError:
                     logger.warning("Cannot resolve %s, skipping", fp)
+                    scan_errors.add(str(fp))
                     continue
                 try:
                     stat = fp.stat()
                 except OSError:
                     logger.warning("Cannot stat %s, skipping", fp)
+                    scan_errors.add(fp_str)
                     continue
 
                 # Quick check: if mtime and size match DB, skip hashing.
@@ -395,6 +400,7 @@ class IncrementalIndexer:
                     hashed_count += 1
                 except OSError:
                     logger.warning("Cannot read %s, skipping", fp)
+                    scan_errors.add(fp_str)
 
         logger.debug(
             "Sync scan: %d hashed, %d skipped (mtime match)",
@@ -407,7 +413,9 @@ class IncrementalIndexer:
             p for p in disk_files
             if p in db_files and db_files[p]["sha256"] != disk_files[p]
         ]
-        deleted_paths = [p for p in db_files if p not in disk_files]
+        deleted_paths = [
+            p for p in db_files if p not in disk_files and p not in scan_errors
+        ]
 
         logger.info(
             "Sync detection: %d new, %d modified, %d deleted",
@@ -474,6 +482,11 @@ class IncrementalIndexer:
         # --- 4. Remove deleted ---
         removed = 0
         for p in deleted_paths:
+            # OCR audit #3: never destroy index data for a file that still
+            # exists on disk (e.g. transient read error during the scan).
+            if Path(p).exists():
+                logger.warning("Skipping removal of %s: file still exists on disk", p)
+                continue
             row = next(
                 iter(self.db.query("SELECT id FROM file WHERE path = ?", [p])), None
             )
