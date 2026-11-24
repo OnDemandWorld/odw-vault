@@ -79,12 +79,13 @@ class TestTriageMedia:
             assert result["duration_seconds"] is None
             assert "ffprobe not found" in result["triage_json"]
 
+    # OCR audit #99: skip (not silently pass) when the dependency is absent.
+    @pytest.mark.skipif(shutil.which("ffprobe") is None, reason="ffprobe not installed")
     def test_corrupt_media(self, tmp_path):
         f = tmp_path / "bad.mp4"
         f.write_bytes(b"not media")
-        if shutil.which("ffprobe"):
-            result = _triage_media(str(f))
-            assert result["is_corrupt"] == 1
+        result = _triage_media(str(f))
+        assert result["is_corrupt"] == 1
 
 
 class TestTriageImage:
@@ -117,19 +118,19 @@ class TestDetectLanguage:
             result = _detect_language(str(f), "document")
             assert result is None
 
+    @pytest.mark.skipif(not HAS_LINGUA, reason="lingua not installed")
     def test_short_text(self, tmp_path):
         f = tmp_path / "short.txt"
         f.write_text("Hi", encoding="utf-8")
-        if HAS_LINGUA:
-            result = _detect_language(str(f), "document")
-            assert result is None  # Too short
+        result = _detect_language(str(f), "document")
+        assert result is None  # Too short
 
+    @pytest.mark.skipif(not HAS_LINGUA, reason="lingua not installed")
     def test_non_text_category(self, tmp_path):
         f = tmp_path / "test.txt"
         f.write_text("Hello world " * 20, encoding="utf-8")
-        if HAS_LINGUA:
-            result = _detect_language(str(f), "image")
-            assert result is None  # Not a text-bearing category
+        result = _detect_language(str(f), "image")
+        assert result is None  # Not a text-bearing category
 
 
 class TestPhase3Run:

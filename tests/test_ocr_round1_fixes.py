@@ -2727,3 +2727,156 @@ class TestLowMiscFixes:
         ))
         with pytest.raises(ValueError, match="Corpus root"):
             run_phase1(db, cfg, MagicMock())
+
+
+class TestLowPipelineCliFixes:
+    """OCR #95/#96/#97."""
+
+    def test_cli_phase_applies_pending_migrations(self, tmp_path, monkeypatch):
+        import cli
+        from click.testing import CliRunner
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (tmp_path / "config.toml").write_text(
+            f'[paths]\ncorpus_root = "{corpus}"\ncache_root = "{corpus / ".rag-cache"}"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+        db = open_db(tmp_path / "corpus.db")
+        migrate(db)
+        # Simulate an old-schema DB: drop the v9 column and its version row.
+        db.conn.execute("ALTER TABLE summary DROP COLUMN prompt_version")
+        db.conn.execute("DELETE FROM schema_version WHERE version >= 9")
+        db.conn.commit()
+        db.conn.close()
+
+        result = CliRunner().invoke(cli.main, ["dedup"])
+        assert result.exit_code == 0, result.output
+
+        db2 = open_db(tmp_path / "corpus.db")
+        cols = {r["name"] for r in db2.query("PRAGMA table_info(summary)")}
+        assert "prompt_version" in cols
+        db2.conn.close()
+
+    def test_oversized_file_marks_stale_and_links_failure(self, tmp_path):
+        from pipeline.config import Config, PathsConfig, WalkConfig
+        from pipeline.phase1_walk import run_phase1
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        big = corpus / "big.dat"
+        big.write_bytes(b"x" * 100)
+        db = _seed_db(tmp_path)
+        cfg = Config(
+            paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")),
+            walk=WalkConfig(max_file_size_bytes=10),
+        )
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        fid = seed_test_files(
+            db,
+            files=[{"name": "big.dat", "path": str(big), "folder_id": 1,
+                    "sha256": "oldhash", "hash_status": "done"}],
+        )[0]
+
+        run_phase1(db, cfg, MagicMock(), workers=1)
+
+        row = db["file"].get(fid)
+        assert row["hash_status"] == "stale"
+        fails = list(db["failure"].rows_where("phase = 'walk' AND error_class = 'oversized'"))
+        assert len(fails) == 1
+        assert fails[0]["file_id"] == fid
+
+    def test_hash_failure_classified_missing(self, tmp_path):
+        from concurrent.futures import Future
+
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase1_walk import run_phase1
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "gone.txt").write_text("x", encoding="utf-8")
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")))
+
+        class _InlineExecutor:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def submit(self, fn, *a, **k):
+                fut = Future()
+                try:
+                    fut.set_result(fn(*a, **k))
+                except Exception as e:
+                    fut.set_exception(e)
+                return fut
+
+        with (
+            patch("pipeline.phase1_walk.ProcessPoolExecutor", _InlineExecutor),
+            patch("pipeline.phase1_walk.sha256_file",
+                  side_effect=lambda p: (str(p), None, "[Errno 2] No such file or directory: 'x'")),
+        ):
+            run_phase1(db, cfg, MagicMock(), workers=1)
+
+        fails = list(db["failure"].rows_where("phase = 'walk'"))
+        assert fails and fails[0]["error_class"] == "missing"
+
+    def test_identify_coverage_guard_aborts_pending(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase2_identify import run_phase2
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        f1 = corpus / "a.txt"
+        f1.write_text("a", encoding="utf-8")
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")))
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        seed_test_files(
+            db, files=[{"name": "a.txt", "path": str(f1), "folder_id": 1, "identify_status": "pending"}]
+        )
+
+        proc = MagicMock(returncode=0, stdout=json.dumps({"files": []}), stderr="")
+        with (
+            patch("pipeline.phase2_identify.shutil.which", return_value="/usr/bin/sf"),
+            patch("pipeline.phase2_identify.subprocess.run", return_value=proc),
+            pytest.raises(RuntimeError, match="matched only"),
+        ):
+            run_phase2(db, cfg, MagicMock())
+
+        row = next(iter(db["file"].rows))
+        assert row["identify_status"] == "pending"  # not stamped unknown/done
+
+    def test_identify_reports_unknown_count(self, tmp_path):
+        from pipeline.config import Config, PathsConfig
+        from pipeline.phase2_identify import run_phase2
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        f1 = corpus / "a.xyz"
+        f1.write_text("a", encoding="utf-8")
+        db = _seed_db(tmp_path)
+        cfg = Config(paths=PathsConfig(corpus_root=str(corpus), cache_root=str(corpus / ".rag-cache")))
+        db["folder"].insert({"path": str(corpus), "rel_path": ".", "name": ".", "depth": 0})
+        db.conn.commit()
+        seed_test_files(
+            db, files=[{"name": "a.xyz", "path": str(f1), "folder_id": 1, "identify_status": "pending"}]
+        )
+
+        sf_out = json.dumps({"files": [{"filename": str(f1), "matches": []}]})
+        proc = MagicMock(returncode=0, stdout=sf_out, stderr="")
+        with (
+            patch("pipeline.phase2_identify.shutil.which", return_value="/usr/bin/sf"),
+            patch("pipeline.phase2_identify.subprocess.run", return_value=proc),
+        ):
+            result = run_phase2(db, cfg, MagicMock())
+
+        assert result["files_failed"] == 1

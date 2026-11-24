@@ -1420,7 +1420,9 @@
     "root_cause": "migrate() is called only by init, api/main.py, and ui/gradio_app.py. _run_phase/_run_app_phase check is_db_initialized but not schema version, so an existing DB from an older release stays at its old schema when the user upgrades and runs CLI phases.",
     "suggested_fix": "Call migrate(db) in _run_phase/_run_app_phase (idempotent and cheap when current).",
     "failure_scenario": "DB at schema v4, code upgraded to v8: `vault query` with a workspace filter or any path touching file.workspace/chunk_fts_zh fails with 'no such column/table' until the user happens to start the API or UI.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: _run_phase/_run_app_phase call migrate(db) — CLI runs keep schema current after upgrades. Test: downgraded DB re-migrated via `vault dedup`. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 874 passed, 0 failed, exit 0"
   },
   {
     "id": 96,
@@ -1433,7 +1435,9 @@
     "root_cause": "Any OSError from sha256_file (e.g. ENOENT for a file deleted between walk and hash) is recorded as error_class='permission'. The oversized (157-164) and symlink (125-132) record_failure calls pass no file_id, and the oversized path leaves an existing hash_status='done' row with stale sha256/size/mtime untouched.",
     "suggested_fix": "Classify via errno (ENOENT->missing, EACCES->permission); pass file_id when a row exists; mark the stale row when a file becomes oversized.",
     "failure_scenario": "File grows past 5 GiB after a prior walk: walk logs an unlinked 'oversized' failure but the DB row keeps its old hash and 'done' status; dedup can still pick it as canonical while the failure summary mislabels deleted-file errors as permission problems.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: hash failures classified missing vs permission and linked to file rows; oversized files marked hash_status='stale' with linked failure; symlink failures linked. Tests: oversized-stale + missing-classification PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 874 passed, 0 failed, exit 0"
   },
   {
     "id": 97,
@@ -1446,7 +1450,9 @@
     "root_cause": "When >90% of pending paths don't match sf output, the guard logs errors but proceeds to set category='unknown', identify_status='done' on all files, so a re-run without --reidentify skips them forever; run_phase2 always returns files_failed=0 even when unsupported_format failures were recorded.",
     "suggested_fix": "Raise (or leave identify_status='pending' and record a phase-level failure) when the coverage guard trips; return actual unknown/failure counts in files_failed.",
     "failure_scenario": "sf output paths mismatch DB paths (corpus moved, sf version change): every file permanently stamped unknown/done, pipeline_run shows 'done' with files_failed=0, corpus silently misclassified until --reidentify.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: coverage guard raises RuntimeError leaving identify_status='pending' (no permanent unknown/done stamping); files_failed reports the unknown count. Tests: abort-pending + unknown-count PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 874 passed, 0 failed, exit 0"
   },
   {
     "id": 98,
@@ -1459,7 +1465,9 @@
     "root_cause": "After running run_phase1 twice, the test only asserts file_count >= 2. It never compares r1/r2 processed counts. A second walk that re-hashes all files or records failures still leaves count == 2 and passes.",
     "suggested_fix": "Capture the count and r1['files_processed'] after the first run; assert r2['files_processed'] == 0, count unchanged, and no new failure rows.",
     "failure_scenario": "The e2e suite reports idempotency covered while a walk that re-hashes the full corpus on every invocation passes unnoticed.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: e2e walk-idempotent compares both runs (count unchanged, r2 processed == 0). PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 874 passed, 0 failed, exit 0"
   },
   {
     "id": 99,
@@ -1472,6 +1480,8 @@
     "root_cause": "test_corrupt_media only asserts inside if shutil.which('ffprobe'); test_short_text and test_non_text_category only inside if HAS_LINGUA. Without those dependencies the tests report passed while executing zero assertions. Related: tests/test_phase8b_transcribe.py:53-65 asserts the error string 'pywhispercpp' assuming the optional package is absent, hard-failing if it is ever installed.",
     "suggested_fix": "Use @pytest.mark.skipif for ffprobe/lingua so absent dependencies show as skipped; in test_phase8b patch the import or skip when pywhispercpp is importable.",
     "failure_scenario": "CI without ffprobe shows test_corrupt_media green although corrupt-media detection was never exercised; installing the optional whisper dependency turns a green suite red for reasons unrelated to any code change.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: ffprobe/lingua-gated triage tests use @pytest.mark.skipif (skipped, not silently passed); phase8b ImportError test made deterministic in the Medium round. PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 874 passed, 0 failed, exit 0"
   }
 ]

@@ -52,38 +52,40 @@ Six parallel review batches (API, RAG core, RAG phases/extractors, pipeline/CLI/
 
 ---
 
-## Round 1 Remediation Progress (2026-11-24)
+## Round 1 Remediation Progress (2026-11-24/25)
 
 **Branch:** `fix/ocr-full-audit-round-1` (off `dev` @ `e1846a0`) — for Jack's review; nothing merged to `main`.
 
 | Disposition | Count | IDs |
 |---|---|---|
-| **Fixed** | 66 | all 9 High (#1–#9); 56 Medium; 1 Low (#79, coupled with #36) |
+| **Fixed** | 97 | all 9 High (#1–#9), all Medium except #38/#43, all 31 Low (#68–#99) |
 | **Skipped (sign-off needed)** | 2 | #38 (CORS default vs documented integration contract), #43 (feedback protocol redesign) |
-| **Open (Low, not in this round's scope)** | 31 | #68–#99 except #79 |
+| **Open** | 0 | — |
 
 ### Baseline (before any edits)
 - `python -m pytest tests/ -q --no-cov` → **737 passed, 3 skipped, 0 failed**
 - `python -m ruff check tests/test_api_auth.py` (CI strict gate) → **pass**
 - `python -m ruff check pipeline/ rag/ api/ eval/ ui/ cli.py tests/` → **194 pre-existing errors** (informational per CI)
 - No type-checker configured; no Makefile.
-- Side effect observed: the baseline run created a repo-root `corpus.db` (live confirmation of finding #9).
+- Side effect observed: the baseline run created a repo-root `corpus.db` (live confirmation of finding #9; removed).
 
 ### Verification protocol used per pass
 1. Targeted suites: `python -m pytest tests/test_ocr_round1_fixes.py <affected module suites> -q --no-cov`
 2. Lint on changed files: `python -m ruff check <changed files>` (no new errors vs baseline)
 3. Full suite: `python -m pytest tests/ -q --no-cov -p no:cacheprovider`
-4. Final state: **838 passed, 0 failed** (737 baseline + 98 new/rewritten regression tests + 3 formerly-skipped watcher tests activated by installing watchdog).
+4. Final state: **874 passed, 0 failed** (737 baseline + 134 new/rewritten regression tests + 3 formerly-skipped watcher tests activated by installing the optional `watchdog` extra).
 
-New regression coverage lives in `tests/test_ocr_round1_fixes.py` (node-executed XSS payloads, real-endpoint API tests, FK/rollback data-loss tests, dedup/exclusion/GC invariants) plus rewrites of the false-confidence suites (#59–#67).
+Fixes were applied in 18 passes of ≤5 findings (1 High pass-cluster, 10 Medium passes, 6 Low passes + coupled fixes), each committed separately for review. New regression coverage lives in `tests/test_ocr_round1_fixes.py` (node-executed XSS payloads, real-endpoint API tests, FK/rollback data-loss tests, dedup/exclusion/GC invariants, migration and failure-classification checks) plus rewrites of the false-confidence suites (#59–#67, #98, #99).
 
 ### Skipped items — decisions needed from Jack
 - **#38** — CORS `*` default is documented as intentional (integration contract / Loop canvas). Changing the default origin allowlist needs product sign-off. Mitigation today: `VAULT_CORS_ORIGINS` + `VAULT_API_KEY`.
 - **#43** — correct fix requires returning query_log ids to the client and keying feedback by (conversation, message), replacing process-global mappings in the legacy Gradio path. Coordinate with the #44 ordinal fix already landed.
-- **#56 (partial)** — unar/p7zip installed in-image; Siegfried binary stays user-provided (mount at `/app/sf`); bundling a pinned release needs a URL/version decision. Docker build not executed (no daemon in review environment).
 
-### Remaining open items
-The 31 Low findings (#68–#99 except #79) were out of this round's requested scope (High → Medium). They remain documented in `full-audit.json` with root causes and suggested fixes for a follow-up round.
+### Partial fixes / residuals (documented, not blockers)
+- **#56** — unar/p7zip installed in-image; Siegfried stays user-provided (mount at `/app/sf`); bundling a pinned release needs a URL/version decision. Docker build not executed (no daemon in review environment).
+- **#40** — provider/settings mutations loopback-guarded; conversation read/delete routes remain unauthenticated (full auth needs design).
+- **#94** — missing corpus root now fails loudly; relative config paths remain CWD-dependent (config-wide anchoring is a separate decision).
+- **#21** — require_citations enforced in generate_answer (/query, CLI); the streaming UI path has its own generation loop.
 
 ---
 
@@ -185,46 +187,46 @@ The 31 Low findings (#68–#99 except #79) were out of this round's requested sc
 ## LOW (32)
 
 ### RAG core & phases
-- [ ] **#68** — Query-embed failure swallowed as empty result (outage looks like content refusal) · `rag/retrieval.py:132-136` *(host-verified)*
-- [ ] **#69** — LIKE wildcards unescaped in `_find_files_by_path` (`%` token matches whole corpus) · `rag/retrieval.py:483-496` *(host-verified)*
-- [ ] **#70** — Untrusted chunk text injected into prompt without spotlighting; fake `[N]` markers bind to real chunks · `rag/generation.py:143-149`
-- [ ] **#71** — Indexer page mapping: final chunk `end_page = page_count + 1` · `rag/indexer.py:749-750`
-- [ ] **#72** — `sync_file` returns success despite failed extraction/embedding stages · `rag/indexer.py:277-295`
-- [ ] **#73** — `on_moved` bypasses `_should_skip` (indexes into .rag-cache/hidden dirs) · `rag/watcher.py:60-64`
-- [ ] **#74** — Paragraph strategy emits unbounded chunks; embedding truncates tail (dense recall loss) · `rag/chunk_strategies.py:329-357`
-- [ ] **#75** — Phase-10 page mapping: same `end_page` off-by-one as #71 · `rag/phase10_chunk.py:179-184`
-- [ ] **#76** — `--folder` interpolated into SQL (apostrophe crashes; injection surface) · `rag/phase8b_transcribe.py:147-148`
-- [ ] **#77** — `max_tokens` ignored (`num_predict` never set); claimed length validation absent · `rag/phase9_summarize.py:43-56`
-- [ ] **#78** — `force_perform` is not an ocrmypdf kwarg (real flag: `force_ocr`) → PriorOcrFoundError failures · `rag/extractors/ocr_extractor.py:32-39`
+- [x] **#68** — Query-embed failure swallowed as empty result (outage looks like content refusal) · `rag/retrieval.py:132-136` *(host-verified)*
+- [x] **#69** — LIKE wildcards unescaped in `_find_files_by_path` (`%` token matches whole corpus) · `rag/retrieval.py:483-496` *(host-verified)*
+- [x] **#70** — Untrusted chunk text injected into prompt without spotlighting; fake `[N]` markers bind to real chunks · `rag/generation.py:143-149`
+- [x] **#71** — Indexer page mapping: final chunk `end_page = page_count + 1` · `rag/indexer.py:749-750`
+- [x] **#72** — `sync_file` returns success despite failed extraction/embedding stages · `rag/indexer.py:277-295`
+- [x] **#73** — `on_moved` bypasses `_should_skip` (indexes into .rag-cache/hidden dirs) · `rag/watcher.py:60-64`
+- [x] **#74** — Paragraph strategy emits unbounded chunks; embedding truncates tail (dense recall loss) · `rag/chunk_strategies.py:329-357`
+- [x] **#75** — Phase-10 page mapping: same `end_page` off-by-one as #71 · `rag/phase10_chunk.py:179-184`
+- [x] **#76** — `--folder` interpolated into SQL (apostrophe crashes; injection surface) · `rag/phase8b_transcribe.py:147-148`
+- [x] **#77** — `max_tokens` ignored (`num_predict` never set); claimed length validation absent · `rag/phase9_summarize.py:43-56`
+- [x] **#78** — `force_perform` is not an ocrmypdf kwarg (real flag: `force_ocr`) → PriorOcrFoundError failures · `rag/extractors/ocr_extractor.py:32-39`
 
 ### API
 - [x] **#79** — /files/{id}/text serves oldest extraction row (no ORDER BY) · `api/main.py:1100-1108`
-- [ ] **#80** — Refusal `done` event: `total_ms` may be null, `conversation_id` missing · `api/main.py:851-860`
-- [ ] **#81** — /query/stream skips the generation-endpoint precheck /query performs · `api/main.py:665-688`
-- [ ] **#82** — `_eval_runs` unbounded; wedged thread blocks all future eval runs (409 forever) · `api/main.py:1160-1205` *(host-verified)*
-- [ ] **#83** — Eval status endpoint returns raw traceback fragments unauthenticated · `api/main.py:1181-1205`
-- [ ] **#84** — Unparseable audit date bounds → silent empty 200 result · `api/audit.py:99-104` *(host-verified)*
+- [x] **#80** — Refusal `done` event: `total_ms` may be null, `conversation_id` missing · `api/main.py:851-860`
+- [x] **#81** — /query/stream skips the generation-endpoint precheck /query performs · `api/main.py:665-688`
+- [x] **#82** — `_eval_runs` unbounded; wedged thread blocks all future eval runs (409 forever) · `api/main.py:1160-1205` *(host-verified)*
+- [x] **#83** — Eval status endpoint returns raw traceback fragments unauthenticated · `api/main.py:1181-1205`
+- [x] **#84** — Unparseable audit date bounds → silent empty 200 result · `api/audit.py:99-104` *(host-verified)*
 
 ### UI / benchmarks
-- [ ] **#85** — `query_log.answer_model` records config default, not active provider · `ui/gradio_app.py:553-556`
-- [ ] **#86** — Provider registry: write failures reported as success; corrupt file reseeds away keys; no locking · `ui/gradio_app.py:173-215`
-- [ ] **#87** — Stop button aborts client only; backend generates and persists full answer · `ui/gradio_app.py:2188-2204`
-- [ ] **#88** — Legacy citations HTML unescaped (snippet + rel_path XSS) · `ui/gradio_app_legacy.py:164-183`
-- [ ] **#89** — Legacy feedback UPDATE…ORDER BY…LIMIT invalid in bundled SQLite; feedback never recorded · `ui/gradio_app_legacy.py:291-300`
-- [ ] **#90** — Legacy generation ignores configured generation endpoint (cloud models fail) · `ui/gradio_app_legacy.py:134-135`
-- [ ] **#91** — benchmark.py posts 3 args to 4-input /chat (Gradio 6 rejects); length counts parts · `ui/benchmark.py:220-224`
-- [ ] **#92** — benchmark_gpt_oss.py unpacks 4-tuples into 3 vars → crash after all queries run · `ui/benchmark_gpt_oss.py:124` *(host-verified)*
+- [x] **#85** — `query_log.answer_model` records config default, not active provider · `ui/gradio_app.py:553-556`
+- [x] **#86** — Provider registry: write failures reported as success; corrupt file reseeds away keys; no locking · `ui/gradio_app.py:173-215`
+- [x] **#87** — Stop button aborts client only; backend generates and persists full answer · `ui/gradio_app.py:2188-2204`
+- [x] **#88** — Legacy citations HTML unescaped (snippet + rel_path XSS) · `ui/gradio_app_legacy.py:164-183`
+- [x] **#89** — Legacy feedback UPDATE…ORDER BY…LIMIT invalid in bundled SQLite; feedback never recorded · `ui/gradio_app_legacy.py:291-300`
+- [x] **#90** — Legacy generation ignores configured generation endpoint (cloud models fail) · `ui/gradio_app_legacy.py:134-135`
+- [x] **#91** — benchmark.py posts 3 args to 4-input /chat (Gradio 6 rejects); length counts parts · `ui/benchmark.py:220-224`
+- [x] **#92** — benchmark_gpt_oss.py unpacks 4-tuples into 3 vars → crash after all queries run · `ui/benchmark_gpt_oss.py:124` *(host-verified)*
 
 ### Pipeline / CLI
-- [ ] **#93** — run_phase3 db_path fallback points at nonexistent cache/corpus.db · `pipeline/phase3_triage.py:210-211`
-- [ ] **#94** — Walk "succeeds" with 0 files on missing root; relative config paths CWD-dependent · `pipeline/phase1_walk.py:98-108`
-- [ ] **#95** — CLI phase commands never apply pending migrations · `cli.py:116-123`
-- [ ] **#96** — Hash failures all classified 'permission'; oversized/symlink failures unlinked, stale rows stay valid · `pipeline/phase1_walk.py:224-233`
-- [ ] **#97** — Identify coverage guard only logs; files stamped unknown/done, files_failed=0 · `pipeline/phase2_identify.py:126-132`
+- [x] **#93** — run_phase3 db_path fallback points at nonexistent cache/corpus.db · `pipeline/phase3_triage.py:210-211`
+- [x] **#94** — Walk "succeeds" with 0 files on missing root; relative config paths CWD-dependent · `pipeline/phase1_walk.py:98-108`
+- [x] **#95** — CLI phase commands never apply pending migrations · `cli.py:116-123`
+- [x] **#96** — Hash failures all classified 'permission'; oversized/symlink failures unlinked, stale rows stay valid · `pipeline/phase1_walk.py:224-233`
+- [x] **#97** — Identify coverage guard only logs; files stamped unknown/done, files_failed=0 · `pipeline/phase2_identify.py:126-132`
 
 ### Tests
-- [ ] **#98** — e2e walk-idempotent never compares the two runs · `tests/test_e2e_pipeline.py:55-70`
-- [ ] **#99** — ffprobe/lingua-gated assertions pass silently when deps absent; phase8b test hard-fails if whisper installed · `tests/test_phase3_triage.py:82-132`
+- [x] **#98** — e2e walk-idempotent never compares the two runs · `tests/test_e2e_pipeline.py:55-70`
+- [x] **#99** — ffprobe/lingua-gated assertions pass silently when deps absent; phase8b test hard-fails if whisper installed · `tests/test_phase3_triage.py:82-132`
 
 ---
 

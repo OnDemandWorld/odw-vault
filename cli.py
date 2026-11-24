@@ -143,6 +143,10 @@ def _run_phase(ctx: click.Context, phase_name: str, phase_fn, **kwargs):
         click.echo("Error: database not initialized. Run 'init' first.", err=True)
         ctx.exit(1)
     db = open_db(db_path)
+    # OCR audit #95: apply pending migrations on CLI runs too — an upgraded
+    # codebase against an old-schema DB used to fail with 'no such column'
+    # until the user happened to start the API/UI.
+    migrate(db)
 
     from pipeline.logging import PhaseLogger
 
@@ -452,6 +456,7 @@ def _run_app_phase(ctx: click.Context, phase_name: str, phase_fn, **kwargs):
         click.echo("Error: database not initialized. Run 'init' first.", err=True)
         ctx.exit(1)
     db = open_db(db_path)
+    migrate(db)  # OCR audit #95: keep CLI runs schema-current
 
     from pipeline.logging import PhaseLogger
 

@@ -133,9 +133,12 @@ def run_phase2(
     # would silently fall through to 'unknown' — make it loud instead.
     _unmatched = sum(1 for fp in files_to_id if fp not in sf_results)
     if files_to_id and _unmatched > 0.9 * len(files_to_id):
-        plog.error(
+        # OCR audit #97: fail loudly and leave identify_status='pending' —
+        # the old log-only guard stamped every file unknown/done, so re-runs
+        # skipped them forever and the corpus stayed silently misclassified.
+        raise RuntimeError(
             f"Siegfried output matched only {len(files_to_id) - _unmatched}/"
-            f"{len(files_to_id)} files — most files will be marked 'unknown'. "
+            f"{len(files_to_id)} files — aborting before marking files 'unknown'. "
             "Check corpus_root vs sf output paths."
         )
 
@@ -245,4 +248,5 @@ def run_phase2(
         identified=identified,
         unknown=unknown,
     )
-    return {"files_processed": identified, "files_failed": 0}
+    # OCR audit #97: report unidentifiable files instead of a constant 0.
+    return {"files_processed": identified, "files_failed": unknown}
