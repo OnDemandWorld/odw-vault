@@ -1392,3 +1392,123 @@ class TestValidation422Serialization:
         client = TestClient(app)
         r = client.get("/queries", params={"page": "x"})
         assert r.status_code == 422
+
+
+class TestApiResponsivenessFixes:
+    """OCR #32/#33/#34/#35: event-loop and export fixes."""
+
+    def test_stream_refusal_persists_via_threadpool(self, tmp_path):
+        import sqlite3
+
+        import sqlite_utils
+        from fastapi.testclient import TestClient
+
+        import api.main as api_main
+        from api.main import app
+
+        conn = sqlite3.connect(str(tmp_path / "t.db"), check_same_thread=False)
+        db = sqlite_utils.Database(conn)
+        migrate(db)
+
+        cfg = MagicMock()
+        cfg.ollama.host = "http://localhost:11434"
+        cfg.chroma_root_path = str(tmp_path / "chroma")
+        cfg.models.embedding.collection_suffix = "test"
+        cfg.models.embedding.name = "test-embed"
+        cfg.models.generation.name = "test-gen"
+        cfg.models.reranker.enabled = False
+        cfg.generation_runtime.refuse_on_empty_context = True
+
+        orig_threadpool = api_main.run_in_threadpool
+        with (
+            patch("api.main._load_config", return_value=cfg),
+            patch("api.main._get_db", return_value=db),
+            patch("api.main.chromadb.PersistentClient") as mc,
+            patch("api.main.ollama.Client") as mo,
+            patch("api.main.retrieve", return_value=([], {"retrieval_ms": 1.0, "query_lang": "en"})),
+            patch("rag.generation._make_client") as mk,
+            patch("api.main.run_in_threadpool", wraps=orig_threadpool) as spy,
+        ):
+            from unittest.mock import AsyncMock
+
+            mk.return_value.close = AsyncMock()
+            mc.return_value.get_collection.return_value = MagicMock()
+            mo.return_value.list.return_value = {"models": []}
+            r = TestClient(app).post("/query/stream", json={"query": "anything"})
+
+        assert r.status_code == 200
+        assert '"refused": true' in r.text or '"refused":true' in r.text
+        # _persist_stream_query is a closure inside query_stream — match by name.
+        assert any(
+            c.args
+            and callable(c.args[0])
+            and getattr(c.args[0], "__name__", "") == "_persist_stream_query"
+            for c in spy.call_args_list
+        ), "refusal persistence must run via run_in_threadpool"
+        conn.close()
+
+    def test_otlp_export_does_not_block_caller(self):
+        import threading
+        import time
+
+        from api.spans import OtlpHttpSpanExporter, _wait_otlp_idle, start_span
+
+        release = threading.Event()
+        posted = threading.Event()
+
+        class _Resp:
+            def read(self):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def slow_urlopen(req, timeout=None):
+            posted.set()
+            release.wait(5)
+            return _Resp()
+
+        with patch("urllib.request.urlopen", side_effect=slow_urlopen):
+            sp = start_span("otlp.slow")
+            sp.end()
+            t0 = time.monotonic()
+            OtlpHttpSpanExporter(endpoint="http://collector:4318/v1/traces").export(sp)
+            elapsed = time.monotonic() - t0
+            assert elapsed < 1.0, "export() must not wait for the HTTP POST"
+            assert posted.wait(2)
+            release.set()
+            _wait_otlp_idle()
+
+    def test_folders_tree_links_nested_paths(self, tmp_path):
+        import sqlite3
+
+        import sqlite_utils
+        from fastapi.testclient import TestClient
+
+        from api.main import app
+
+        conn = sqlite3.connect(str(tmp_path / "t.db"), check_same_thread=False)
+        db = sqlite_utils.Database(conn)
+        migrate(db)
+        ft = db["folder"]
+        ft.insert({"path": "/c", "rel_path": ".", "name": ".", "depth": 0})
+        root_id = ft.last_rowid
+        ft.insert({"path": "/c/a", "rel_path": "a", "name": "a", "depth": 1, "parent_id": root_id})
+        a_id = ft.last_rowid
+        ft.insert({"path": "/c/a/b", "rel_path": "a/b", "name": "b", "depth": 2, "parent_id": a_id})
+        db.conn.commit()
+
+        with patch("api.main._get_db", return_value=db):
+            r = TestClient(app).get("/folders")
+
+        assert r.status_code == 200
+        tree = r.json()
+        # Folders whose parent is "." are roots by design; "a/b" must be
+        # linked under "a" via the O(1) rel_path index.
+        a_nodes = [n for n in tree if n["rel_path"] == "a"]
+        assert len(a_nodes) == 1
+        assert [c["rel_path"] for c in a_nodes[0]["children"]] == ["a/b"]
+        conn.close()

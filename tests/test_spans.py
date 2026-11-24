@@ -239,6 +239,10 @@ class TestExporters:
         sp.end()
         OtlpHttpSpanExporter(endpoint="http://collector:4318/v1/traces", timeout=1.5).export(sp)
 
+        # OCR audit #34: export is now background — wait for the queue to drain.
+        from api.spans import _wait_otlp_idle
+
+        _wait_otlp_idle()
         assert calls["url"] == "http://collector:4318/v1/traces"
         assert calls["timeout"] == 1.5
         assert b"resourceSpans" in calls["data"]

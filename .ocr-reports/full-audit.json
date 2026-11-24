@@ -471,7 +471,9 @@
     "root_cause": "_upload_files_impl is async but runs corpus_root.mkdir, dest.open/stat/resolve, and all db inserts/commits directly on the event-loop thread; only out.write is offloaded. Connections use busy_timeout=5000, so a commit contending with the background sync/watcher writer blocks the loop up to 5s per statement.",
     "suggested_fix": "Run the per-file persist section via run_in_threadpool, or make the handler sync def so FastAPI runs it in the threadpool; keep only UploadFile.read awaits on the loop.",
     "failure_scenario": "While /pipeline/sync or the watcher holds the SQLite write lock, an upload's commit waits up to 5s on the event loop; every concurrent request — including all in-flight SSE token pushes — stalls.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: upload persist extracted to worker-thread helpers (_ensure_upload_root_folder, _persist_uploaded_file) using thread-local _get_db; mkdir offloaded; only UploadFile.read/write awaits remain inline. tests/test_file_management.py 12 PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 806 passed, 0 failed, exit 0"
   },
   {
     "id": 33,
@@ -484,7 +486,9 @@
     "root_cause": "The comment at 761-763 says persistence must run on a worker thread; the normal path uses await run_in_threadpool (912-914). The refuse branch at 845-849 instead calls _persist_stream_query synchronously inside event_generator, creating/using a sqlite connection on the event-loop thread with 2 writes + 2 commits, blocking up to busy_timeout=5s under contention.",
     "suggested_fix": "Use query_log_id = await run_in_threadpool(_persist_stream_query, ...) in the refuse branch, matching the normal path.",
     "failure_scenario": "refuse_on_empty_context=true with a filter yielding no hits while a background sync holds the write lock: the refused stream's direct commit blocks the event loop for seconds, freezing token delivery for all concurrent streamed queries.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: refuse branch persists via await run_in_threadpool(_persist_stream_query,...). Test: TestApiResponsivenessFixes.test_stream_refusal_persists_via_threadpool PASS (threadpool spy). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 806 passed, 0 failed, exit 0"
   },
   {
     "id": 34,
@@ -497,7 +501,9 @@
     "root_cause": "OtlpHttpSpanExporter.export uses urllib.request.urlopen (timeout=2.0) called synchronously from Span.end inside the request handler. /query emits 3 spans sequentially, each adding up to 2s of blocking I/O; for the async upload handler span.end runs on the event loop. No queue, batching, or background flush.",
     "suggested_fix": "Buffer ended spans and export from a dedicated background worker (queue.Queue + batch POST), or offload via run_in_threadpool for async call sites; keep the short timeout and silent degradation.",
     "failure_scenario": "TRACE_EXPORTER=otlp with a slow/unreachable endpoint: every /query takes ~6s extra (3 spans x 2s) even though generation succeeded; each upload freezes the event loop up to 2s at span end.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: OTLP export enqueues payload; single module-level daemon worker POSTs (queue + task_done). Test: test_otlp_export_does_not_block_caller PASS; test_otlp_exporter_posts_payload updated to drain the queue. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 806 passed, 0 failed, exit 0"
   },
   {
     "id": 35,
@@ -510,7 +516,9 @@
     "root_cause": "For every folder row the code iterates the entire node_map comparing rel_path strings to find the parent, instead of a dict lookup keyed by rel_path.",
     "suggested_fix": "Build a {rel_path: FolderNode} index once and look up parent_path in O(1); fall back to roots when absent.",
     "failure_scenario": "A corpus with 10,000 folders makes GET /folders perform ~50-100M string comparisons (tens of seconds of CPU), saturating a threadpool worker; the folder tree UI times out and repeated polling compounds the load.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: /folders builds a rel_path->node dict for O(1) parent lookup. Test: test_folders_tree_links_nested_paths PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 806 passed, 0 failed, exit 0"
   },
   {
     "id": 36,
@@ -523,7 +531,9 @@
     "root_cause": "The query selects e.text_extracted AS extraction_path and FileResponse.extraction_path (schemas.py:86) carries it verbatim. extraction.text_extracted stores the actual text, not a path — the sibling endpoint /files/{id}/text exists to serve it.",
     "suggested_fix": "Return the artifact path or a URL/boolean instead of the text; if text is genuinely wanted, rename the field and document it.",
     "failure_scenario": "A UI polling GET /files/{id} for a large PDF receives ~1MB of raw document text in JSON on every poll; any client treating extraction_path as a filesystem path breaks.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: extraction_path now returns '/files/{id}/text' pointer instead of full document text (UI does not consume the field). test_reextract_idempotency updated to the new contract. Coupled fix #79 required so /text serves the latest extraction. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 806 passed, 0 failed, exit 0"
   },
   {
     "id": 37,
@@ -1082,7 +1092,9 @@
     "root_cause": "The query selects all succeeded=1 extraction rows with no ORDER BY and returns row[0]. Multiple rows accumulate when phase 8 re-runs (inserts without deleting prior rows); SQLite returns rowid order, so the stale first extraction wins. GET /files/{id} deliberately picks MAX(id), making the endpoints disagree.",
     "suggested_fix": "Add ORDER BY id DESC LIMIT 1 (mirroring the MAX(id) selection in get_file).",
     "failure_scenario": "A document re-extracted after an extractor fix: /files/{id} shows the new summary while /files/{id}/text keeps serving outdated text.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed (coupled with #36): /files/{id}/text ORDER BY id DESC LIMIT 1 — latest successful extraction, matching GET /files/{id}. Covered by updated test_reextract_idempotency. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 806 passed, 0 failed, exit 0"
   },
   {
     "id": 80,

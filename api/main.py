@@ -849,7 +849,11 @@ def query_stream(req: QueryRequest):
             if cfg.generation_runtime.refuse_on_empty_context and not hits:
                 from rag.generation import REFUSAL_TEXT
 
-                query_log_id = _persist_stream_query(
+                # OCR audit #33: persist on a worker thread like the normal
+                # path — a direct sqlite commit here blocks the event loop
+                # (up to busy_timeout) and freezes all concurrent streams.
+                query_log_id = await run_in_threadpool(
+                    _persist_stream_query,
                     REFUSAL_TEXT,
                     int((time.monotonic() - t0) * 1000),
                     0,
@@ -1031,7 +1035,10 @@ def list_folders(workspace: str | None = None):
             inferred_label=r.get("inferred_label"),
         )
 
-    # Link children to parents
+    # Link children to parents.
+    # OCR audit #35: O(1) rel_path index instead of an O(n^2) linear scan
+    # per node (10k folders used to mean ~50-100M string comparisons).
+    by_rel_path: dict[str, FolderNode] = {n.rel_path: n for n in node_map.values()}
     roots: list[FolderNode] = []
     for r in rows:
         node = node_map[r["id"]]
@@ -1040,11 +1047,9 @@ def list_folders(workspace: str | None = None):
         if parent_path == "." or parent_path == "":
             roots.append(node)
         else:
-            # Find parent node
-            for _pid, pnode in node_map.items():
-                if pnode.rel_path == parent_path:
-                    pnode.children.append(node)
-                    break
+            pnode = by_rel_path.get(parent_path)
+            if pnode is not None:
+                pnode.children.append(node)
             else:
                 roots.append(node)
 
@@ -1065,7 +1070,9 @@ def get_file(file_id: int):
                   f.page_count, f.folder_id,
                   fo.name as parent_folder,
                   s.summary_text as summary,
-                  e.text_extracted as extraction_path
+                  CASE WHEN e.id IS NOT NULL
+                       THEN '/files/' || f.id || '/text'
+                       ELSE NULL END as extraction_path
            FROM file f
            LEFT JOIN folder fo ON f.folder_id = fo.id
            LEFT JOIN summary s ON s.file_id = f.id
@@ -1104,8 +1111,11 @@ def get_file(file_id: int):
 def get_file_text(file_id: int):
     db = _get_db()
 
+    # OCR audit #79: latest successful extraction, matching GET /files/{id}'s
+    # MAX(id) selection — rowid order used to serve the stale first extraction.
     row = list(db.query(
-        "SELECT text_extracted FROM extraction WHERE file_id = ? AND succeeded = 1",
+        "SELECT text_extracted FROM extraction WHERE file_id = ? AND succeeded = 1 "
+        "ORDER BY id DESC LIMIT 1",
         [file_id],
     ))
 
@@ -1388,6 +1398,88 @@ async def upload_files(
         return await _upload_files_impl(files, workspace)
 
 
+def _ensure_upload_root_folder(corpus_root) -> int:
+    """Worker-thread helper: ensure the root folder row exists (OCR audit #32)."""
+    db = _get_db()  # thread-local: each worker owns its own connection
+    root_folders = list(db.query(
+        "SELECT id FROM folder WHERE rel_path = '.' LIMIT 1"
+    ))
+    if root_folders:
+        return root_folders[0]["id"]
+    db["folder"].insert({
+        # Resolve: the indexer stores resolved roots (symlinked corpus
+        # roots otherwise produce duplicate "." folders with two
+        # different path spellings).
+        "path": str(corpus_root.resolve()),
+        "rel_path": ".",
+        "name": ".",
+        "depth": 0,
+        "excluded": 0,
+    })
+    db.conn.commit()
+    return next(iter(db.query("SELECT id FROM folder WHERE rel_path = '.'")))["id"]
+
+
+def _persist_uploaded_file(
+    dest, corpus_root, folder_id: int, size_bytes: int,
+    mime_type: str | None, workspace_label: str, actor: str,
+) -> int:
+    """Worker-thread helper: insert the file row + audit (OCR audit #32).
+
+    SQLite commits here used to run on the event loop, stalling every
+    concurrent request (incl. SSE token pushes) for up to busy_timeout
+    under write contention.
+    """
+    db = _get_db()
+    # Store resolved paths, matching the indexer — unresolved spellings made
+    # sync_all treat every uploaded file as deleted with symlinked roots.
+    dest = dest.resolve()
+    rel_path = str(dest.relative_to(corpus_root.resolve()))
+
+    # V-10: same mtime format the indexer/sync writes so the fast-skip matches.
+    mtime = datetime.datetime.fromtimestamp(
+        dest.stat().st_mtime, tz=datetime.UTC
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Chain .last_rowid on the same Table object — db["file"] returns a fresh
+    # Table per access, so a separate db["file"].last_rowid read would be None.
+    file_id = db["file"].insert({
+        "folder_id": folder_id,
+        "path": str(dest),
+        "rel_path": rel_path,
+        "name": dest.name,
+        "extension": dest.suffix.lstrip("."),
+        "size_bytes": size_bytes,
+        "mtime": mtime,
+        "sha256": "",
+        "mime_type": mime_type,
+        "hash_status": "pending",
+        "identify_status": "pending",
+        "triage_status": "pending",
+        "is_dup_primary": 1,
+        "excluded": 0,
+        "workspace": workspace_label,
+    }).last_rowid
+    db.conn.commit()
+
+    db.execute(
+        "UPDATE file SET created_at = datetime('now') WHERE id = ?",
+        [file_id],
+    )
+    db.conn.commit()
+
+    # Best-effort audit trail (V1.3 F-Vault-1) — one entry per file.
+    record_audit(
+        db,
+        actor,
+        "file.upload",
+        "file",
+        resource_id=file_id,
+        detail=dest.name,
+    )
+    return file_id
+
+
 async def _upload_files_impl(
     files: list[UploadFile],
     workspace: str | None,
@@ -1395,29 +1487,9 @@ async def _upload_files_impl(
     cfg = _load_config()
     workspace_label = workspace if workspace else "default"
     corpus_root = cfg.corpus_root_path
-    corpus_root.mkdir(parents=True, exist_ok=True)
+    await run_in_threadpool(corpus_root.mkdir, parents=True, exist_ok=True)
 
-    db = _get_db()
-
-    # Ensure a root folder exists
-    root_folders = list(db.query(
-        "SELECT id FROM folder WHERE rel_path = '.' LIMIT 1"
-    ))
-    if root_folders:
-        folder_id = root_folders[0]["id"]
-    else:
-        db["folder"].insert({
-            # Resolve: the indexer stores resolved roots (symlinked corpus
-            # roots otherwise produce duplicate "." folders with two
-            # different path spellings).
-            "path": str(corpus_root.resolve()),
-            "rel_path": ".",
-            "name": ".",
-            "depth": 0,
-            "excluded": 0,
-        })
-        db.conn.commit()
-        folder_id = next(iter(db.query("SELECT id FROM folder WHERE rel_path = '.'")))["id"]
+    folder_id = await run_in_threadpool(_ensure_upload_root_folder, corpus_root)
 
     uploaded = 0
     failed: list[str] = []
@@ -1471,58 +1543,20 @@ async def _upload_files_impl(
                 dest.unlink(missing_ok=True)
                 raise
 
-            # Determine relative path (store resolved paths, matching the
-            # indexer — unresolved spellings made sync_all treat every
-            # uploaded file as deleted when the corpus root had symlinks).
-            dest = dest.resolve()
-            rel_path = str(dest.relative_to(corpus_root.resolve()))
-
-            # Get file modification time (V-10: same format the indexer/sync
-            # writes — '%Y-%m-%dT%H:%M:%SZ' — so the sync fast-skip can match).
-            mtime = datetime.datetime.fromtimestamp(
-                dest.stat().st_mtime, tz=datetime.UTC
-            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            # Insert file record. Chain .last_rowid on the same Table object —
-            # db["file"] returns a fresh Table per access, so a separate
-            # db["file"].last_rowid read would be None.
-            file_id = db["file"].insert({
-                "folder_id": folder_id,
-                "path": str(dest),
-                "rel_path": rel_path,
-                "name": dest.name,
-                "extension": dest.suffix.lstrip("."),
-                "size_bytes": size_bytes,
-                "mtime": mtime,
-                "sha256": "",
-                "mime_type": upload_file.content_type,
-                "hash_status": "pending",
-                "identify_status": "pending",
-                "triage_status": "pending",
-                "is_dup_primary": 1,
-                "excluded": 0,
-                "workspace": workspace_label,
-            }).last_rowid
-            db.conn.commit()
-
-            # Set created_at
-            db.execute(
-                "UPDATE file SET created_at = datetime('now') WHERE id = ?",
-                [file_id],
+            # OCR audit #32: all SQLite/FS persist work runs on a worker
+            # thread (own thread-local connection) — never on the event loop.
+            await run_in_threadpool(
+                _persist_uploaded_file,
+                dest,
+                corpus_root,
+                folder_id,
+                size_bytes,
+                upload_file.content_type,
+                workspace_label,
+                _resolve_actor(),
             )
-            db.conn.commit()
 
             uploaded += 1
-
-            # Best-effort audit trail (V1.3 F-Vault-1) — one entry per file.
-            record_audit(
-                db,
-                _resolve_actor(),
-                "file.upload",
-                "file",
-                resource_id=file_id,
-                detail=dest.name,
-            )
         except Exception as e:
             logger.error("Failed to upload %s: %s", upload_file.filename, e)
             failed.append(upload_file.filename or "unnamed")
