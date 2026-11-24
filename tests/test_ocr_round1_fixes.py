@@ -1512,3 +1512,119 @@ class TestApiResponsivenessFixes:
         assert len(a_nodes) == 1
         assert [c["rel_path"] for c in a_nodes[0]["children"]] == ["a/b"]
         conn.close()
+
+
+class TestAuditDateBounds:
+    """OCR #37: date-only end bound includes the whole final day."""
+
+    def test_end_bound_inclusive(self, tmp_path):
+        from api.audit import query_audit_records
+
+        db = _seed_db(tmp_path)
+        db.conn.execute(
+            "INSERT INTO audit_log (ts, actor, action, resource_type) VALUES "
+            "('2026-01-31 15:00:00', 'a', 'query', 'query_log'), "
+            "('2026-02-01 00:00:01', 'a', 'query', 'query_log')"
+        )
+        db.conn.commit()
+
+        rows = query_audit_records(db, start="2026-01-01", end="2026-01-31")
+        assert len(rows) == 1
+        assert rows[0]["ts"] == "2026-01-31 15:00:00"
+
+
+class TestSettingsLoopbackGuard:
+    """OCR #40: provider mutations restricted to loopback clients."""
+
+    def test_remote_client_denied(self):
+        from ui.gradio_app import _settings_loopback_guard
+
+        req = MagicMock()
+        req.client.host = "10.0.0.5"
+        resp = _settings_loopback_guard(req)
+        assert resp is not None
+        assert resp.status_code == 403
+
+    def test_loopback_client_allowed(self):
+        from ui.gradio_app import _settings_loopback_guard
+
+        for host in ("127.0.0.1", "::1", "localhost"):
+            req = MagicMock()
+            req.client.host = host
+            assert _settings_loopback_guard(req) is None
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("node") is None, reason="node not installed"
+)
+class TestUiRound6Fixes:
+    """OCR #39/#41: execute the real UI JS fragments via node."""
+
+    def _run_node(self, script: str):
+        import subprocess
+
+        proc = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=30
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    def test_folder_tree_escapes_decoded_names(self):
+        js = _ui_js_source()
+        esc = _extract_js_function(js, "_escHtml")
+        tree = _extract_js_function(js, "_buildFolderTree")
+        script = (
+            esc
+            + tree
+            + """
+var _treeHTML = '';
+var document = {
+  createElement: function(){
+    return {
+      _t: '',
+      set textContent(v){ this._t = String(v); },
+      get innerHTML(){ return this._t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    };
+  },
+  getElementById: function(id){
+    if(id === 'ff') return { options: [
+      {value: 'All folders', text: 'All folders'},
+      {value: '<img src=x onerror=alert(1)>', text: '<img src=x onerror=alert(1)>'}
+    ] };
+    if(id === 'folder-tree') return { set innerHTML(v){ _treeHTML = v; } };
+    return null;
+  }
+};
+_buildFolderTree();
+if(_treeHTML.indexOf('<img') !== -1) throw new Error('folder-name XSS rendered as markup');
+if(_treeHTML.indexOf('&lt;img') === -1) throw new Error('folder name not escaped: ' + _treeHTML);
+"""
+        )
+        self._run_node(script)
+
+    def test_empty_citations_payload_clears_panel(self):
+        js = _ui_js_source()
+        start = js.index("if(d.length > 1){")
+        i = js.index("{", start)
+        depth = 0
+        end = None
+        for j in range(i, len(js)):
+            if js[j] == "{":
+                depth += 1
+            elif js[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        block = js[start:end]
+        # Run the block twice: empty payload clears, non-empty sets.
+        harness = """
+var _citHTML = 'stale-sources';
+var document = { getElementById: function(){ return { set innerHTML(v){ _citHTML = v; } }; } };
+var d = ['answer text', ''];
+BLOCK
+if(_citHTML !== '') throw new Error('empty payload did not clear panel: ' + _citHTML);
+d = ['answer text', '<div>new sources</div>'];
+BLOCK
+if(_citHTML !== '<div>new sources</div>') throw new Error('payload not rendered');
+""".replace("BLOCK", block)
+        self._run_node(harness)

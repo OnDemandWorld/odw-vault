@@ -546,7 +546,9 @@
     "root_cause": "end is normalized via SQLite datetime(?): datetime('2026-01-31') yields '2026-01-31 00:00:00', and ts <= that excludes every record later that day despite the docstring promising an inclusive end bound. The same bug class was fixed for /queries (V-9 _normalize_date_bound) but not for the audit read seam used by GET /audit/export.",
     "suggested_fix": "Apply the same date-bound normalization: a bare YYYY-MM-DD end bound becomes 'YYYY-MM-DD 23:59:59' (or ts < datetime(end, '+1 day')). Related: #84.",
     "failure_scenario": "Compliance export GET /audit/export?start=2026-01-01&end=2026-01-31 omits all audit events of Jan 31 after midnight — the report silently under-reports activity for the requested period.",
-    "verification": "host"
+    "verification": "host",
+    "status": "fixed",
+    "verification_notes": "Fixed: api/audit.py _normalize_bound makes date-only end bounds inclusive (23:59:59), mirroring /queries V-9. Test: TestAuditDateBounds PASS; test_audit/test_audit_export PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 811 passed, 0 failed, exit 0"
   },
   {
     "id": 38,
@@ -559,7 +561,9 @@
     "root_cause": "VAULT_CORS_ORIGINS defaults to '*' and VAULT_API_KEY defaults to unset (fully open). With allow_origins=['*'] and allow_headers=['*'], browser JS on any origin can fetch localhost /files, /files/{id}/text, /queries, /audit/export and read responses (no credentials needed). No Host-header allowlist, so DNS-rebinding reaches the same open endpoints.",
     "suggested_fix": "Default to an explicit loopback origin list rather than '*', require opt-in for '*', and/or validate the Host header; document that VAULT_API_KEY should be set whenever the port is reachable beyond localhost.",
     "failure_scenario": "Operator runs Vault with defaults and visits a malicious page; its JS fetches http://127.0.0.1:8001/files then /files/{id}/text for each id, exfiltrating the entire corpus cross-origin because ACAO:* permits reading every response.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "skipped",
+    "verification_notes": "SKIPPED (design decision required): the '*' CORS default is documented as intentional for the cross-origin integration contract (api/main.py comment referencing INTEGRATION_CONTRACT.md §1 and Loop canvas). Changing the default origin allowlist could break documented external integrations; needs product sign-off on the default origins. Mitigation available today: set VAULT_CORS_ORIGINS to explicit origins and VAULT_API_KEY. Revisit with Jack."
   },
   {
     "id": 39,
@@ -572,7 +576,9 @@
     "root_cause": "Server-side html.escape of folder names (line 946) is undone by the browser: JS reads opt.text (entity-decoded) and concatenates it unescaped into an innerHTML string.",
     "suggested_fix": "Escape opt.text/opt.value with a text-node-based escaper before building the HTML string, or build the tree with createElement/textContent.",
     "failure_scenario": "An attacker who can add a directory to a shared corpus names it '<img src=x onerror=...>'; the option renders safely but _buildFolderTree re-inserts the decoded name as markup, executing script in every UI user's browser.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: _buildFolderTree escapes opt.value/opt.text via _escHtml before innerHTML. Test: TestUiRound6Fixes.test_folder_tree_escapes_decoded_names (node, real payload) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 811 passed, 0 failed, exit 0"
   },
   {
     "id": 40,
@@ -585,7 +591,9 @@
     "root_cause": "The proxy app has no auth on any route. /api/settings/providers + /activate let any network client set the active generation endpoint; _stream_tokens then sends the full prompt (query + retrieved corpus chunks) to that endpoint. /conversations/* allows reading/deleting all histories. CLI exposes --host (cli.py:679), so 0.0.0.0 binds are supported.",
     "suggested_fix": "Require a local token/session for mutating settings and conversation routes, or refuse non-loopback binds without an explicit auth mechanism; at minimum document the trust boundary.",
     "failure_scenario": "vault ui --host 0.0.0.0 on a shared LAN: an attacker POSTs a provider with their own base_url and activates it; every subsequent user question ships proprietary retrieved document text to the attacker's server, and all conversations can be read/deleted.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed (partial, minimal): _settings_loopback_guard restricts provider upsert/delete/activate to loopback clients (403 otherwise) — closes the corpus-exfiltration vector via attacker-controlled generation endpoints on non-loopback binds. Conversation read/delete routes remain unauthenticated (documented residual; full auth needs design). Tests: TestSettingsLoopbackGuard (2) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 811 passed, 0 failed, exit 0"
   },
   {
     "id": 41,
@@ -598,7 +606,9 @@
     "root_cause": "The SSE handler only updates #cit when d[1] is truthy ('if(d[1])'). The backend yields _citations_html([]) == '' for every frame of a turn with no citations, so the empty payload is ignored and the previous turn's panel persists.",
     "suggested_fix": "Update citEl.innerHTML whenever d.length > 1 (assign d[1] || ''); clear #cit in _send/_newChat.",
     "failure_scenario": "Q1 returns an answer with a Sources panel; Q2 gets 'No relevant context found' — Q1's source cards remain displayed beneath Q2, misattributing sources to the new answer.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: SSE handler updates #cit whenever d.length > 1 (assigns d[1] || '') so empty payloads clear stale sources. Test: test_empty_citations_payload_clears_panel (node, real code block) PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 811 passed, 0 failed, exit 0"
   },
   {
     "id": 42,

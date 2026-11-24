@@ -170,6 +170,23 @@ _PROVIDER_PRESETS = [
 ]
 
 
+def _settings_loopback_guard(request: Request):
+    """OCR audit #40: provider/settings mutations can redirect generation —
+    and thus every retrieved corpus excerpt — to an arbitrary endpoint.
+    Restrict them to loopback clients; non-loopback deployments must front
+    the UI with an authenticating proxy. Returns an error response or None.
+    """
+    from fastapi.responses import JSONResponse
+
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        return JSONResponse(
+            {"ok": False, "error": "settings changes are restricted to local clients"},
+            status_code=403,
+        )
+    return None
+
+
 def _load_provider_registry() -> dict:
     """Load (or seed) the provider registry from llm_providers.json."""
     if _PROVIDERS_FILE.exists():
@@ -1130,6 +1147,9 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
 
     @proxy_app.post("/api/settings/providers")
     async def upsert_provider(request: Request):
+        denied = _settings_loopback_guard(request)
+        if denied is not None:
+            return denied
         try:
             payload = await request.json()
         except Exception:
@@ -1168,7 +1188,10 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
         return {"ok": True, "settings": _settings_payload()}
 
     @proxy_app.delete("/api/settings/providers/{pid}")
-    async def delete_provider(pid: str):
+    async def delete_provider(pid: str, request: Request):
+        denied = _settings_loopback_guard(request)
+        if denied is not None:
+            return denied
         reg = _load_provider_registry()
         before = len(reg["providers"])
         reg["providers"] = [p for p in reg["providers"] if p.get("id") != pid]
@@ -1180,7 +1203,10 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
         return {"ok": True, "settings": _settings_payload()}
 
     @proxy_app.post("/api/settings/providers/{pid}/activate")
-    async def activate_provider(pid: str):
+    async def activate_provider(pid: str, request: Request):
+        denied = _settings_loopback_guard(request)
+        if denied is not None:
+            return denied
         reg = _load_provider_registry()
         if not any(p.get("id") == pid for p in reg["providers"]):
             return {"ok": False, "error": "not found"}
@@ -2271,9 +2297,12 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
                 // Citations first: an exception later in this block (e.g. the
                 // markdown renderer choking on some generated text) must
                 // never swallow the citations payload of the final frames.
-                if(d[1]){
+                // OCR audit #41: an empty citations payload must CLEAR the
+                // panel — 'if(d[1])' kept the previous turn's sources visible
+                // under uncited/refused answers.
+                if(d.length > 1){
                   var citEl = document.getElementById('cit');
-                  if(citEl) citEl.innerHTML = d[1];
+                  if(citEl) citEl.innerHTML = d[1] || '';
                 }
                 if(last && last.content && last.content.length){
                   var text = last.content[0].text || '';
@@ -2637,7 +2666,9 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       var indent = 0;
       var parts = opt.value.split('/');
       if(parts.length > 1) indent = (parts.length - 1) * 12;
-      html += '<div class="folder-tree-item" data-folder="' + opt.value.replace(/"/g, '&quot;') + '" style="padding-left:' + (8 + indent) + 'px"><span class="folder-tree-item__icon">&#x1f4c4;</span><span>' + opt.text + '</span></div>';
+      // OCR audit #39: opt.text/opt.value are entity-decoded by the browser —
+      // re-escape before innerHTML interpolation (folder names are untrusted).
+      html += '<div class="folder-tree-item" data-folder="' + _escHtml(opt.value) + '" style="padding-left:' + (8 + indent) + 'px"><span class="folder-tree-item__icon">&#x1f4c4;</span><span>' + _escHtml(opt.text) + '</span></div>';
     }
     tree.innerHTML = html;
   }

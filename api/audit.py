@@ -60,6 +60,19 @@ def record_audit(
         logger.warning("audit write failed (best-effort, ignoring): %s", exc)
 
 
+def _normalize_bound(raw: str, *, end: bool) -> str:
+    """Normalize an audit time bound (OCR audit #37, mirrors /queries V-9).
+
+    ``ts`` rows are 'YYYY-MM-DD HH:MM:SS'; a bare 'YYYY-MM-DD' end bound must
+    include the whole final day, not just midnight. Values with a time
+    component pass through (ISO 'T' separator accepted).
+    """
+    value = raw.strip()
+    if len(value) == 10:
+        return f"{value} 23:59:59" if end else f"{value} 00:00:00"
+    return value.replace("T", " ", 1) if "T" in value else value
+
+
 def query_audit_records(
     db,
     *,
@@ -98,10 +111,10 @@ def query_audit_records(
     params: list = []
     if start:
         conditions.append("ts >= datetime(?)")
-        params.append(start)
+        params.append(_normalize_bound(start, end=False))
     if end:
         conditions.append("ts <= datetime(?)")
-        params.append(end)
+        params.append(_normalize_bound(end, end=True))
     if actor:
         conditions.append("actor = ?")
         params.append(actor)
