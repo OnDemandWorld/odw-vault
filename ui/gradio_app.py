@@ -196,6 +196,10 @@ def _load_provider_registry() -> dict:
                 return data
         except Exception:
             logger.warning("Failed to parse llm_providers.json; reseeding", exc_info=True)
+            # OCR audit #86: preserve the corrupt file (it may hold API keys)
+            # instead of silently overwriting it with the default seed.
+            with contextlib.suppress(OSError):
+                _PROVIDERS_FILE.replace(_PROVIDERS_FILE.with_suffix(".json.corrupt"))
     return _seed_default_registry()
 
 
@@ -225,11 +229,21 @@ def _seed_default_registry() -> dict:
     return reg
 
 
-def _save_provider_registry(reg: dict) -> None:
+_registry_lock = threading.Lock()
+
+
+def _save_provider_registry(reg: dict) -> bool:
+    """OCR audit #86: atomic write under a lock; report failure so callers
+    never return ok:True when nothing was persisted."""
+    tmp = _PROVIDERS_FILE.with_suffix(".json.tmp")
     try:
-        _PROVIDERS_FILE.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+        with _registry_lock:
+            tmp.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+            tmp.replace(_PROVIDERS_FILE)
+        return True
     except Exception:
         logger.error("Failed to write llm_providers.json", exc_info=True)
+        return False
 
 
 def _mask_key(key: str) -> str:
@@ -568,7 +582,9 @@ def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float
                 "unknown",
                 json.dumps([h.rel_path for h in hits]),
                 answer,
-                _cfg.models.generation.name,
+                # OCR audit #85: record the ACTIVE provider's model — the
+                # config default mislabeled every switched-provider turn.
+                (_get_active_provider() or {}).get("model") or _cfg.models.generation.name,
                 _cfg.models.embedding.name,
                 _cfg.models.reranker.name if getattr(_cfg.models.reranker, "enabled", False) else None,
                 int(total_ms * 1000),
@@ -586,6 +602,20 @@ def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float
 def _chat_history_snapshot() -> list:
     """Latest chat history as tracked by the Gradio state (best-effort)."""
     return _LATEST_HISTORY
+
+
+# OCR audit #87: server-side stop flags — the client abort alone left the
+# backend generating (and persisting) the full answer after "Stop".
+_chat_cancels: set[str] = set()
+
+
+def _request_chat_cancel(conv_id: str | None) -> None:
+    if conv_id:
+        _chat_cancels.add(conv_id)
+
+
+def _chat_cancel_requested(conv_id: str | None) -> bool:
+    return bool(conv_id) and conv_id in _chat_cancels
 
 
 # The history list most recently yielded by _on_chat (feedback alignment).
@@ -612,6 +642,7 @@ def _on_feedback(feedback_data: gr.LikeData) -> None:
 def _on_chat(message: str, history: list[dict], folder_filter: str, conversation_id: str | None = None):
     import time as _time
     import uuid as _uuid
+    _chat_cancels.discard(conversation_id)  # OCR #87: stale stop must not kill a new turn
     query_start = _time.time()
     logger.info(f"[QUERY] message={message[:100]!r}, folder_filter={folder_filter!r}")
 
@@ -695,6 +726,12 @@ def _on_chat(message: str, history: list[dict], folder_filter: str, conversation
         # the same way).
         token_gen = _stream_tokens(message.strip(), hits, history=history[:-2])
         for result in token_gen:
+            # OCR audit #87: honor Stop — close the token generator (which
+            # tears down the LLM stream) and persist only what was shown.
+            if _chat_cancel_requested(conversation_id):
+                _chat_cancels.discard(conversation_id)
+                token_gen.close()
+                break
             if isinstance(result, tuple):
                 full_text, citations = result
             else:
@@ -1156,6 +1193,16 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
             "config": cfg_summary,
         }
 
+    @proxy_app.post("/api/chat/cancel")
+    async def cancel_chat(request: Request):
+        # OCR audit #87: propagate the UI Stop button to the backend.
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        _request_chat_cancel(payload.get("conversation_id"))
+        return {"ok": True}
+
     @proxy_app.get("/api/settings")
     async def get_settings():
         return _settings_payload()
@@ -1199,7 +1246,8 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
                 "api_key": api_key, "model": model,
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             })
-        _save_provider_registry(reg)
+        if not _save_provider_registry(reg):
+            return {"ok": False, "error": "failed to persist provider registry"}
         return {"ok": True, "settings": _settings_payload()}
 
     @proxy_app.delete("/api/settings/providers/{pid}")
@@ -1214,7 +1262,8 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
             return {"ok": False, "error": "not found"}
         if reg.get("active_id") == pid:
             reg["active_id"] = reg["providers"][0]["id"] if reg["providers"] else None
-        _save_provider_registry(reg)
+        if not _save_provider_registry(reg):
+            return {"ok": False, "error": "failed to persist provider registry"}
         return {"ok": True, "settings": _settings_payload()}
 
     @proxy_app.post("/api/settings/providers/{pid}/activate")
@@ -1226,7 +1275,8 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
         if not any(p.get("id") == pid for p in reg["providers"]):
             return {"ok": False, "error": "not found"}
         reg["active_id"] = pid
-        _save_provider_registry(reg)
+        if not _save_provider_registry(reg):
+            return {"ok": False, "error": "failed to persist provider registry"}
         return {"ok": True, "settings": _settings_payload()}
 
     @proxy_app.post("/api/settings/providers/test")
@@ -2230,6 +2280,15 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     _S.abortFlag = true;
     _S.streaming = false;
     _updateSend();
+    // OCR audit #87: tell the backend to stop generating too — otherwise it
+    // finishes and persists the full answer the user never saw.
+    if(_currentConvId){
+      fetch('/api/chat/cancel', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({conversation_id: _currentConvId})
+      }).catch(function(){});
+    }
     var msgs = document.getElementById('msgs');
     var lastMsg = msgs ? msgs.lastElementChild : null;
     if(lastMsg && lastMsg.classList.contains('assistant') && lastMsg.classList.contains('cursor')){

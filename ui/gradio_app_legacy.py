@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import threading
 from pathlib import Path
@@ -169,10 +170,14 @@ def _citations_html(citations: list[dict]) -> str:
     items = []
     for c in citations:
         page_str = f", page {c['page_start']}" if c.get("page_start") else ""
+        # OCR audit #88: corpus snippets and file names are untrusted —
+        # escape before interpolating into gr.HTML markup (XSS).
+        rel_path = html.escape(str(c["rel_path"]))
+        snippet = html.escape(str(c["snippet"]))
         items.append(
             f"<li><b>[{c['citation_number']}]</b> "
-            f"<code>{c['rel_path']}</code>{page_str}<br>"
-            f"<span style='color:#666;font-size:12px'>{c['snippet']}</span>"
+            f"<code>{rel_path}</code>{page_str}<br>"
+            f"<span style='color:#666;font-size:12px'>{snippet}</span>"
             f"</li>"
         )
     return (
@@ -289,10 +294,14 @@ def _on_feedback(
 
     feedback_value = "up" if feedback_data.liked else "down"
     try:
+        # OCR audit #89: UPDATE ... ORDER BY ... LIMIT requires a SQLite
+        # compile option the bundled build lacks (syntax error on every
+        # click) — target the row by id via subquery instead.
         _get_db().conn.execute(
             "UPDATE query_log SET feedback = ?, feedback_at = datetime('now') "
-            "WHERE query_text = ? AND feedback IS NULL "
-            "ORDER BY asked_at DESC LIMIT 1",
+            "WHERE id = (SELECT id FROM query_log "
+            "            WHERE query_text = ? AND feedback IS NULL "
+            "            ORDER BY asked_at DESC LIMIT 1)",
             (feedback_value, query_text),
         )
         _get_db().conn.commit()

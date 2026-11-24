@@ -2514,3 +2514,117 @@ class TestLowApiFixes:
             r = TestClient(app).get("/audit/export", params={"start": "01/01/2026"})
         assert r.status_code == 422
         conn.close()
+
+
+class TestLowUiFixes:
+    """OCR #85/#86/#87/#88/#89."""
+
+    def test_query_log_records_active_provider_model(self, tmp_path):
+        import ui.gradio_app as ui
+
+        db = _seed_db(tmp_path)
+        cfg = MagicMock()
+        cfg.models.embedding.name = "test-embed"
+        cfg.models.generation.name = "config-default"
+        cfg.models.reranker.enabled = False
+        with (
+            patch.object(ui, "_get_db", return_value=db),
+            patch.object(ui, "_get_active_provider", return_value={"model": "switched-model"}),
+            patch.object(ui, "_cfg", cfg),
+            patch.object(ui, "_chat_history_snapshot", return_value=[0]),
+        ):
+            ui._record_query_log("q", "a", [], 1.0, 2.0, conversation_id="c1")
+        row = next(iter(db["query_log"].rows))
+        assert row["answer_model"] == "switched-model"
+
+    def test_registry_save_reports_failure(self, tmp_path):
+        import ui.gradio_app as ui
+
+        bad_path = tmp_path / "no-such-dir" / "reg.json"  # parent missing
+        with patch.object(ui, "_PROVIDERS_FILE", bad_path):
+            assert ui._save_provider_registry({"providers": []}) is False
+
+    def test_registry_save_atomic_success(self, tmp_path):
+        import ui.gradio_app as ui
+
+        p = tmp_path / "reg.json"
+        with patch.object(ui, "_PROVIDERS_FILE", p):
+            assert ui._save_provider_registry({"providers": [], "version": 1}) is True
+        assert json.loads(p.read_text())["version"] == 1
+        assert not p.with_suffix(".json.tmp").exists()
+
+    def test_corrupt_registry_backed_up_before_reseed(self, tmp_path):
+        import ui.gradio_app as ui
+
+        p = tmp_path / "reg.json"
+        p.write_text("{corrupt json", encoding="utf-8")
+        with (
+            patch.object(ui, "_PROVIDERS_FILE", p),
+            patch.object(ui, "_cfg", None),
+            patch.object(ui, "_ollama_host", "http://localhost:11434"),
+        ):
+            reg = ui._load_provider_registry()
+        assert reg["providers"]  # reseeded
+        assert p.with_suffix(".json.corrupt").exists()  # old content preserved
+
+    def test_chat_stop_persists_only_shown_text(self, tmp_path):
+        import ui.gradio_app as ui
+
+        from rag.retrieval import Hit
+
+        hit = Hit(chunk_id=1, file_id=1, folder_id=1, rel_path="d.txt",
+                  page_start=None, text="t")
+
+        def fake_stream(*a, **k):
+            yield "part1"
+            ui._request_chat_cancel("c1")  # user hits Stop mid-stream
+            yield "part2"
+
+        with (
+            patch.object(ui, "_get_db", return_value=_seed_db(tmp_path)),
+            patch.object(ui, "_cfg", MagicMock()),
+            patch.object(ui, "retrieve", return_value=([hit], {})),
+            patch.object(ui, "_stream_tokens", side_effect=fake_stream),
+            patch.object(ui, "_save_conversation_message"),
+            patch.object(ui, "_record_query_log") as mock_log,
+        ):
+            gen = ui._on_chat("q", [], "All folders", "c1")
+            frames = list(gen)
+
+        assert frames  # streamed at least the first part
+        assert mock_log.call_args.kwargs["answer"] == "part1"
+        assert not ui._chat_cancel_requested("c1")  # flag consumed
+
+    def test_legacy_citations_escaped(self):
+        from ui.gradio_app_legacy import _citations_html
+
+        out = _citations_html([{
+            "citation_number": 1,
+            "rel_path": "<img src=x onerror=alert(1)>.pdf",
+            "page_start": None,
+            "snippet": "<script>alert(1)</script>",
+        }])
+        assert "<img" not in out
+        assert "<script>" not in out
+        assert "&lt;img" in out
+
+    def test_legacy_feedback_sql_valid(self, tmp_path):
+        from types import SimpleNamespace
+
+        import ui.gradio_app_legacy as legacy
+
+        db = _seed_db(tmp_path)
+        db.conn.execute(
+            "INSERT INTO query_log (user, query_text, query_lang, retrieved_chunks_json, "
+            "answer_text, answer_model, embedding_model, latency_ms) "
+            "VALUES ('ui', 'legacy q', 'en', '[]', 'a', 'm', 'e', 1)"
+        )
+        db.conn.commit()
+        history = [
+            {"role": "user", "content": "legacy q"},
+            {"role": "assistant", "content": "a"},
+        ]
+        with patch.object(legacy, "_get_db", return_value=db):
+            legacy._on_feedback(history, SimpleNamespace(liked=True, index=1))
+        row = next(iter(db["query_log"].rows))
+        assert row["feedback"] == "up"

@@ -1270,7 +1270,9 @@
     "root_cause": "_record_query_log writes _cfg.models.generation.name, but generation runs through _get_active_provider() (registry), which the Settings UI can switch to any model/provider.",
     "suggested_fix": "Record the active provider's model (and provider name) resolved at generation time.",
     "failure_scenario": "User switches the active provider via Settings; all query_log rows still say the config default, so /queries metrics and model-quality analysis attribute answers to the wrong model.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: query_log.answer_model records the active provider's model (config default only as fallback). Test: switched-provider assertion PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 864 passed, 0 failed, exit 0"
   },
   {
     "id": 86,
@@ -1283,7 +1285,9 @@
     "root_cause": "_save_provider_registry swallows write errors (returns None), so upsert/activate/delete return ok:True even when nothing persisted. _load_provider_registry reseeds (and overwrites) the file on any parse error, destroying stored providers/API keys. Concurrent read-modify-write cycles have no lock.",
     "suggested_fix": "Propagate save failures to the API response; back up before reseeding; serialize mutations with a lock and write atomically (temp file + rename).",
     "failure_scenario": "llm_providers.json on a full/read-only volume: user adds a provider, sees 'Provider saved', but after restart it is gone; a transient partial write corrupts the JSON and next load silently replaces all providers and keys with the default seed.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: registry saves atomic (tmp+rename) under a lock and return success/failure (handlers return ok:False on failure); corrupt file backed up to .json.corrupt before reseeding. Tests: 3 registry tests PASS. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 864 passed, 0 failed, exit 0"
   },
   {
     "id": 87,
@@ -1296,7 +1300,9 @@
     "root_cause": "_stopStreaming sets abortFlag and cancels the fetch reader, but the Gradio generator (_on_chat) runs to completion server-side, saving the full assistant text to the conversation and query_log.",
     "suggested_fix": "Propagate cancellation to the backend (per-conversation cancel flag checked in _on_chat) and persist only what was shown, or mark the turn as stopped.",
     "failure_scenario": "User hits Stop after 2 tokens; the GPU keeps generating for minutes and reopening the conversation shows a complete answer the user never saw — displayed and stored history disagree.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: Stop propagates — JS POSTs /api/chat/cancel; _on_chat checks the per-conversation flag each token, closes the token generator (tears down the LLM stream) and persists only shown text; stale flags cleared at turn start. Test: mid-stream cancel persists 'part1' only. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 864 passed, 0 failed, exit 0"
   },
   {
     "id": 88,
@@ -1309,7 +1315,9 @@
     "root_cause": "_citations_html interpolates c['rel_path'] and c['snippet'] directly into gr.HTML markup with no html.escape (the modern UI escapes both).",
     "suggested_fix": "html.escape rel_path and snippet as done in ui/gradio_app.py:_citations_html.",
     "failure_scenario": "If the legacy UI is launched, a cited document containing '<img src=x onerror=...>' executes script in the user's browser via the Sources panel; a malicious file name does the same.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: legacy _citations_html html.escapes rel_path and snippet. Test: payload escaped. .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 864 passed, 0 failed, exit 0"
   },
   {
     "id": 89,
@@ -1322,7 +1330,9 @@
     "root_cause": "UPDATE ... ORDER BY asked_at DESC LIMIT 1 requires SQLITE_ENABLE_UPDATE_DELETE_LIMIT; the bundled SQLite rejects it (reproduced: 'near \"order\": syntax error'). The exception is caught and only logged. The modern UI's V-2 comment documents this exact fix; legacy retains the broken statement.",
     "suggested_fix": "Target the row by id via subquery: UPDATE query_log SET ... WHERE id = (SELECT id FROM query_log WHERE query_text=? AND feedback IS NULL ORDER BY asked_at DESC LIMIT 1).",
     "failure_scenario": "Any thumbs up/down in the legacy UI raises a syntax error on every click; query_log.feedback stays NULL forever while the UI appears to accept feedback.",
-    "verification": "agent"
+    "verification": "agent",
+    "status": "fixed",
+    "verification_notes": "Fixed: legacy feedback UPDATE targets row by id subquery (valid SQLite). Test: feedback recorded ('up'). .venv/bin/python -m pytest tests/ -q --no-cov -p no:cacheprovider -> 864 passed, 0 failed, exit 0"
   },
   {
     "id": 90,
