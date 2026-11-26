@@ -250,6 +250,7 @@ MIGRATIONS = [
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
             model TEXT NOT NULL,
+            prompt_version TEXT,
             summary_text TEXT,
             generated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
@@ -575,6 +576,13 @@ MIGRATIONS = [
         GROUP BY f.category;
         """,
     ),
+    (
+        9,
+        "summary.prompt_version column (OCR audit #28: prompt bumps invalidate cached summaries)",
+        """
+        SELECT 1;
+        """,
+    ),
 ]
 
 
@@ -623,6 +631,11 @@ def migrate(db: Database) -> None:
                     _add_column_if_missing(
                         db, "file", "workspace", "TEXT NOT NULL DEFAULT 'default'"
                     )
+                    db.conn.commit()
+                if version == 9:
+                    # OCR audit #28: legacy rows keep NULL and are regenerated
+                    # once under the current prompt version.
+                    _add_column_if_missing(db, "summary", "prompt_version", "TEXT")
                     db.conn.commit()
                 db.executescript(sql)
                 db.conn.execute(

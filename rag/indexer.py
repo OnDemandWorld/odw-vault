@@ -227,6 +227,24 @@ class IncrementalIndexer:
         pronom_id, mime_type, category, extract_strategy = _identify_format(file_path)
         stat = file_path.stat()
 
+        # OCR audit #20: identical content already indexed under another
+        # path — mark this copy dup-secondary so it is not double-embedded.
+        # Applies to both new inserts and updates (API uploads arrive with
+        # hash_status='pending' and are hashed here for the first time).
+        twin = next(
+            iter(
+                self.db.query(
+                    "SELECT id, dup_group_id FROM file "
+                    "WHERE sha256 = ? AND is_dup_primary = 1 AND excluded = 0 AND path != ? "
+                    "LIMIT 1",
+                    [new_hash, str(file_path)],
+                )
+            ),
+            None,
+        )
+        dup_primary = 0 if twin else 1
+        dup_group_id = twin["dup_group_id"] if twin else None
+
         if existing:
             file_id = existing["id"]
             # Clean up old derived data (Chroma + SQLite) before reprocessing
@@ -236,12 +254,14 @@ class IncrementalIndexer:
             self.db.execute(
                 """UPDATE file SET sha256=?, size_bytes=?, extension=?,
                        pronom_id=?, mime_type=?, category=?, extract_strategy=?,
-                       mtime=?, hash_status='done', identify_status='done'
+                       mtime=?, hash_status='done', identify_status='done',
+                       is_dup_primary=?, dup_group_id=?
                     WHERE id=?""",
                 [
                     new_hash, stat.st_size, file_path.suffix.lower(),
                     pronom_id, mime_type, category, extract_strategy,
                     mtime_iso,
+                    dup_primary, dup_group_id,
                     file_id,
                 ],
             )
@@ -263,7 +283,8 @@ class IncrementalIndexer:
                     "mime_type": mime_type,
                     "category": category,
                     "extract_strategy": extract_strategy,
-                    "is_dup_primary": 1,
+                    "is_dup_primary": dup_primary,
+                    "dup_group_id": dup_group_id,
                     "excluded": 0,
                     "hash_status": "done",
                     "identify_status": "done",
@@ -290,6 +311,37 @@ class IncrementalIndexer:
                 error_message=str(exc),
             )
             return {"status": "error", "file_id": file_id, "error": str(exc)}
+
+        # OCR audit #72: stages swallow their own exceptions into the failure
+        # table — verify derivatives so a file with failed extraction or no
+        # embeddings is not reported (and counted) as a clean success.
+        ext = next(
+            iter(self.db.query(
+                "SELECT succeeded FROM extraction WHERE file_id = ? ORDER BY id DESC LIMIT 1",
+                [file_id],
+            )),
+            None,
+        )
+        if ext is None or not ext["succeeded"]:
+            return {
+                "status": "partial", "file_id": file_id, "action": action,
+                "error": "extraction missing or failed",
+            }
+        file_row = self.db["file"].get(file_id)
+        if file_row["is_dup_primary"] and not file_row["excluded"]:
+            n_chunks = self.db["chunk"].count_where("file_id = ?", [file_id])
+            if n_chunks:
+                n_embedded = next(iter(self.db.query(
+                    "SELECT COUNT(*) AS c FROM embedding_ref er "
+                    "JOIN chunk c ON er.chunk_id = c.id "
+                    "WHERE c.file_id = ? AND er.embedding_model = ? AND er.is_current = 1",
+                    [file_id, self.cfg.models.embedding.name],
+                )))["c"]
+                if n_embedded == 0:
+                    return {
+                        "status": "partial", "file_id": file_id, "action": action,
+                        "error": "chunks present but no current embeddings",
+                    }
 
         logger.info("Synced file %s (id=%d, action=%s)", file_path, file_id, action)
         return {"status": "success", "file_id": file_id, "action": action}
@@ -345,6 +397,9 @@ class IncrementalIndexer:
             }
 
         disk_files: dict[str, str] = {}  # absolute path -> sha256
+        # OCR audit #3: paths that exist but could not be read during this
+        # scan must never be classified as deleted (data-loss guard).
+        scan_errors: set[str] = set()
         hashed_count = 0
         skipped_hash = 0
 
@@ -364,11 +419,13 @@ class IncrementalIndexer:
                     fp_str = str(fp.resolve())
                 except OSError:
                     logger.warning("Cannot resolve %s, skipping", fp)
+                    scan_errors.add(str(fp))
                     continue
                 try:
                     stat = fp.stat()
                 except OSError:
                     logger.warning("Cannot stat %s, skipping", fp)
+                    scan_errors.add(fp_str)
                     continue
 
                 # Quick check: if mtime and size match DB, skip hashing.
@@ -395,6 +452,7 @@ class IncrementalIndexer:
                     hashed_count += 1
                 except OSError:
                     logger.warning("Cannot read %s, skipping", fp)
+                    scan_errors.add(fp_str)
 
         logger.debug(
             "Sync scan: %d hashed, %d skipped (mtime match)",
@@ -407,7 +465,9 @@ class IncrementalIndexer:
             p for p in disk_files
             if p in db_files and db_files[p]["sha256"] != disk_files[p]
         ]
-        deleted_paths = [p for p in db_files if p not in disk_files]
+        deleted_paths = [
+            p for p in db_files if p not in disk_files and p not in scan_errors
+        ]
 
         logger.info(
             "Sync detection: %d new, %d modified, %d deleted",
@@ -474,6 +534,11 @@ class IncrementalIndexer:
         # --- 4. Remove deleted ---
         removed = 0
         for p in deleted_paths:
+            # OCR audit #3: never destroy index data for a file that still
+            # exists on disk (e.g. transient read error during the scan).
+            if Path(p).exists():
+                logger.warning("Skipping removal of %s: file still exists on disk", p)
+                continue
             row = next(
                 iter(self.db.query("SELECT id FROM file WHERE path = ?", [p])), None
             )
@@ -747,7 +812,9 @@ class IncrementalIndexer:
             if page_count and page_count > 0:
                 total = max(len(text), 1)
                 start_page = max(1, int((char_start / total) * page_count) + 1)
-                end_page = max(1, int((char_end / total) * page_count) + 1)
+                # OCR audit #71: clamp — the final chunk otherwise maps to
+                # page_count + 1, a page that does not exist.
+                end_page = min(page_count, max(1, int((char_end / total) * page_count) + 1))
 
             chunks_to_insert.append(
                 {
@@ -796,11 +863,12 @@ class IncrementalIndexer:
 
         chunks = list(
             self.db.query(
-                """SELECT c.id, c.text, c.context_text, c.file_id,
+                """SELECT c.id, c.text, c.context_text, c.file_id, c.start_page,
                           f.folder_id, f.rel_path, f.category
                    FROM chunk c
                    JOIN file f ON f.id = c.file_id
                    WHERE c.file_id = ?
+                     AND f.is_dup_primary = 1 AND f.excluded = 0
                      AND c.id NOT IN (
                          SELECT chunk_id FROM embedding_ref WHERE embedding_model = ?
                      )

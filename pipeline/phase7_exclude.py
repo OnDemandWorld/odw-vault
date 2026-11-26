@@ -14,6 +14,38 @@ from sqlite_utils.db import NotFoundError
 from pipeline.config import Config
 
 
+def _exclude_folder_tree(db, folder_id: int, reason: str) -> None:
+    """Exclude a folder, all descendant folders, and all their files.
+
+    OCR audit #2: marking only the folder row left descendant files at
+    excluded=0, so they were still extracted, embedded, and served.
+    """
+    rows = db.query(
+        """
+        WITH RECURSIVE subtree(id) AS (
+            SELECT ?
+            UNION ALL
+            SELECT f.id FROM folder f JOIN subtree s ON f.parent_id = s.id
+        )
+        SELECT id FROM subtree
+        """,
+        [folder_id],
+    )
+    ids = [r["id"] for r in rows]
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    db.execute(
+        f"UPDATE folder SET excluded = 1, exclusion_reason = ? WHERE id IN ({placeholders})",
+        [reason, *ids],
+    )
+    db.execute(
+        f"UPDATE file SET excluded = 1, exclusion_reason = ? WHERE folder_id IN ({placeholders})",
+        [reason, *ids],
+    )
+    db.conn.commit()
+
+
 def run_phase7_exclude(
     db,
     config: Config,
@@ -27,6 +59,10 @@ def run_phase7_exclude(
         db[table].get(item_id)
     except NotFoundError:
         raise ValueError(f"{target} with id {item_id} not found") from None
+
+    if target == "folder":
+        _exclude_folder_tree(db, item_id, reason)
+        return
 
     db[table].update(
         item_id,
@@ -51,22 +87,35 @@ def run_phase7_exclude_batch(
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            target = row["target"].strip()
-            item_id = int(row["id"].strip())
-            reason = row["reason"].strip()
-            table = "folder" if target == "folder" else "file"
+            # OCR audit #53: validate each row — an unrecognized target used
+            # to silently map to the file table, and one malformed row
+            # aborted the rest of the batch after earlier rows committed.
+            try:
+                target = (row.get("target") or "").strip()
+                item_id = int((row.get("id") or "").strip())
+                reason = (row.get("reason") or "").strip()
+            except (ValueError, AttributeError):
+                skipped += 1
+                continue
+            if target not in ("file", "folder"):
+                skipped += 1
+                continue
+            table = target
             try:
                 existing = db[table].get(item_id)
             except NotFoundError:
                 skipped += 1
                 continue  # Skip nonexistent IDs with a count
             if existing:
-                db[table].update(
-                    item_id,
-                    {
-                        "excluded": 1,
-                        "exclusion_reason": reason,
-                    },
-                )
+                if target == "folder":
+                    _exclude_folder_tree(db, item_id, reason)
+                else:
+                    db[table].update(
+                        item_id,
+                        {
+                            "excluded": 1,
+                            "exclusion_reason": reason,
+                        },
+                    )
                 count += 1
     return count, skipped

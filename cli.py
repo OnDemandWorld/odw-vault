@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pipeline.env  # isort: skip  # noqa: F401
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -14,8 +15,10 @@ import click
 from pipeline.config import DEFAULT_CONFIG_TOML, Config, load_app_config, load_config
 from pipeline.db import cleanup_stale_runs, is_db_initialized, migrate, open_db
 
-# Project root is the directory containing cli.py
-PROJECT_ROOT = Path(__file__).resolve().parent
+# Project root is the directory containing cli.py. OCR audit #8: when pip
+# installs cli.py as a py-module (e.g. the Docker image), __file__ lives in
+# site-packages — VAULT_HOME anchors config/seeds/corpus.db to the real root.
+PROJECT_ROOT = Path(os.environ.get("VAULT_HOME") or Path(__file__).resolve().parent).resolve()
 
 
 def get_config(ctx: click.Context) -> Config:
@@ -33,6 +36,15 @@ def get_config(ctx: click.Context) -> Config:
 
 def get_db_path(ctx: click.Context) -> Path:
     return PROJECT_ROOT / "corpus.db"
+
+
+def _require_initialized(ctx: click.Context) -> None:
+    """OCR audit #54: refuse to open/create corpus.db before init — sqlite3
+    .connect silently creates an empty DB, letting approve fabricate success
+    and blocking a later init with 'already exists'."""
+    if not is_db_initialized(get_db_path(ctx)):
+        click.echo("Error: corpus.db not initialized. Run 'vault init' first.", err=True)
+        ctx.exit(2)
 
 
 @click.group()
@@ -63,18 +75,28 @@ def init(corpus_root: str, cache_root: str | None, force: bool) -> None:
 
     if db_path.exists() and force:
         db_path.unlink()
+        # OCR audit #48: remove WAL sidecars too — a hot -wal left by a killed
+        # process would be recovered into the fresh DB, resurrecting old data.
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(db_path) + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
 
-    # Write config.toml (preserve existing if present, only update paths)
+    # Write config.toml. OCR audit #49: ALWAYS preserve an existing config
+    # (--force overwrites corpus.db, not user settings) and merge into [paths]
+    # so custom keys like chroma_root survive re-pointing the corpus.
     config_path = PROJECT_ROOT / "config.toml"
-    if config_path.exists() and not force:
-        # Update existing config with new paths
+    if config_path.exists():
         import tomllib
 
         import tomli_w
 
         with open(config_path, "rb") as f:
             existing = tomllib.load(f)
-        existing["paths"] = {"corpus_root": str(root), "cache_root": str(cache)}
+        paths = dict(existing.get("paths", {}))
+        paths["corpus_root"] = str(root)
+        paths["cache_root"] = str(cache)
+        existing["paths"] = paths
         config_path.write_text(tomli_w.dumps(existing), encoding="utf-8")
         click.echo(f"Updated {config_path} with new paths")
     else:
@@ -121,6 +143,10 @@ def _run_phase(ctx: click.Context, phase_name: str, phase_fn, **kwargs):
         click.echo("Error: database not initialized. Run 'init' first.", err=True)
         ctx.exit(1)
     db = open_db(db_path)
+    # OCR audit #95: apply pending migrations on CLI runs too — an upgraded
+    # codebase against an old-schema DB used to fail with 'no such column'
+    # until the user happened to start the API/UI.
+    migrate(db)
 
     from pipeline.logging import PhaseLogger
 
@@ -270,6 +296,7 @@ def exclude(target: str, item_id: int, reason: str) -> None:
     """Phase 7: Mark a file or folder as excluded."""
     from pipeline.phase7_exclude import run_phase7_exclude
 
+    _require_initialized(click.get_current_context())
     config = get_config(click.get_current_context())
     db = open_db(get_db_path(click.get_current_context()))
     run_phase7_exclude(db, config, target, item_id, reason)
@@ -287,6 +314,7 @@ def exclude_batch(
     """Phase 7: Batch exclude from CSV."""
     from pipeline.phase7_exclude import run_phase7_exclude_batch
 
+    _require_initialized(click.get_current_context())
     config = get_config(click.get_current_context())
     db = open_db(get_db_path(click.get_current_context()))
     if csv_path:
@@ -313,6 +341,7 @@ def exclude_batch(
 @click.option("--by", required=True)
 def approve(by: str) -> None:
     """Final sign-off on pre-flight."""
+    _require_initialized(click.get_current_context())
     db = open_db(get_db_path(click.get_current_context()))
     from pipeline.helpers import now_iso
 
@@ -324,6 +353,7 @@ def approve(by: str) -> None:
 @main.command()
 def status() -> None:
     """Print per-phase status as JSON."""
+    _require_initialized(click.get_current_context())
     db = open_db(get_db_path(click.get_current_context()))
     config_row = next(iter(db.query("SELECT value FROM config WHERE key='corpus_root'")), None)
     corpus_root = config_row["value"] if config_row else "unknown"
@@ -426,6 +456,7 @@ def _run_app_phase(ctx: click.Context, phase_name: str, phase_fn, **kwargs):
         click.echo("Error: database not initialized. Run 'init' first.", err=True)
         ctx.exit(1)
     db = open_db(db_path)
+    migrate(db)  # OCR audit #95: keep CLI runs schema-current
 
     from pipeline.logging import PhaseLogger
 

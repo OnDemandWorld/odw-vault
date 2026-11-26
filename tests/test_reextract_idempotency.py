@@ -182,7 +182,13 @@ class TestGetFileLatestRows:
         with patch("api.main._get_db", return_value=db):
             client = TestClient(app)
             resp = client.get(f"/files/{fid}")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["summary"] == "new sum"
-        assert body["extraction_path"] == NEW_TEXT
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["summary"] == "new sum"
+            # OCR audit #36: extraction_path is now a pointer to the text
+            # endpoint, not the full document text; the latest text is served
+            # by /files/{id}/text.
+            assert body["extraction_path"] == f"/files/{fid}/text"
+            text_resp = client.get(f"/files/{fid}/text")
+            assert text_resp.status_code == 200
+            assert NEW_TEXT in text_resp.text

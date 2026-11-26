@@ -34,7 +34,9 @@ import contextvars
 import json
 import logging
 import os
+import queue
 import random
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -308,19 +310,60 @@ class OtlpHttpSpanExporter(SpanExporter):
     def export(self, span_obj: Span) -> None:
         if not self.endpoint:
             return
+        # OCR audit #34: the request path only serializes + enqueues; the
+        # blocking HTTP POST runs on a shared background worker. A slow or
+        # unreachable collector used to add up to timeout x spans-per-request
+        # of latency inline (and block the event loop for async handlers).
         try:
-            import urllib.request
+            payload = self._payload(span_obj)
+        except Exception:  # best-effort, silent degradation
+            logger.debug("OTLP payload build failed", exc_info=True)
+            return
+        _otlp_enqueue(payload, self.endpoint, self.timeout)
 
+
+# Module-level OTLP export queue + single daemon worker. get_exporter() builds
+# a fresh exporter per span, so the worker must NOT live on the instance.
+_otlp_queue: queue.Queue | None = None
+_otlp_worker: threading.Thread | None = None
+_otlp_lock = threading.Lock()
+
+
+def _otlp_enqueue(payload: bytes, endpoint: str, timeout: float) -> None:
+    global _otlp_queue, _otlp_worker
+    with _otlp_lock:
+        if _otlp_queue is None:
+            _otlp_queue = queue.Queue()
+        if _otlp_worker is None or not _otlp_worker.is_alive():
+            _otlp_worker = threading.Thread(target=_otlp_drain, daemon=True)
+            _otlp_worker.start()
+    _otlp_queue.put((payload, endpoint, timeout))
+
+
+def _otlp_drain() -> None:
+    import urllib.request
+
+    while True:
+        payload, endpoint, timeout = _otlp_queue.get()
+        try:
             req = urllib.request.Request(
-                self.endpoint,
-                data=self._payload(span_obj),
+                endpoint,
+                data=payload,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 resp.read()
         except Exception:  # best-effort, silent degradation
-            logger.debug("OTLP span export to %s failed", self.endpoint, exc_info=True)
+            logger.debug("OTLP span export to %s failed", endpoint, exc_info=True)
+        finally:
+            _otlp_queue.task_done()
+
+
+def _wait_otlp_idle() -> None:
+    """Block until all queued OTLP exports finished (test/shutdown hook)."""
+    if _otlp_queue is not None:
+        _otlp_queue.join()
 
 
 class _NullExporter(SpanExporter):

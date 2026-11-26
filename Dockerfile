@@ -15,15 +15,25 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# OCR audit #8: `pip install .` places cli.py in site-packages, so the CLI
+# cannot derive the project root from __file__. Anchor it explicitly.
+ENV VAULT_HOME=/app
+
 # System dependencies:
 #   - build-essential / python3-dev: compile native Python deps (fasttext, chromadb)
 #   - ffmpeg: media duration detection (README runtime dep)
 #   - curl: container healthcheck against /health
+# OCR audit #56: unar/p7zip are LOCAL subprocess backends for patool (phase 0),
+# not external services — without them every archive expansion fails in-image.
+# Siegfried (sf) remains user-provided: mount the binary at /app/sf
+# (phase 2 raises a clear error when absent).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3-dev \
     ffmpeg \
     curl \
+    unar \
+    p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --upgrade pip
@@ -46,6 +56,13 @@ RUN pip install --no-cache-dir .
 # Provide a default config so the container can boot. Override at runtime with
 # a volume mount: -v "$PWD/config.toml:/app/config.toml"
 COPY config.example.toml ./config.toml
+
+# OCR audit #57: run as a non-root user — the API processes untrusted uploads
+# and archive contents; a compromise must not yield root with access to the
+# mounted config (API keys) and corpus volumes. Mounted volumes must be
+# readable/writable by UID 10001.
+RUN useradd --create-home --uid 10001 vault && chown -R vault:vault /app
+USER vault
 
 EXPOSE 8765
 

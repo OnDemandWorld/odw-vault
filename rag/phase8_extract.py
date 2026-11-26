@@ -159,11 +159,19 @@ def run_extract(
         "is_dup_primary=1",
         "excluded=0",
         "extract_strategy IS NOT NULL",
-        "extract_strategy NOT IN ('skip', 'manual', 'unsupported')",
+        # OCR audit #22: whisper files belong to phase 8b (transcribe) —
+        # the dispatcher has no whisper extractor and used to record a
+        # permanent failure row for every audio/video file.
+        "extract_strategy NOT IN ('skip', 'manual', 'unsupported', 'whisper')",
     ]
 
+    # OCR audit #76: bind user-supplied filters instead of interpolating
+    # them into SQL (apostrophes crashed the query; crafted values could
+    # alter it).
+    params: list = []
     if strategy:
-        where_parts.append(f"extract_strategy='{strategy}'")
+        where_parts.append("extract_strategy = ?")
+        params.append(strategy)
 
     if not reextract:
         # Exclude files that already have an extraction row
@@ -175,7 +183,7 @@ def run_extract(
     if limit:
         query += f" LIMIT {limit}"
 
-    files = list(db.query(query))
+    files = list(db.query(query, params))
 
     if not files:
         msg = "No files eligible for extraction."
@@ -237,6 +245,18 @@ def run_extract(
                     if len(text_for_db) > MAX_EXTRACT_TEXT_DB:
                         text_for_db = text_for_db[:MAX_EXTRACT_TEXT_DB]
 
+                # OCR audit #23: text was extracted but the artifact is
+                # missing/unreadable (write failure swallowed upstream) —
+                # recording succeeded=1 with NULL text silently loses the
+                # document. Record a failure instead.
+                if (char_count or 0) > 0 and text_for_db is None:
+                    succeeded = False
+                    error_msg = (
+                        "extraction artifact missing/unreadable after write "
+                        "(disk full or permissions on .rag-cache?)"
+                    )
+
+            if succeeded:
                 db["extraction"].insert(
                     {
                         "file_id": file_id,

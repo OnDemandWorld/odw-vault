@@ -14,6 +14,7 @@ import logging
 import re
 from datetime import UTC, datetime
 
+from pipeline.helpers import record_failure
 from rag.chunk_strategies import get_chunker, resolve_strategy_name
 from rag.tokenization import index_zh_chunks
 
@@ -118,6 +119,32 @@ def run_chunk(
     if rechunk:
         file_ids = [r["file_id"] for r in rows]
         placeholders = ",".join("?" for _ in file_ids)
+        # OCR audit #15: DELETE FROM chunk cascades to embedding_ref but not
+        # to Chroma — remove the vectors first (best-effort) so rechunk does
+        # not leave orphaned, still-retrievable vectors behind.
+        try:
+            refs = list(
+                db.query(
+                    f"SELECT er.collection, er.external_id FROM embedding_ref er "
+                    f"JOIN chunk c ON er.chunk_id = c.id "
+                    f"WHERE c.file_id IN ({placeholders})",
+                    file_ids,
+                )
+            )
+            if refs:
+                import chromadb
+
+                with chromadb.PersistentClient(path=str(cfg.chroma_root_path)) as _cc:
+                    by_coll: dict[str, list[str]] = {}
+                    for r in refs:
+                        by_coll.setdefault(r["collection"], []).append(r["external_id"])
+                    for cname, eids in by_coll.items():
+                        try:
+                            _cc.get_collection(cname).delete(ids=eids)
+                        except Exception as e:
+                            logger.warning("Rechunk: Chroma cleanup failed for %s: %s", cname, e)
+        except Exception as e:
+            logger.warning("Rechunk: Chroma vector cleanup skipped: %s", e)
         # V1.2 M2: clear the additive Chinese index for these files first
         # (standalone FTS table has no auto-sync trigger). Best-effort.
         try:
@@ -137,106 +164,123 @@ def run_chunk(
 
     total_chunks = 0
     files_processed = 0
+    files_failed = 0
 
     for row in rows:
-        extraction_id = row["extraction_id"]
-        file_id = row["file_id"]
-        text = row["text_extracted"]
-        page_count = row["extraction_page_count"]
+        # OCR audit #30: per-file isolation — one bad file (write lock,
+        # disk full, strategy error) must not abort the whole phase, and
+        # every failure must reach the failure table.
+        try:
+            extraction_id = row["extraction_id"]
+            file_id = row["file_id"]
+            text = row["text_extracted"]
+            page_count = row["extraction_page_count"]
 
-        # Resolve the chunking strategy for this file (default: sentence_window,
-        # which reproduces the legacy behaviour exactly).
-        strategy_name = resolve_strategy_name(
-            cfg, category=row.get("category"), override=chunker
-        )
-        strategy = get_chunker(strategy_name)
-        spans = strategy.chunk(
-            text,
-            window_size=window_size,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
-        if not spans:
-            continue
+            # Resolve the chunking strategy for this file (default: sentence_window,
+            # which reproduces the legacy behaviour exactly).
+            strategy_name = resolve_strategy_name(
+                cfg, category=row.get("category"), override=chunker
+            )
+            strategy = get_chunker(strategy_name)
+            spans = strategy.chunk(
+                text,
+                window_size=window_size,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            if not spans:
+                continue
 
-        chunks_to_insert = []
-        for span in spans:
-            # Character offsets into the extraction text (provided by strategy)
-            char_start = span.start
-            char_end = span.end
+            chunks_to_insert = []
+            for span in spans:
+                # Character offsets into the extraction text (provided by strategy)
+                char_start = span.start
+                char_end = span.end
 
-            # Page info from extraction metadata
-            meta: dict[str, object] = {
-                "extraction_id": extraction_id,
-                "extraction_tool": row["tool"],
-                "char_start": char_start,
-                "char_end": char_end,
-                "chunk_strategy": strategy.name,
-            }
-
-            start_page = None
-            end_page = None
-            if page_count is not None and page_count > 0:
-                # Approximate page mapping based on position in text
-                page_start = int((char_start / max(len(text), 1)) * page_count) + 1
-                page_end = int((char_end / max(len(text), 1)) * page_count) + 1
-                start_page = max(1, page_start)
-                end_page = max(1, page_end)
-
-            chunks_to_insert.append(
-                {
-                    "file_id": file_id,
-                    "chunk_index": span.index,
-                    "text": span.text,
-                    "token_count": _token_estimate(span.text),
-                    "start_page": start_page,
-                    "end_page": end_page,
-                    "metadata_json": json.dumps(meta, ensure_ascii=False),
-                    "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                # Page info from extraction metadata
+                meta: dict[str, object] = {
+                    "extraction_id": extraction_id,
+                    "extraction_tool": row["tool"],
+                    "char_start": char_start,
+                    "char_end": char_end,
+                    "chunk_strategy": strategy.name,
                 }
+
+                start_page = None
+                end_page = None
+                if page_count is not None and page_count > 0:
+                    # Approximate page mapping based on position in text
+                    page_start = int((char_start / max(len(text), 1)) * page_count) + 1
+                    page_end = int((char_end / max(len(text), 1)) * page_count) + 1
+                    start_page = max(1, page_start)
+                    # OCR audit #75: clamp to the real page count (the last
+                    # chunk otherwise gets end_page = page_count + 1).
+                    end_page = min(page_count, max(1, page_end))
+
+                chunks_to_insert.append(
+                    {
+                        "file_id": file_id,
+                        "chunk_index": span.index,
+                        "text": span.text,
+                        "token_count": _token_estimate(span.text),
+                        "start_page": start_page,
+                        "end_page": end_page,
+                        "metadata_json": json.dumps(meta, ensure_ascii=False),
+                        "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }
+                )
+
+            if not chunks_to_insert:
+                continue
+
+            db["chunk"].insert_all(chunks_to_insert)
+            db.conn.commit()
+
+            # OCR audit #24: the migration-4 AFTER INSERT trigger already syncs
+            # chunk_fts — the old explicit per-chunk INSERT here doubled every
+            # posting (and left orphans after a crash before the final rebuild).
+            inserted_chunks = list(
+                db.query(
+                    "SELECT id, text FROM chunk WHERE file_id = ? ORDER BY chunk_index",
+                    [file_id],
+                )
             )
 
-        if not chunks_to_insert:
+            # V1.2 M2: populate the additive Chinese BM25 index for any Chinese
+            # chunks (English chunks are skipped cheaply; default path unaffected).
+            index_zh_chunks(
+                db,
+                [(ch["id"], ch["text"]) for ch in inserted_chunks],
+                model_path=cfg.models.language_id.model_path,
+            )
+
+            total_chunks += len(chunks_to_insert)
+            files_processed += 1
+            logger.debug(
+                "file_id=%d: %d chunks via '%s' from %d spans (%d chars)",
+                file_id,
+                len(chunks_to_insert),
+                strategy.name,
+                len(spans),
+                row["char_count"],
+            )
+        except Exception as exc:
+            files_failed += 1
+            logger.error("Chunking failed for file_id=%s: %s", row.get("file_id"), exc)
+            record_failure(
+                db,
+                file_id=row["file_id"],
+                phase="chunk",
+                error_class=type(exc).__name__,
+                error_message=str(exc),
+            )
             continue
-
-        db["chunk"].insert_all(chunks_to_insert)
-        db.conn.commit()
-
-        # Populate FTS5 table (external content table needs explicit inserts).
-        # The rowid must match chunk.id for content='chunk' to work.
-        inserted_chunks = list(
-            db.query(
-                "SELECT id, text FROM chunk WHERE file_id = ? ORDER BY chunk_index",
-                [file_id],
-            )
-        )
-        for ch in inserted_chunks:
-            db.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?, ?)", [ch["id"], ch["text"]])
-        db.conn.commit()
-
-        # V1.2 M2: populate the additive Chinese BM25 index for any Chinese
-        # chunks (English chunks are skipped cheaply; default path unaffected).
-        index_zh_chunks(
-            db,
-            [(ch["id"], ch["text"]) for ch in inserted_chunks],
-            model_path=cfg.models.language_id.model_path,
-        )
-
-        total_chunks += len(chunks_to_insert)
-        files_processed += 1
-        logger.debug(
-            "file_id=%d: %d chunks via '%s' from %d spans (%d chars)",
-            file_id,
-            len(chunks_to_insert),
-            strategy.name,
-            len(spans),
-            row["char_count"],
-        )
 
     logger.info(
-        "Chunking complete: %d chunks across %d files",
+        "Chunking complete: %d chunks across %d files (%d failed)",
         total_chunks,
         files_processed,
+        files_failed,
     )
 
     # Rebuild FTS index to ensure consistency

@@ -24,16 +24,40 @@ class TestValidationShrinking:
 
 
 class TestHealthCache:
-    @patch("api.main._load_config")
-    def test_health_cached_within_ttl(self, mock_load_cfg):
+    def test_health_cached_within_ttl(self, tmp_path):
+        """OCR audit #64: mock the probes (no real Ollama/Chroma//tmp writes)
+        and assert the cache by CALL COUNTS — r1.json()==r2.json() held even
+        with the cache removed, so the old test could not detect its absence."""
+        import sqlite3
+
+        import sqlite_utils
+
+        from pipeline.db import migrate
+
+        conn = sqlite3.connect(str(tmp_path / "t.db"), check_same_thread=False)
+        db = sqlite_utils.Database(conn)
+        migrate(db)
+
         mock_cfg = MagicMock()
         mock_cfg.ollama.host = "http://localhost:11434"
-        mock_cfg.chroma_root_path = "/tmp/nonexistent-chroma"
+        mock_cfg.chroma_root_path = str(tmp_path / "chroma")
         mock_cfg.models.embedding.collection_suffix = "test"
-        mock_cfg.models.language_id.model_path = "/tmp/nonexistent-model"
-        mock_load_cfg.return_value = mock_cfg
+        mock_cfg.models.language_id.model_path = str(tmp_path / "no-model")
 
-        r1 = client.get("/health")
-        r2 = client.get("/health")
+        with (
+            patch("api.main._load_config", return_value=mock_cfg) as mock_load_cfg,
+            patch("api.main._get_db", return_value=db),
+            patch("api.main.ollama.Client") as mock_ollama,
+            patch("api.main.chromadb.PersistentClient") as mock_chroma,
+        ):
+            mock_chroma.return_value.get_collection.return_value = MagicMock()
+            r1 = client.get("/health")
+            r2 = client.get("/health")
+
         assert r1.status_code == 200 and r2.status_code == 200
         assert r1.json() == r2.json()
+        # Cache hit short-circuits before _load_config and the probes.
+        assert mock_load_cfg.call_count == 1
+        assert mock_ollama.call_count == 1
+        assert mock_chroma.call_count == 1
+        conn.close()

@@ -7,6 +7,7 @@ ProcessPoolExecutor.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -28,6 +29,11 @@ def _should_skip_file(name: str, path: Path, config: Config) -> bool:
     """Determine if a file should be skipped during walk."""
     if is_hidden_or_system(name):
         return True
+    # OCR audit #58: honor walk.skip_patterns (Thumbs.db, *.tmp, ...) —
+    # the config knob was previously dead and CLAUDE.md claimed it worked.
+    for pattern in config.walk.skip_patterns:
+        if fnmatch.fnmatch(name, pattern):
+            return True
     return path.resolve().is_relative_to(config.cache_root_path.resolve())
 
 
@@ -81,6 +87,10 @@ def run_phase1(
     """Walk corpus and hash all files."""
     root = config.corpus_root_path
     root_resolved = root.resolve()
+    # OCR audit #94: a missing root used to "succeed" with 0 files (os.walk
+    # yields nothing) and propagate an empty corpus to report/approve.
+    if not root_resolved.is_dir():
+        raise ValueError(f"Corpus root does not exist or is not a directory: {root}")
     max_size = config.walk.max_file_size_bytes
     n_workers = workers or config.walk.hash_workers or os.cpu_count() or 4
 
@@ -123,8 +133,10 @@ def run_phase1(
                     except OSError:
                         link_target = None
                     if link_target is None or not link_target.is_relative_to(root_resolved):
+                        _sym_row = _row_by_path(db, "file", str(fp))
                         record_failure(
                             db,
+                            file_id=_sym_row["id"] if _sym_row else None,
                             phase="walk",
                             error_class="symlink",
                             error_message=f"Skipped symlink pointing outside corpus: {fp}",
@@ -155,12 +167,24 @@ def run_phase1(
                 # so a file that grew past the limit between walks is still
                 # flagged instead of passing on stale metadata.
                 if size > max_size:
+                    # OCR audit #96: link the failure to the file row and
+                    # invalidate stale hash metadata — a file that grew past
+                    # the cap must not stay 'done' with its old hash (dedup
+                    # and report would keep treating it as valid).
+                    _over_row = _row_by_path(db, "file", abs_path)
                     record_failure(
                         db,
+                        file_id=_over_row["id"] if _over_row else None,
                         phase="walk",
                         error_class="oversized",
                         error_message=f"File too large: {size} bytes ({abs_path})",
                     )
+                    if _over_row:
+                        db.execute(
+                            "UPDATE file SET hash_status='stale', size_bytes=? WHERE id=?",
+                            [size, _over_row["id"]],
+                        )
+                        db.conn.commit()
                     continue
 
                 if not rehash:
@@ -225,10 +249,16 @@ def run_phase1(
                         "UPDATE file SET hash_status='failed', error_message=? WHERE path=?",
                         [error, path],
                     )
+                    # OCR audit #96: classify by cause (a file deleted between
+                    # walk and hash is 'missing', not 'permission') and link
+                    # the failure to its file row when one exists.
+                    _err_class = "missing" if "No such file" in error else "permission"
+                    _hash_row = _row_by_path(db, "file", path)
                     record_failure(
                         db,
+                        file_id=_hash_row["id"] if _hash_row else None,
                         phase="walk",
-                        error_class="permission",
+                        error_class=_err_class,
                         error_message=f"Hash failed for {path}: {error}",
                     )
                     failed += 1

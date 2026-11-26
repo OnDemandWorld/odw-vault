@@ -88,7 +88,15 @@ def _triage_pdf_body(doc, filepath: str, config: Config, out: dict) -> dict:
         out["category_override"] = "pdf-scanned"
         return out
 
-    sample_pages = sorted({0, n // 2, max(0, n - 1)})
+    # OCR audit #58: honor triage.pdf_sample_pages (default 3 keeps the
+    # legacy first/middle/last sampling exactly).
+    _k = max(1, getattr(config.triage, "pdf_sample_pages", 3))
+    if _k == 3:
+        sample_pages = sorted({0, n // 2, max(0, n - 1)})
+    elif n <= _k:
+        sample_pages = list(range(n))
+    else:
+        sample_pages = sorted({int(i * (n - 1) / (_k - 1)) for i in range(_k)})
     chars_total = 0
     text_sample = []
     for i in sample_pages:
@@ -172,6 +180,13 @@ def _detect_language(filepath: str, category: str) -> str | None:
     if category not in ("document", "spreadsheet", "pdf-text", "data", "email", "ebook"):
         return None
     try:
+        # OCR audit #52: skip binary containers — reading ZIP (docx/xlsx/
+        # pptx/epub), OLE2 (legacy doc/xls) or SQLite bytes as UTF-8 produces
+        # garbage language labels. Detect on extracted text instead (ph. 8+).
+        with open(filepath, "rb") as f:
+            magic = f.read(8)
+        if magic[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"\xd0\xcf\x11\xe0") or magic[:6] == b"SQLite":
+            return None
         with open(filepath, encoding="utf-8", errors="ignore") as f:
             text = f.read(4096)
         if len(text) < 50:
@@ -208,7 +223,13 @@ def run_phase3(
 
     n_workers = workers or min(os.cpu_count() or 4, 8)
     if db_path is None:
-        db_path = config.cache_root_path / "corpus.db"
+        # OCR audit #93: the old fallback (cache_root/corpus.db) pointed at a
+        # nonexistent DB — workers created a stray empty file and every
+        # UPDATE failed with 'no such table: file'. Fail loudly instead.
+        raise ValueError(
+            "run_phase3 requires db_path (the real corpus.db location); "
+            "there is no safe default."
+        )
 
     # Accumulate results in main thread, then batch-update
     results: list[tuple[int, dict | None, bool]] = []
@@ -257,16 +278,18 @@ def run_phase3(
                     tdb.conn.commit()  # Ensure triage results are persisted
                 elif category in ("audio", "video"):
                     result = _triage_media(filepath)
+                    # OCR audit #51: persist is_corrupt so v_problem_files and
+                    # the report's Problem Files section see corrupt media.
                     tdb.execute(
-                        "UPDATE file SET duration_seconds=?, triage_json=?, triage_status='done' WHERE id=?",
-                        [result["duration_seconds"], result["triage_json"], file_id],
+                        "UPDATE file SET duration_seconds=?, is_corrupt=?, triage_json=?, triage_status='done' WHERE id=?",
+                        [result["duration_seconds"], result["is_corrupt"], result["triage_json"], file_id],
                     )
                     tdb.conn.commit()
                 elif category == "image":
                     result = _triage_image(filepath)
                     tdb.execute(
-                        "UPDATE file SET triage_json=?, triage_status='done' WHERE id=?",
-                        [result["triage_json"], file_id],
+                        "UPDATE file SET is_corrupt=?, triage_json=?, triage_status='done' WHERE id=?",
+                        [result["is_corrupt"], result["triage_json"], file_id],
                     )
                     tdb.conn.commit()
                 else:

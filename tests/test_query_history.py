@@ -13,8 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.db import migrate, open_db
-
+from pipeline.db import migrate
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -23,9 +22,17 @@ from pipeline.db import migrate, open_db
 
 @pytest.fixture()
 def db(tmp_path: Path):
-    """Create a temporary database with all migrations applied."""
-    db_path = tmp_path / "test.db"
-    database = open_db(db_path)
+    """Create a temporary database with all migrations applied.
+
+    check_same_thread=False: GET /queries runs in TestClient's worker thread
+    (OCR audit #61 — these tests now drive the real endpoint).
+    """
+    import sqlite3
+
+    import sqlite_utils
+
+    conn = sqlite3.connect(str(tmp_path / "test.db"), check_same_thread=False)
+    database = sqlite_utils.Database(conn)
     migrate(database)
     return database
 
@@ -108,121 +115,113 @@ class TestQueryLogging:
 # ---------------------------------------------------------------------------
 
 
+def _get(db, params):
+    """OCR audit #61: drive the REAL GET /queries endpoint (the old tests
+    wrote their own SQL and asserted SQLite returns what SQLite returns —
+    the endpoint's pagination/escaping/date logic was never executed)."""
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from api.main import app
+
+    with patch("api.main._get_db", return_value=db):
+        r = TestClient(app).get("/queries", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
 class TestQueryHistoryPagination:
-    """Verify pagination logic for query history."""
+    """Verify pagination via GET /queries."""
 
     def test_pagination_page_1(self, db):
-        """First page should return correct items."""
         for i in range(25):
             _insert_query(db, f"Query {i:02d}")
-
-        # Simulate the API logic
-        page, size = 1, 10
-        offset = (page - 1) * size
-        rows = list(db.query(
-            "SELECT id, query_text FROM query_log ORDER BY asked_at DESC LIMIT ? OFFSET ?",
-            [size, offset],
-        ))
-        assert len(rows) == 10
+        body = _get(db, {"page": 1, "size": 10})
+        assert len(body["items"]) == 10
+        assert body["total"] == 25
+        assert body["page"] == 1
 
     def test_pagination_page_3(self, db):
-        """Third page of size 10 should return 5 items from 25 total."""
         for i in range(25):
             _insert_query(db, f"Query {i:02d}")
-
-        page, size = 3, 10
-        offset = (page - 1) * size
-        rows = list(db.query(
-            "SELECT id, query_text FROM query_log ORDER BY asked_at DESC LIMIT ? OFFSET ?",
-            [size, offset],
-        ))
-        assert len(rows) == 5
+        body = _get(db, {"page": 3, "size": 10})
+        assert len(body["items"]) == 5
+        assert body["total"] == 25
 
     def test_pagination_total_count(self, db):
-        """Total count should reflect all matching records."""
         for i in range(25):
             _insert_query(db, f"Query {i:02d}")
-
-        count_rows = list(db.query("SELECT COUNT(*) as total FROM query_log"))
-        assert count_rows[0]["total"] == 25
+        assert _get(db, {})["total"] == 25
 
     def test_pagination_empty(self, db):
-        """Empty query_log should return 0 items."""
-        rows = list(db.query(
-            "SELECT id FROM query_log ORDER BY asked_at DESC LIMIT ? OFFSET ?",
-            [10, 0],
-        ))
-        assert len(rows) == 0
-
-
-# ---------------------------------------------------------------------------
-# Test: query history search
-# ---------------------------------------------------------------------------
+        body = _get(db, {"page": 1, "size": 10})
+        assert body["items"] == []
+        assert body["total"] == 0
 
 
 class TestQueryHistorySearch:
-    """Verify keyword search filtering."""
+    """Verify keyword/date filtering via GET /queries."""
 
     def test_search_matches_keyword(self, db):
-        """Search for 'RAG' should match queries containing 'RAG'."""
         _insert_query(db, "What is RAG?")
         _insert_query(db, "How does RAG work?")
         _insert_query(db, "What is Python?")
-
-        rows = list(db.query(
-            "SELECT query_text FROM query_log WHERE query_text LIKE ? ORDER BY asked_at DESC",
-            ["%RAG%"],
-        ))
-        assert len(rows) == 2
-        assert all("RAG" in r["query_text"] for r in rows)
+        body = _get(db, {"keyword": "RAG"})
+        assert body["total"] == 2
+        assert all("RAG" in i["query_text"] for i in body["items"])
 
     def test_search_no_match(self, db):
-        """Search for non-existent keyword should return 0 results."""
         _insert_query(db, "What is RAG?")
         _insert_query(db, "What is Python?")
-
-        rows = list(db.query(
-            "SELECT query_text FROM query_log WHERE query_text LIKE ?",
-            ["%Blockchain%"],
-        ))
-        assert len(rows) == 0
+        assert _get(db, {"keyword": "Blockchain"})["total"] == 0
 
     def test_search_case_insensitive(self, db):
-        """SQLite LIKE is case-insensitive by default for ASCII."""
         _insert_query(db, "What is RAG?")
         _insert_query(db, "What is rag?")
+        assert _get(db, {"keyword": "RAG"})["total"] == 2
 
-        # Both should match since SQLite LIKE is case-insensitive
-        rows = list(db.query(
-            "SELECT query_text FROM query_log WHERE query_text LIKE ?",
-            ["%RAG%"],
-        ))
-        assert len(rows) == 2
+    def test_search_wildcard_is_literal(self, db):
+        _insert_query(db, "Coverage is 100% today")
+        _insert_query(db, "Coverage is 1000 today")
+        body = _get(db, {"keyword": "100%"})
+        assert body["total"] == 1
+        assert "100%" in body["items"][0]["query_text"]
 
     def test_search_with_date_filter(self, db):
-        """Date filtering should work alongside keyword search."""
         _insert_query(db, "RAG query 1")
         _insert_query(db, "RAG query 2")
         _insert_query(db, "Python query")
+        body = _get(db, {"keyword": "RAG", "start_date": "2020-01-01"})
+        assert body["total"] == 2
 
-        # Search for RAG with a date filter that includes all
-        rows = list(db.query(
-            "SELECT query_text FROM query_log "
-            "WHERE query_text LIKE ? AND asked_at >= '2020-01-01'",
-            ["%RAG%"],
-        ))
-        assert len(rows) == 2
+    def test_end_date_includes_final_day(self, db):
+        _insert_query(db, "late RAG")
+        _insert_query(db, "next day RAG")
+        db.conn.execute(
+            "UPDATE query_log SET asked_at = '2026-01-31 15:00:00' WHERE query_text = 'late RAG'"
+        )
+        db.conn.execute(
+            "UPDATE query_log SET asked_at = '2026-02-01 00:00:01' WHERE query_text = 'next day RAG'"
+        )
+        db.conn.commit()
+        body = _get(db, {"keyword": "RAG", "end_date": "2026-01-31"})
+        assert body["total"] == 1
+        assert body["items"][0]["query_text"] == "late RAG"
 
     def test_search_combined_filters(self, db):
-        """Multiple filters should combine with AND."""
         _insert_query(db, "RAG question", user="alice")
         _insert_query(db, "RAG question", user="bob")
         _insert_query(db, "Python question", user="alice")
-
-        rows = list(db.query(
-            "SELECT query_text, user FROM query_log "
-            "WHERE query_text LIKE ? AND user = ?",
-            ["%RAG%", "alice"],
-        ))
-        assert len(rows) == 1
-        assert rows[0]["user"] == "alice"
+        db.conn.execute(
+            "UPDATE query_log SET asked_at = '2026-03-10 00:00:00' WHERE user = 'bob'"
+        )
+        db.conn.execute(
+            "UPDATE query_log SET asked_at = '2026-01-10 00:00:00' WHERE user = 'alice'"
+        )
+        db.conn.commit()
+        body = _get(db, {
+            "keyword": "RAG", "start_date": "2026-01-01", "end_date": "2026-01-31",
+        })
+        assert body["total"] == 1
+        assert body["items"][0]["query_text"] == "RAG question"

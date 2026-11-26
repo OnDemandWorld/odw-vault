@@ -181,19 +181,33 @@ class TestCliServe:
 
 class TestCliArchives:
     def test_archives_dry_run(self, tmp_path):
-        """Verify the archives command parses --dry-run."""
+        """OCR audit #65: seed a real archive and assert dry-run effects.
+
+        The old assertion ('dry-run' not in output OR exit in (0,2)) could
+        never fail — the command never prints that literal, so even a crash
+        passed."""
+        import zipfile
+
         root = tmp_path / "corpus"
         root.mkdir()
-        runner = CliRunner()
+        with zipfile.ZipFile(root / "bundle.zip", "w") as z:
+            z.writestr("inner.txt", "content")
+
+        (tmp_path / "config.toml").write_text(
+            f'[paths]\ncorpus_root = "{root}"\ncache_root = "{root / ".rag-cache"}"\n',
+            encoding="utf-8",
+        )
         db_path = tmp_path / "corpus.db"
         db = open_db(db_path)
         migrate(db)
         db["config"].insert({"key": "corpus_root", "value": str(root)}, replace=True)
 
         with patch("cli.PROJECT_ROOT", tmp_path):
-            result = runner.invoke(main, ["archives", "--dry-run"])
-        # May fail due to patool or no archives, but command should run
-        assert "dry-run" not in result.output or result.exit_code in (0, 2)
+            result = CliRunner().invoke(main, ["archives", "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        assert db["archive_expansion"].count == 0
+        assert not (root / "bundle.extracted").exists()
 
 
 class TestCliIdentify:

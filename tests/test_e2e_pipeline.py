@@ -63,11 +63,16 @@ class TestE2EWalkAndIdentify:
         plog = PhaseLogger("test", cache)
 
         r1 = run_phase1(db, cfg, plog)
+        count1 = db.execute("SELECT COUNT(*) FROM file").fetchone()[0]
         # Reuse same db connection for idempotency check
         r2 = run_phase1(db, cfg, plog)
 
+        # OCR audit #98: compare the runs — count >= 2 passed even when the
+        # second walk re-hashed everything.
         file_count = db.execute("SELECT COUNT(*) FROM file").fetchone()[0]
-        assert file_count >= 2
+        assert file_count == count1
+        assert r1["files_processed"] >= 2
+        assert r2["files_processed"] == 0
 
 
 class TestE2EReport:

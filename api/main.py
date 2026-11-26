@@ -20,6 +20,7 @@ import chromadb
 import ollama
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
@@ -122,13 +123,16 @@ async def _lifespan(application: FastAPI):
         if cfg.watcher.enabled:
             from rag.watcher import CorpusWatcher
 
-            chroma_client = chromadb.PersistentClient(path=str(cfg.chroma_root_path))
+            # OCR audit #16: no process-lifetime Chroma client — the watcher
+            # opens/closes one per flush so retrieval's per-query reload sees
+            # external sync writes (a pinned SharedSystem never reloads).
             _watcher = CorpusWatcher(
                 cfg,
                 _get_db(),
-                chroma_client,
+                None,
                 db_factory=_get_db,
                 startup_sync=cfg.watcher.startup_sync,
+                chroma_factory=lambda: chromadb.PersistentClient(path=str(cfg.chroma_root_path)),
             )
             _watcher.start()
             logger.info("Corpus watcher started via API server")
@@ -362,9 +366,12 @@ def _shrink_validation_errors(exc: RequestValidationError) -> list:
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # OCR audit #31: pydantic v2 errors() can embed live exception objects in
+    # ctx (e.g. int_parsing ValueError) — jsonable_encoder coerces them so a
+    # validation error renders as 422 instead of a serialization 500.
     return JSONResponse(
         status_code=422,
-        content={"detail": _shrink_validation_errors(exc)},
+        content={"detail": jsonable_encoder(_shrink_validation_errors(exc))},
     )
 
 
@@ -446,16 +453,7 @@ def _query_impl(req: QueryRequest):
     # V-8: precheck the GENERATION endpoint too — it can differ from the
     # embedding host (cloud Ollama default in config.example.toml); a dead
     # generation endpoint previously surfaced as a raw 500 after retries.
-    gen_host = getattr(cfg.models.generation.endpoint, "host", None)
-    if gen_host and gen_host != cfg.ollama.host:
-        try:
-            with ollama.Client(host=gen_host, timeout=10) as _c:
-                _c.list()
-        except Exception:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Generation model endpoint ({gen_host}) is not reachable",
-            ) from None
+    _precheck_generation_endpoint(cfg)
 
     # Check Chroma collection
     suffix = cfg.models.embedding.collection_suffix
@@ -662,6 +660,23 @@ def _query_impl(req: QueryRequest):
 # ---------------------------------------------------------------------------
 
 
+def _precheck_generation_endpoint(cfg) -> None:
+    """503 early when the generation endpoint differs from the embedding
+    host and is unreachable (V-8). OCR audit #81: shared by /query AND
+    /query/stream — the stream path used to discover dead endpoints only
+    mid-stream, after retrieval and conversation writes."""
+    gen_host = getattr(cfg.models.generation.endpoint, "host", None)
+    if gen_host and gen_host != cfg.ollama.host:
+        try:
+            with ollama.Client(host=gen_host, timeout=10) as _c:
+                _c.list()
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Generation model endpoint ({gen_host}) is not reachable",
+            ) from None
+
+
 @app.post("/query/stream")
 def query_stream(req: QueryRequest):
     cfg = _load_config()
@@ -673,6 +688,9 @@ def query_stream(req: QueryRequest):
             _c.list()
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama is not reachable") from None
+
+    # OCR audit #81: same generation-endpoint precheck as /query.
+    _precheck_generation_endpoint(cfg)
 
     # Check Chroma
     suffix = cfg.models.embedding.collection_suffix
@@ -842,9 +860,16 @@ def query_stream(req: QueryRequest):
             if cfg.generation_runtime.refuse_on_empty_context and not hits:
                 from rag.generation import REFUSAL_TEXT
 
-                query_log_id = _persist_stream_query(
+                # OCR audit #33: persist on a worker thread like the normal
+                # path — a direct sqlite commit here blocks the event loop
+                # (up to busy_timeout) and freezes all concurrent streams.
+                # OCR audit #80: report the real elapsed time and attach the
+                # conversation, matching the normal done-event shape.
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                query_log_id = await run_in_threadpool(
+                    _persist_stream_query,
                     REFUSAL_TEXT,
-                    int((time.monotonic() - t0) * 1000),
+                    elapsed_ms,
                     0,
                 )
                 yield ServerSentEvent(event="citations", data=json.dumps([]))
@@ -853,8 +878,9 @@ def query_stream(req: QueryRequest):
                     data=json.dumps(
                         {
                             "query_log_id": query_log_id,
-                            "metrics": {"retrieval_ms": retrieval_ms, "generation_ms": 0.0, "total_ms": retrieval_ms},
+                            "metrics": {"retrieval_ms": retrieval_ms, "generation_ms": 0.0, "total_ms": elapsed_ms},
                             "refused": True,
+                            "conversation_id": conversation_id,
                         }
                     ),
                 )
@@ -1024,7 +1050,10 @@ def list_folders(workspace: str | None = None):
             inferred_label=r.get("inferred_label"),
         )
 
-    # Link children to parents
+    # Link children to parents.
+    # OCR audit #35: O(1) rel_path index instead of an O(n^2) linear scan
+    # per node (10k folders used to mean ~50-100M string comparisons).
+    by_rel_path: dict[str, FolderNode] = {n.rel_path: n for n in node_map.values()}
     roots: list[FolderNode] = []
     for r in rows:
         node = node_map[r["id"]]
@@ -1033,11 +1062,9 @@ def list_folders(workspace: str | None = None):
         if parent_path == "." or parent_path == "":
             roots.append(node)
         else:
-            # Find parent node
-            for _pid, pnode in node_map.items():
-                if pnode.rel_path == parent_path:
-                    pnode.children.append(node)
-                    break
+            pnode = by_rel_path.get(parent_path)
+            if pnode is not None:
+                pnode.children.append(node)
             else:
                 roots.append(node)
 
@@ -1058,7 +1085,9 @@ def get_file(file_id: int):
                   f.page_count, f.folder_id,
                   fo.name as parent_folder,
                   s.summary_text as summary,
-                  e.text_extracted as extraction_path
+                  CASE WHEN e.id IS NOT NULL
+                       THEN '/files/' || f.id || '/text'
+                       ELSE NULL END as extraction_path
            FROM file f
            LEFT JOIN folder fo ON f.folder_id = fo.id
            LEFT JOIN summary s ON s.file_id = f.id
@@ -1097,8 +1126,11 @@ def get_file(file_id: int):
 def get_file_text(file_id: int):
     db = _get_db()
 
+    # OCR audit #79: latest successful extraction, matching GET /files/{id}'s
+    # MAX(id) selection — rowid order used to serve the stale first extraction.
     row = list(db.query(
-        "SELECT text_extracted FROM extraction WHERE file_id = ? AND succeeded = 1",
+        "SELECT text_extracted FROM extraction WHERE file_id = ? AND succeeded = 1 "
+        "ORDER BY id DESC LIMIT 1",
         [file_id],
     ))
 
@@ -1159,6 +1191,10 @@ def list_models():
 # runs in-process and expose status for polling.
 _eval_runs: dict[str, dict] = {}
 _eval_lock = threading.Lock()
+# OCR audit #82: a wedged worker must not block eval forever, and finished
+# result dicts must not accumulate without bound on a long-lived server.
+_EVAL_RUN_TTL_SECONDS = 3600
+_EVAL_KEEP_FINISHED = 50
 
 
 def _run_eval_background(run_id: str) -> None:
@@ -1179,8 +1215,11 @@ def _run_eval_background(run_id: str) -> None:
                 "error": "evaluation module unavailable",
             }
     except Exception as exc:  # noqa: BLE001
+        # OCR audit #83: tracebacks go to the server log, not to
+        # unauthenticated callers (paths/library layout disclosure).
+        logger.error("Eval run %s failed:\n%s", run_id, traceback.format_exc())
         with _eval_lock:
-            _eval_runs[run_id] = {"status": "error", "error": f"{exc}", "trace": traceback.format_exc()[-2000:]}
+            _eval_runs[run_id] = {"status": "error", "error": f"{exc}"}
 
 
 @app.post("/eval/run")
@@ -1189,9 +1228,18 @@ def run_eval():
 
     run_id = str(_uuid.uuid4())
     with _eval_lock:
-        if any(r["status"] == "running" for r in _eval_runs.values()):
+        now = time.monotonic()
+        if any(
+            r["status"] == "running"
+            and now - r.get("started_at", now) < _EVAL_RUN_TTL_SECONDS
+            for r in _eval_runs.values()
+        ):
             raise HTTPException(status_code=409, detail="An eval run is already in progress")
-        _eval_runs[run_id] = {"status": "running"}
+        # Prune oldest finished entries (insertion-ordered dict).
+        finished = [rid for rid, r in _eval_runs.items() if r["status"] != "running"]
+        for rid in finished[:-_EVAL_KEEP_FINISHED] if len(finished) > _EVAL_KEEP_FINISHED else []:
+            del _eval_runs[rid]
+        _eval_runs[run_id] = {"status": "running", "started_at": now}
     threading.Thread(target=_run_eval_background, args=(run_id,), daemon=True).start()
     return {"run_id": run_id, "status": "running"}
 
@@ -1381,6 +1429,88 @@ async def upload_files(
         return await _upload_files_impl(files, workspace)
 
 
+def _ensure_upload_root_folder(corpus_root) -> int:
+    """Worker-thread helper: ensure the root folder row exists (OCR audit #32)."""
+    db = _get_db()  # thread-local: each worker owns its own connection
+    root_folders = list(db.query(
+        "SELECT id FROM folder WHERE rel_path = '.' LIMIT 1"
+    ))
+    if root_folders:
+        return root_folders[0]["id"]
+    db["folder"].insert({
+        # Resolve: the indexer stores resolved roots (symlinked corpus
+        # roots otherwise produce duplicate "." folders with two
+        # different path spellings).
+        "path": str(corpus_root.resolve()),
+        "rel_path": ".",
+        "name": ".",
+        "depth": 0,
+        "excluded": 0,
+    })
+    db.conn.commit()
+    return next(iter(db.query("SELECT id FROM folder WHERE rel_path = '.'")))["id"]
+
+
+def _persist_uploaded_file(
+    dest, corpus_root, folder_id: int, size_bytes: int,
+    mime_type: str | None, workspace_label: str, actor: str,
+) -> int:
+    """Worker-thread helper: insert the file row + audit (OCR audit #32).
+
+    SQLite commits here used to run on the event loop, stalling every
+    concurrent request (incl. SSE token pushes) for up to busy_timeout
+    under write contention.
+    """
+    db = _get_db()
+    # Store resolved paths, matching the indexer — unresolved spellings made
+    # sync_all treat every uploaded file as deleted with symlinked roots.
+    dest = dest.resolve()
+    rel_path = str(dest.relative_to(corpus_root.resolve()))
+
+    # V-10: same mtime format the indexer/sync writes so the fast-skip matches.
+    mtime = datetime.datetime.fromtimestamp(
+        dest.stat().st_mtime, tz=datetime.UTC
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Chain .last_rowid on the same Table object — db["file"] returns a fresh
+    # Table per access, so a separate db["file"].last_rowid read would be None.
+    file_id = db["file"].insert({
+        "folder_id": folder_id,
+        "path": str(dest),
+        "rel_path": rel_path,
+        "name": dest.name,
+        "extension": dest.suffix.lstrip("."),
+        "size_bytes": size_bytes,
+        "mtime": mtime,
+        "sha256": "",
+        "mime_type": mime_type,
+        "hash_status": "pending",
+        "identify_status": "pending",
+        "triage_status": "pending",
+        "is_dup_primary": 1,
+        "excluded": 0,
+        "workspace": workspace_label,
+    }).last_rowid
+    db.conn.commit()
+
+    db.execute(
+        "UPDATE file SET created_at = datetime('now') WHERE id = ?",
+        [file_id],
+    )
+    db.conn.commit()
+
+    # Best-effort audit trail (V1.3 F-Vault-1) — one entry per file.
+    record_audit(
+        db,
+        actor,
+        "file.upload",
+        "file",
+        resource_id=file_id,
+        detail=dest.name,
+    )
+    return file_id
+
+
 async def _upload_files_impl(
     files: list[UploadFile],
     workspace: str | None,
@@ -1388,29 +1518,9 @@ async def _upload_files_impl(
     cfg = _load_config()
     workspace_label = workspace if workspace else "default"
     corpus_root = cfg.corpus_root_path
-    corpus_root.mkdir(parents=True, exist_ok=True)
+    await run_in_threadpool(corpus_root.mkdir, parents=True, exist_ok=True)
 
-    db = _get_db()
-
-    # Ensure a root folder exists
-    root_folders = list(db.query(
-        "SELECT id FROM folder WHERE rel_path = '.' LIMIT 1"
-    ))
-    if root_folders:
-        folder_id = root_folders[0]["id"]
-    else:
-        db["folder"].insert({
-            # Resolve: the indexer stores resolved roots (symlinked corpus
-            # roots otherwise produce duplicate "." folders with two
-            # different path spellings).
-            "path": str(corpus_root.resolve()),
-            "rel_path": ".",
-            "name": ".",
-            "depth": 0,
-            "excluded": 0,
-        })
-        db.conn.commit()
-        folder_id = next(iter(db.query("SELECT id FROM folder WHERE rel_path = '.'")))["id"]
+    folder_id = await run_in_threadpool(_ensure_upload_root_folder, corpus_root)
 
     uploaded = 0
     failed: list[str] = []
@@ -1464,58 +1574,20 @@ async def _upload_files_impl(
                 dest.unlink(missing_ok=True)
                 raise
 
-            # Determine relative path (store resolved paths, matching the
-            # indexer — unresolved spellings made sync_all treat every
-            # uploaded file as deleted when the corpus root had symlinks).
-            dest = dest.resolve()
-            rel_path = str(dest.relative_to(corpus_root.resolve()))
-
-            # Get file modification time (V-10: same format the indexer/sync
-            # writes — '%Y-%m-%dT%H:%M:%SZ' — so the sync fast-skip can match).
-            mtime = datetime.datetime.fromtimestamp(
-                dest.stat().st_mtime, tz=datetime.UTC
-            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            # Insert file record. Chain .last_rowid on the same Table object —
-            # db["file"] returns a fresh Table per access, so a separate
-            # db["file"].last_rowid read would be None.
-            file_id = db["file"].insert({
-                "folder_id": folder_id,
-                "path": str(dest),
-                "rel_path": rel_path,
-                "name": dest.name,
-                "extension": dest.suffix.lstrip("."),
-                "size_bytes": size_bytes,
-                "mtime": mtime,
-                "sha256": "",
-                "mime_type": upload_file.content_type,
-                "hash_status": "pending",
-                "identify_status": "pending",
-                "triage_status": "pending",
-                "is_dup_primary": 1,
-                "excluded": 0,
-                "workspace": workspace_label,
-            }).last_rowid
-            db.conn.commit()
-
-            # Set created_at
-            db.execute(
-                "UPDATE file SET created_at = datetime('now') WHERE id = ?",
-                [file_id],
+            # OCR audit #32: all SQLite/FS persist work runs on a worker
+            # thread (own thread-local connection) — never on the event loop.
+            await run_in_threadpool(
+                _persist_uploaded_file,
+                dest,
+                corpus_root,
+                folder_id,
+                size_bytes,
+                upload_file.content_type,
+                workspace_label,
+                _resolve_actor(),
             )
-            db.conn.commit()
 
             uploaded += 1
-
-            # Best-effort audit trail (V1.3 F-Vault-1) — one entry per file.
-            record_audit(
-                db,
-                _resolve_actor(),
-                "file.upload",
-                "file",
-                resource_id=file_id,
-                detail=dest.name,
-            )
         except Exception as e:
             logger.error("Failed to upload %s: %s", upload_file.filename, e)
             failed.append(upload_file.filename or "unnamed")
@@ -1755,42 +1827,65 @@ def delete_file(file_id: int):
     file_row = file_rows[0]
     rel_path = file_row["rel_path"]
 
-    # Delete from disk — containment check so a tampered rel_path
-    # cannot unlink files outside the corpus root.
-    corpus_root = cfg.corpus_root_path
-    file_path = corpus_root / rel_path
-    if (
-        file_path.exists()
-        and file_path.resolve().is_relative_to(corpus_root.resolve())
-    ):
-        file_path.unlink()
+    # OCR audit #4: collect vector refs BEFORE the DB transaction (the rows
+    # are deleted inside it), commit the DB atomically, and only then touch
+    # Chroma and disk — a failed request must never destroy the original.
+    embedding_refs = list(db.query(
+        """SELECT er.id, er.collection, er.external_id
+           FROM embedding_ref er
+           JOIN chunk c ON er.chunk_id = c.id
+           WHERE c.file_id = ?""",
+        [file_id],
+    ))
+    # Summary vectors live in summaries__ keyed by summary_id — without
+    # this join they are orphaned in Chroma forever (the file rows below
+    # are the only record of their ids).
+    summary_refs = list(db.query(
+        """SELECT ser.collection, ser.external_id
+           FROM summary_embedding_ref ser
+           JOIN summary s ON ser.summary_id = s.id
+           WHERE s.file_id = ?""",
+        [file_id],
+    ))
+    embedding_refs.extend(summary_refs)
 
-    # Delete from Chroma
+    # Delete from SQLite — atomic, with FK-reference cleanup first.
+    # archive_expansion.archive_file_id, folder.source_archive_file_id and
+    # file.extracted_from_archive_id reference file(id) WITHOUT cascade;
+    # leaving them dangling made DELETE FROM file raise IntegrityError.
+    from rag.tokenization import remove_zh_index_for_file
+
+    try:
+        remove_zh_index_for_file(db, file_id)
+        db.execute("DELETE FROM archive_expansion WHERE archive_file_id = ?", [file_id])
+        db.execute(
+            "UPDATE folder SET source_archive_file_id = NULL WHERE source_archive_file_id = ?",
+            [file_id],
+        )
+        db.execute(
+            "UPDATE file SET extracted_from_archive_id = NULL WHERE extracted_from_archive_id = ?",
+            [file_id],
+        )
+        db.execute("DELETE FROM embedding_ref WHERE chunk_id IN (SELECT id FROM chunk WHERE file_id = ?)", [file_id])
+        db.execute("DELETE FROM chunk WHERE file_id = ?", [file_id])
+        db.execute("DELETE FROM extraction WHERE file_id = ?", [file_id])
+        db.execute(
+            "DELETE FROM summary_embedding_ref WHERE summary_id IN "
+            "(SELECT id FROM summary WHERE file_id = ?)",
+            [file_id],
+        )
+        db.execute("DELETE FROM summary WHERE file_id = ?", [file_id])
+        db.execute("DELETE FROM failure WHERE file_id = ?", [file_id])
+        db.execute("DELETE FROM file WHERE id = ?", [file_id])
+        db.conn.commit()
+    except Exception:
+        db.conn.rollback()
+        raise
+
+    # Delete from Chroma (best-effort, after the DB commit)
     try:
         chroma_path = str(cfg.chroma_root_path)
         with chromadb.PersistentClient(path=chroma_path) as chroma_client:
-            # Find embedding_ref entries for this file's chunks
-            embedding_refs = list(db.query(
-                """SELECT er.id, er.collection, er.external_id
-                   FROM embedding_ref er
-                   JOIN chunk c ON er.chunk_id = c.id
-                   WHERE c.file_id = ?""",
-                [file_id],
-            ))
-
-            # Summary vectors live in summaries__ keyed by summary_id — without
-            # this join they are orphaned in Chroma forever (the file rows below
-            # are the only record of their ids).
-            summary_refs = list(db.query(
-                """SELECT ser.collection, ser.external_id
-                   FROM summary_embedding_ref ser
-                   JOIN summary s ON ser.summary_id = s.id
-                   WHERE s.file_id = ?""",
-                [file_id],
-            ))
-            for ref in summary_refs:
-                embedding_refs.append(ref)
-
             # Group by collection and delete
             collections_to_delete: dict[str, list[str]] = {}
             for ref in embedding_refs:
@@ -1808,22 +1903,15 @@ def delete_file(file_id: int):
     except Exception as e:
         logger.warning("Failed to connect to Chroma: %s", e)
 
-    # Delete from SQLite (cascade)
-    from rag.tokenization import remove_zh_index_for_file
-
-    remove_zh_index_for_file(db, file_id)
-    db.execute("DELETE FROM embedding_ref WHERE chunk_id IN (SELECT id FROM chunk WHERE file_id = ?)", [file_id])
-    db.execute("DELETE FROM chunk WHERE file_id = ?", [file_id])
-    db.execute("DELETE FROM extraction WHERE file_id = ?", [file_id])
-    db.execute(
-        "DELETE FROM summary_embedding_ref WHERE summary_id IN "
-        "(SELECT id FROM summary WHERE file_id = ?)",
-        [file_id],
-    )
-    db.execute("DELETE FROM summary WHERE file_id = ?", [file_id])
-    db.execute("DELETE FROM failure WHERE file_id = ?", [file_id])
-    db.execute("DELETE FROM file WHERE id = ?", [file_id])
-    db.conn.commit()
+    # Delete from disk LAST — containment check so a tampered rel_path
+    # cannot unlink files outside the corpus root.
+    corpus_root = cfg.corpus_root_path
+    file_path = corpus_root / rel_path
+    if (
+        file_path.exists()
+        and file_path.resolve().is_relative_to(corpus_root.resolve())
+    ):
+        file_path.unlink()
 
     # Best-effort audit trail (V1.3 F-Vault-1) — never blocks the response.
     record_audit(
@@ -1920,9 +2008,13 @@ def export_audit(
         raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
 
     db = _get_db()
-    rows = query_audit_records(
-        db, start=start, end=end, actor=actor, action=action, limit=limit
-    )
+    try:
+        rows = query_audit_records(
+            db, start=start, end=end, actor=actor, action=action, limit=limit
+        )
+    except ValueError as exc:
+        # OCR audit #84: bad time bounds are a client error, not an empty report.
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     filters = {
         "start": start,
         "end": end,

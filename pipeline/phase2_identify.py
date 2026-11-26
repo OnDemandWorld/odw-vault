@@ -19,6 +19,9 @@ from pipeline.logging import PhaseLogger
 
 # Extension fallback for files where Siegfried returns UNKNOWN or no match
 # Maps extension -> (pronom_id, category, extract_strategy)
+# OCR audit #55: max file paths per Siegfried invocation (OS argv limit).
+_SF_PATH_BATCH = 500
+
 EXT_FALLBACK = {
     ".pak": ("UNKNOWN-pak", "data", "filename-only"),
     ".qm": ("UNKNOWN-qm", "data", "filename-only"),
@@ -52,7 +55,6 @@ def run_phase2(
     """Run Siegfried format identification over the corpus."""
     sf_path = config.identify.siegfried_path
     n_workers = config.identify.siegfried_workers
-    root = config.corpus_root_path
 
     # Resolve siegfried path: check PATH first, then project root
     sf_path = config.identify.siegfried_path
@@ -84,32 +86,38 @@ def run_phase2(
 
     plog.info(f"Running Siegfried on {len(files_to_id)} files...")
 
+    # OCR audit #55: scan only the pending files, not the whole corpus root
+    # (which includes the multi-GB .rag-cache model directory). Batch the
+    # path list to stay under the OS argument-size limit.
+    sf_files: list[dict] = []
     try:
-        result = subprocess.run(
-            [sf_path, "-json", "-multi", str(n_workers), str(Path(root).resolve())],
-            capture_output=True,
-            text=True,
-            timeout=3600,
-        )
-        if result.returncode != 0 and not result.stdout:
-            plog.error(f"Siegfried returned non-zero: {result.stderr}")
-            raise RuntimeError(f"Siegfried failed: {result.stderr}")
+        for i in range(0, len(files_to_id), _SF_PATH_BATCH):
+            batch = files_to_id[i : i + _SF_PATH_BATCH]
+            result = subprocess.run(
+                [sf_path, "-json", "-multi", str(n_workers), *batch],
+                capture_output=True,
+                text=True,
+                timeout=3600,
+            )
+            if result.returncode != 0 and not result.stdout:
+                plog.error(f"Siegfried returned non-zero: {result.stderr}")
+                raise RuntimeError(f"Siegfried failed: {result.stderr}")
+            try:
+                sf_data = json.loads(result.stdout)
+            except json.JSONDecodeError as e:
+                plog.error(f"Failed to parse Siegfried JSON: {e}")
+                raise RuntimeError(f"Siegfried JSON parse error: {e}") from None
+            sf_files.extend(sf_data.get("files", []))
     except subprocess.TimeoutExpired:
         plog.error("Siegfried timed out after 1 hour")
         raise RuntimeError("Siegfried timeout") from None
-
-    try:
-        sf_data = json.loads(result.stdout)
-    except json.JSONDecodeError as e:
-        plog.error(f"Failed to parse Siegfried JSON: {e}")
-        raise RuntimeError(f"Siegfried JSON parse error: {e}") from None
 
     # Build path -> identification map. DB paths are resolved (phase 1
     # stores fp.resolve()); index sf's echoed paths both raw and canonical
     # so relative roots or symlinked ancestors can't silently mismatch
     # (a mismatch marks every file 'unknown' without any error).
     sf_results = {}
-    for file_entry in sf_data.get("files", []):
+    for file_entry in sf_files:
         filepath = file_entry.get("filename", "")
         sf_results[filepath] = file_entry
         try:
@@ -125,9 +133,12 @@ def run_phase2(
     # would silently fall through to 'unknown' — make it loud instead.
     _unmatched = sum(1 for fp in files_to_id if fp not in sf_results)
     if files_to_id and _unmatched > 0.9 * len(files_to_id):
-        plog.error(
+        # OCR audit #97: fail loudly and leave identify_status='pending' —
+        # the old log-only guard stamped every file unknown/done, so re-runs
+        # skipped them forever and the corpus stayed silently misclassified.
+        raise RuntimeError(
             f"Siegfried output matched only {len(files_to_id) - _unmatched}/"
-            f"{len(files_to_id)} files — most files will be marked 'unknown'. "
+            f"{len(files_to_id)} files — aborting before marking files 'unknown'. "
             "Check corpus_root vs sf output paths."
         )
 
@@ -237,4 +248,5 @@ def run_phase2(
         identified=identified,
         unknown=unknown,
     )
-    return {"files_processed": identified, "files_failed": 0}
+    # OCR audit #97: report unidentifiable files instead of a constant 0.
+    return {"files_processed": identified, "files_failed": unknown}

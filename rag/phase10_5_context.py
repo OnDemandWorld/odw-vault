@@ -127,6 +127,8 @@ def _call_ollama_native(
             options={
                 "temperature": temperature,
                 "num_ctx": 16384,
+                # OCR audit #77: honor max_tokens (was accepted but never sent).
+                "num_predict": max_tokens,
             },
         )
     text = response.get("message", {}).get("content", "").strip()
@@ -195,10 +197,14 @@ def run_context(
                             WHERE e2.file_id = f.id AND e2.succeeded = 1)
             LEFT JOIN summary s ON s.file_id = f.id
                 AND s.id = (SELECT MAX(s2.id) FROM summary s2 WHERE s2.file_id = f.id)
-            WHERE c.context_text IS NULL
+            WHERE (c.context_text IS NULL OR c.context_prompt_hash IS NOT NULL)
               AND f.is_dup_primary = 1 AND f.excluded = 0
             ORDER BY c.id
         """
+        # OCR audit #25: selecting only context_text IS NULL made the
+        # per-row prompt-hash check below dead code — prompt/model changes
+        # never invalidated stored contexts. Now every eligible chunk is
+        # considered; the hash check skips rows whose context is current.
 
     rows = list(db.query(query))
 
@@ -358,25 +364,20 @@ def validate_and_clean(db, min_context_chars: int = 50) -> dict:
             thinking_malformed += 1
             text = new_text
 
-        # If after stripping nothing meaningful remains, clear for reprocessing
+        # OCR audit #26: mark unusable contexts with an empty-string sentinel
+        # (keeping the prompt hash) instead of NULL. NULL made run_context
+        # regenerate them on every invocation forever — genuinely
+        # unaugmentable chunks (copyright footers, single table cells) never
+        # converge. The sentinel is excluded from augmentation downstream
+        # (context_text != '' filters) and skipped by the prompt-hash cache;
+        # a prompt/model change still invalidates it via the hash mismatch.
         if not text:
-            db["chunk"].update(cid, {
-                "context_text": None,
-                "context_model": None,
-                "context_prompt_hash": None,
-                "context_generated_at": None,
-            })
+            db["chunk"].update(cid, {"context_text": ""})
             fixed += 1
             continue
 
-        # Clear very-short contexts for reprocessing
         if len(text) < min_context_chars:
-            db["chunk"].update(cid, {
-                "context_text": None,
-                "context_model": None,
-                "context_prompt_hash": None,
-                "context_generated_at": None,
-            })
+            db["chunk"].update(cid, {"context_text": ""})
             too_short += 1
             fixed += 1
             continue

@@ -138,12 +138,14 @@ def run_phase5(
     ollama_model = model or config.ollama.model
     host = config.ollama.host
 
-    # Get folders bottom-up (depth descending), excluding extracted archives and excluded.
-    # Skip folders that already have a matching prompt hash unless reinfer=True.
+    # Get folders bottom-up (depth descending), excluding excluded folders.
+    # OCR audit #47: select ALL eligible folders — the per-folder prompt-hash
+    # check below is the cache. The old WHERE clause filtered out every
+    # already-inferred folder, making --reinfer a no-op and never refreshing
+    # labels after content changes.
     folders = list(
         db.query("""
         SELECT * FROM folder WHERE excluded=0
-            AND (inferred_category IS NULL OR inference_prompt_hash IS NULL)
         ORDER BY depth DESC, id ASC
     """)
     )
@@ -167,6 +169,17 @@ def run_phase5(
         task = progress.add_task(f"Inferring {len(folders)} folders...", total=len(folders))
 
         for folder in folders:
+            # OCR audit #58: honor folder_meta.min_files_to_infer (was dead).
+            _min_files = config.folder_meta.min_files_to_infer
+            if _min_files > 0:
+                _fc = next(iter(db.query(
+                    "SELECT COUNT(*) AS c FROM file WHERE folder_id = ? AND excluded = 0",
+                    [folder["id"]],
+                )))["c"]
+                if _fc < _min_files:
+                    progress.update(task, advance=1)
+                    continue
+
             prompt, prompt_hash = _build_prompt(folder, db, config)
 
             # Check cache

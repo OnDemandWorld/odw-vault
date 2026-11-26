@@ -10,6 +10,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -18,6 +19,8 @@ from pipeline.config import AppConfig
 from pipeline.db import finish_model_run, heartbeat_model_run, start_model_run
 from pipeline.helpers import record_failure
 from pipeline.logging import PhaseLogger
+
+logger = logging.getLogger(__name__)
 
 
 def _build_config_hash(cfg: AppConfig) -> str:
@@ -48,36 +51,45 @@ def _transcribe_file(
     try:
         from pywhispercpp.model import Model
 
-        model = Model(model=model_name, fname_audio=filepath)
-        model.print_system_info()
+        # OCR audit #7: use the real pywhispercpp API (Model + transcribe).
+        # Resolve the model locally and fail loudly when absent — the old
+        # code path could silently download models, violating the offline
+        # guarantee.
+        models_dir = cache_root / "models"
+        if Path(model_name).is_file():
+            model_path = str(Path(model_name).resolve())
+        else:
+            candidates = [models_dir / model_name, models_dir / f"{model_name}.bin"]
+            local = next((p for p in candidates if p.is_file()), None)
+            if local is None:
+                return False, None, {
+                    "error": (
+                        f"whisper model '{model_name}' not found in {models_dir}. "
+                        f"Place ggml-{model_name}.bin there (offline mode — no downloads)."
+                    )
+                }
+            model_path = str(local.resolve())
 
-        # Run transcription with parameters
-        params = model.new_full_params(
-            language=None if language == "auto" else language,
-            n_threads=threads,
-            no_timestamps=False,
-            word_timestamps=word_timestamps,
-        )
+        params = {
+            "n_threads": threads,
+            "token_timestamps": word_timestamps,
+            "print_progress": False,
+        }
+        if language and language != "auto":
+            params["language"] = language
+        model = Model(model=model_path, models_dir=str(models_dir), **params)
+        raw_segments = model.transcribe(filepath)
 
-        model.process(
-            fname_audio=filepath,
-            params=params,
-            new_segment_callback=lambda seg: None,  # placeholder
-        )
-
-        # Extract results
+        # Extract results. Segment.t0/t1 are centiseconds in whisper.cpp.
         segments = []
-        for seg in model.segments:
-            seg_data = {
-                "text": seg.text,
-                "start": seg.start,
-                "end": seg.end,
-            }
-            if word_timestamps and hasattr(seg, "words"):
-                seg_data["words"] = [
-                    {"text": w.text, "start": w.start, "end": w.end} for w in seg.words
-                ]
-            segments.append(seg_data)
+        for seg in raw_segments:
+            segments.append(
+                {
+                    "text": seg.text,
+                    "start": seg.t0 / 100.0,
+                    "end": seg.t1 / 100.0,
+                }
+            )
 
         transcript = {
             "sha256": sha256,
@@ -137,15 +149,29 @@ def run_transcribe(
     cache_root = cfg.cache_root_path
     model_name = model or tcfg.model
 
+    if workers and workers > 1:
+        logger.warning(
+            "Transcription --workers=%d requested but parallel transcription is "
+            "not implemented; running sequentially",
+            workers,
+        )
+
     # Select audio/video files
     where_parts = [
         "is_dup_primary=1",
         "excluded=0",
         "category IN ('audio', 'video')",
+        # OCR audit #27: resumability — skip files already transcribed
+        # successfully (re-run after an interruption must not redo them).
+        "id NOT IN (SELECT file_id FROM extraction WHERE tool='whisper.cpp' AND succeeded=1)",
     ]
 
+    # OCR audit #76: bind the folder filter (an apostrophe in a folder name
+    # used to crash the query with an unterminated literal).
+    params: list = []
     if folder:
-        where_parts.append(f"rel_path LIKE '{folder}/%'")
+        where_parts.append("rel_path LIKE ?")
+        params.append(f"{folder}/%")
 
     where_clause = " AND ".join(where_parts)
 
@@ -153,7 +179,7 @@ def run_transcribe(
     if limit:
         query += f" LIMIT {limit}"
 
-    files = list(db.query(query))
+    files = list(db.query(query, params))
 
     if not files:
         msg = "No audio/video files eligible for transcription."

@@ -132,8 +132,11 @@ def _retrieve_with_client(
         _qr = _qc.embed(model=cfg.models.embedding.name, input=[query])
         _query_emb = _qr["embeddings"][0]
     except Exception as _e:
+        # OCR audit #68: an embedding-endpoint outage must surface as a
+        # service error (API maps RuntimeError to 503), not as an empty
+        # result indistinguishable from "no matches" / a content refusal.
         logger.error("Failed to embed query for retrieval: %s", _e)
-        return [], metrics
+        raise RuntimeError(f"Query embedding failed: {_e}") from _e
     finally:
         if _qc is not None:
             _qc.close()
@@ -149,9 +152,12 @@ def _retrieve_with_client(
         candidate_file_ids = set(allowed_file_ids)
 
     # Exclude derived/meta files from search (preflight_report.md
-    # contains folder listings that poison keyword matching)
+    # contains folder listings that poison keyword matching).
+    # OCR audit #1: also honor phase-7 exclusions — file.excluded=1 and
+    # folder.excluded=1 (folder exclusion may predate the file cascade).
     _excluded_file_ids = db.query(
-        "SELECT id FROM file WHERE rel_path = 'preflight_report.md'"
+        "SELECT f.id FROM file f LEFT JOIN folder fo ON f.folder_id = fo.id "
+        "WHERE f.rel_path = 'preflight_report.md' OR f.excluded = 1 OR fo.excluded = 1"
     )
     excluded_ids = {r["id"] for r in _excluded_file_ids}
 
@@ -183,6 +189,11 @@ def _retrieve_with_client(
         dense_candidates,
         candidate_file_ids,
     )
+    # OCR audit #1: when no narrowing/filter binds (candidate_file_ids is
+    # None) the dense query searches the whole collection — excluded files'
+    # vectors must be dropped here. Chroma metadata carries no excluded flag.
+    if excluded_ids:
+        dense_hits = [h for h in dense_hits if h.file_id not in excluded_ids]
     metrics["dense_hits"] = len(dense_hits)
 
     # 6. BM25 chunk retrieval
@@ -194,9 +205,11 @@ def _retrieve_with_client(
     # 6b. Path-matching BM25: find chunks from files whose path contains query tokens
     # This catches cases like "kwh" which appear in file paths but not chunk text
     path_hits = _path_match_retrieve(db, query, candidate_file_ids, excluded_ids, n_results=30)
-    # Merge path_hits into bm25_hits — path_hits go FIRST so they get high RRF rank
+    # OCR audit #11: path hits are a recall supplement, not relevance-ranked
+    # results — append AFTER genuine BM25 hits so cover/TOC chunks cannot
+    # occupy the top RRF ranks and push the actual answer out of top_k.
     bm25_chunk_ids = {h.chunk_id for h in bm25_hits}
-    bm25_hits = [ph for ph in path_hits if ph.chunk_id not in bm25_chunk_ids] + bm25_hits
+    bm25_hits = bm25_hits + [ph for ph in path_hits if ph.chunk_id not in bm25_chunk_ids]
 
     metrics["bm25_hits"] = len(bm25_hits)
 
@@ -484,10 +497,15 @@ def _find_files_by_path(db, query: str, excluded_ids: set[int]) -> set[int]:
     if not tokens:
         return set()
 
-    conditions = " OR ".join("f.rel_path LIKE ?" for _ in tokens)
+    # OCR audit #69: escape LIKE wildcards — a '%'/'_' token (e.g. "100%")
+    # otherwise matches every file and balloons the candidate set.
+    conditions = " OR ".join("f.rel_path LIKE ? ESCAPE '\\'" for _ in tokens)
     exc = ",".join("?" for _ in excluded_ids) if excluded_ids else ""
     exc_clause = f" AND f.id NOT IN ({exc})" if exc else ""
-    params = [f"%{t}%" for t in tokens]
+    params = [
+        "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        for t in tokens
+    ]
     if excluded_ids:
         params.extend(excluded_ids)
 
@@ -849,7 +867,10 @@ def _assemble_context(hits: list[Hit], db, augment: bool = False) -> None:
             contexts = {r["id"]: r["context_text"] for r in rows}
             for h in hits:
                 ctx = contexts.get(h.chunk_id)
-                if ctx:
+                # OCR audit #13: dense hits already carry the context — the
+                # Chroma document is stored as context + chunk text. Prepending
+                # again would duplicate it in the generation prompt.
+                if ctx and not h.text.startswith(ctx):
                     h.text = f"{ctx}\n\n{h.text}"
         except Exception:
             pass  # best-effort augmentation

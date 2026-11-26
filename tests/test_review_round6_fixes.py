@@ -92,11 +92,28 @@ def test_normalize_date_bound_is_inclusive():
 
 def test_eval_run_is_async(patched_db):
     """V-13: /eval/run returns immediately with a run id instead of blocking."""
+    import time
+
     client = TestClient(app)
-    response = client.post("/eval/run")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "running"
-    assert body["run_id"]
-    status = client.get(f"/eval/run/{body['run_id']}")
-    assert status.status_code == 200
+    # OCR audit #9: mock config + eval runner and join the background thread
+    # before teardown — otherwise the daemon thread can open the real
+    # repo corpus.db / config.toml after the _get_db patch is gone.
+    with (
+        patch.object(api_main, "_load_config"),
+        patch("eval.runner.run_eval", return_value={"questions": 0}),
+    ):
+        response = client.post("/eval/run")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "running"
+        assert body["run_id"]
+        status = client.get(f"/eval/run/{body['run_id']}")
+        assert status.status_code == 200
+
+        deadline = time.monotonic() + 5
+        while api_main._eval_runs.get(body["run_id"], {}).get("status") == "running":
+            if time.monotonic() > deadline:
+                raise AssertionError("eval background thread did not finish in 5s")
+            time.sleep(0.01)
+    # Never leak run state into later tests (409 guard reads this global).
+    api_main._eval_runs.clear()

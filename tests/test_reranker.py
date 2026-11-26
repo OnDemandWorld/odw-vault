@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from rag.reranker import _extract_score, _sigmoid, rerank
 from rag.retrieval import Hit
-from rag.reranker import rerank, _extract_score, _sigmoid
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -181,99 +180,71 @@ class TestRerankerTopKCutoff:
 
 
 class TestRerankerConfigToggle:
-    """When reranker is disabled, the retrieval pipeline should skip rerank()."""
+    """OCR audit #60: exercise the REAL retrieve() gate.
 
-    def test_retrieval_skips_reranker_when_disabled(self):
-        """retrieve() should not call rerank when config says disabled."""
-        from rag.retrieval import reciprocal_rank_fuse
+    The old tests re-implemented the gating expression locally (with the
+    wrong config shape, cfg.reranker vs cfg.models.reranker) and asserted on
+    their own variable — retrieve() was never called.
+    """
 
-        # We test at the retrieval module level — verify the flag logic
-        # by checking that the reranker code path is gated by the config.
-        # This is a unit test of the toggle logic, not a full integration test.
+    def _rerank_called(self, tmp_path, enabled, use_reranker):
+        from unittest.mock import MagicMock, patch
 
-        # Simulate the config check logic from retrieval.py
-        class MockRerankerConfig:
-            enabled = False
-            name = "reranker-model"
-            top_n_out = 8
-            batch_size = 8
+        from rag.retrieval import _retrieve_with_client
+        from tests.conftest import seed_test_files
+        from tests.test_ocr_round1_fixes import _insert_folder, _make_cfg, _seed_db
 
-        class MockConfig:
-            reranker = MockRerankerConfig()
+        db = _seed_db(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        cfg.models.reranker.enabled = enabled
+        cfg.models.reranker.name = "reranker-model"
+        fid = _insert_folder(db, "/c", ".", "root", 0)
+        f = seed_test_files(db, files=[{"name": "a.txt", "folder_id": fid}])[0]
+        ct = db["chunk"]
+        ct.insert({"file_id": f, "text": "energy content", "chunk_index": 0,
+                   "token_count": 2, "metadata_json": "{}"})
+        db.conn.commit()
+        cid = ct.last_rowid
 
-        cfg = MockConfig()
-        use_reranker = None  # not overridden
+        mock_coll = MagicMock()
+        mock_coll.metadata = {"embedding_model": "test-embed"}
+        mock_coll.query.return_value = {
+            "ids": [[f"c_{cid}"]],
+            "metadatas": [[{"chunk_id": cid, "file_id": f, "folder_id": fid, "rel_path": "a.txt"}]],
+            "documents": [["energy content"]],
+            "distances": [[0.1]],
+        }
+        client = MagicMock()
 
-        reranker_enabled = (
-            use_reranker if use_reranker is not None
-            else getattr(cfg.reranker, "enabled", False)
-        )
+        def get_collection(name):
+            if name.startswith("chunks__"):
+                return mock_coll
+            raise Exception("absent")
 
-        assert reranker_enabled is False
+        client.get_collection.side_effect = get_collection
+        with (
+            patch("ollama.Client") as mo,
+            patch("rag.retrieval._detect_language", return_value="en"),
+            patch("rag.reranker.rerank", side_effect=lambda **kw: kw["hits"]) as mock_rerank,
+        ):
+            mo.return_value.embed.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
+            _retrieve_with_client(
+                "energy", db, client, str(tmp_path / "chroma"), cfg,
+                use_reranker=use_reranker,
+            )
+        return mock_rerank.called
 
-    def test_retrieval_enables_reranker_when_config_true(self):
-        """retrieve() should call rerank when config says enabled."""
+    def test_retrieval_skips_reranker_when_disabled(self, tmp_path):
+        assert self._rerank_called(tmp_path, enabled=False, use_reranker=None) is False
 
-        class MockRerankerConfig:
-            enabled = True
-            name = "reranker-model"
-            top_n_out = 8
-            batch_size = 8
+    def test_retrieval_enables_reranker_when_config_true(self, tmp_path):
+        assert self._rerank_called(tmp_path, enabled=True, use_reranker=None) is True
 
-        class MockConfig:
-            reranker = MockRerankerConfig()
+    def test_api_override_can_force_enable(self, tmp_path):
+        assert self._rerank_called(tmp_path, enabled=False, use_reranker=True) is True
 
-        cfg = MockConfig()
-        use_reranker = None
-
-        reranker_enabled = (
-            use_reranker if use_reranker is not None
-            else getattr(cfg.reranker, "enabled", False)
-        )
-
-        assert reranker_enabled is True
-
-    def test_api_override_can_force_enable(self):
-        """API parameter use_reranker=True should override config disabled."""
-
-        class MockRerankerConfig:
-            enabled = False
-            name = "reranker-model"
-            top_n_out = 8
-
-        class MockConfig:
-            reranker = MockRerankerConfig()
-
-        cfg = MockConfig()
-        use_reranker = True  # API override
-
-        reranker_enabled = (
-            use_reranker if use_reranker is not None
-            else getattr(cfg.reranker, "enabled", False)
-        )
-
-        assert reranker_enabled is True
-
-    def test_api_override_can_force_disable(self):
-        """API parameter use_reranker=False should override config enabled."""
-
-        class MockRerankerConfig:
-            enabled = True
-            name = "reranker-model"
-            top_n_out = 8
-
-        class MockConfig:
-            reranker = MockRerankerConfig()
-
-        cfg = MockConfig()
-        use_reranker = False  # API override
-
-        reranker_enabled = (
-            use_reranker if use_reranker is not None
-            else getattr(cfg.reranker, "enabled", False)
-        )
-
-        assert reranker_enabled is False
+    def test_api_override_can_force_disable(self, tmp_path):
+        assert self._rerank_called(tmp_path, enabled=True, use_reranker=False) is False
 
 
 # ---------------------------------------------------------------------------

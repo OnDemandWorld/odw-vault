@@ -90,7 +90,12 @@ def _ensure_file_in_db(db, file_path: Path, config: Config) -> int | None:
     if existing:
         return existing["id"]
 
-    stat = file_path.stat()
+    # OCR audit #50: the file may have vanished mid-run — don't let stat()
+    # raise inside the caller's except handler and mask the original error.
+    try:
+        stat = file_path.stat()
+    except OSError:
+        return None
     db["file"].insert(
         {
             "folder_id": folder_id,
@@ -117,6 +122,10 @@ def run_phase0(
     root = config.corpus_root_path
     expanded_total = 0
     failed_total = 0
+    # OCR audit #50: archives that failed THIS run are skipped on subsequent
+    # depth passes — otherwise one bad archive multiplies failure rows by
+    # depth_limit on every invocation.
+    failed_this_run: set[str] = set()
 
     with Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True
@@ -131,7 +140,10 @@ def run_phase0(
                 "SELECT f.path FROM archive_expansion ae JOIN file f ON f.id = ae.archive_file_id WHERE ae.succeeded = 1"
             ):
                 already.add(r["path"])
-            archives = [a for a in archives if str(a.resolve()) not in already]
+            archives = [
+                a for a in archives
+                if str(a.resolve()) not in already and str(a.resolve()) not in failed_this_run
+            ]
 
             if not archives:
                 plog.info(
@@ -197,13 +209,22 @@ def run_phase0(
                     )
                     expanded_total += 1
                 except Exception as e:
+                    failed_this_run.add(str(arc.resolve()))
                     arc_id = _ensure_file_in_db(db, arc, config)
                     if arc_id is None:
                         # archive_file_id is NOT NULL + FK to file(id);
                         # "or 0" would violate it and mask the original
-                        # extraction error. Report without the expansion row.
-                        plog.info(f"Extraction failed and file row missing for {arc}: {e}")
-                        failed_total = locals().get("failed_total", 0)
+                        # extraction error. Record an unlinked failure row
+                        # (OCR audit #50: silent failures are defects).
+                        record_failure(
+                            db,
+                            file_id=None,
+                            phase="archives",
+                            tool="patool",
+                            error_class=type(e).__name__,
+                            error_message=f"{arc}: {e}",
+                        )
+                        failed_total += 1
                         continue
                     record_expansion(
                         db,

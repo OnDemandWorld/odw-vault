@@ -121,7 +121,8 @@ def main():
     print(f"{'Model':<30} {'TTFT':>8} {'Text':>8} {'Total':>8} {'Ch/s':>8} {'Empty':>6} {'OK':>4} {'Fails':>5}")
     print(f"{'-'*75}")
 
-    for model_name, label, _ in models:
+    # OCR audit #92: models entries are 4-tuples (client, name, label, opts).
+    for _client, model_name, label, _opts in models:
         results = all_results[model_name]
         valid = [r for r in results if not r.get("error")]
         fails = sum(1 for r in results if r.get("error"))

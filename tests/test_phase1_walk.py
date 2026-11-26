@@ -73,8 +73,9 @@ class TestPhase1Walk:
         cfg = self._make_config(root)
         r1 = run_phase1(test_db, cfg, mock_plog, workers=1)
         r2 = run_phase1(test_db, cfg, mock_plog, workers=1)
-        # Second run should skip already-hashed files
-        assert r2["files_processed"] >= 0
+        # OCR audit #66: second run must skip already-hashed files exactly
+        # (>= 0 was always true — re-hashing everything passed).
+        assert r2["files_processed"] == 0
 
     def test_rehash(self, test_db, test_corpus, mock_plog):
         root, _ = test_corpus
@@ -100,16 +101,42 @@ class TestPhase1Walk:
         assert "subdir" in deep["rel_path"]
 
     def test_hash_failure(self, test_db, tmp_path, mock_plog):
+        from unittest.mock import patch
+
         root = tmp_path / "corpus"
         root.mkdir()
         f = root / "test.txt"
         f.write_text("hello", encoding="utf-8")
         cfg = self._make_config(root)
-        # Make file unreadable so hash fails in subprocess
-        f.chmod(0o000)
-        try:
+        # OCR audit #66: force a hash failure deterministically (chmod 0o000
+        # is ineffective as root) and assert it reaches the failure table.
+        # The pool is replaced with an inline executor so the sha256 patch
+        # applies (worker processes would not inherit it).
+        from concurrent.futures import Future
+
+        class _InlineExecutor:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def submit(self, fn, *a, **k):
+                fut = Future()
+                try:
+                    fut.set_result(fn(*a, **k))
+                except Exception as e:
+                    fut.set_exception(e)
+                return fut
+
+        with (
+            patch("pipeline.phase1_walk.ProcessPoolExecutor", _InlineExecutor),
+            patch("pipeline.phase1_walk.sha256_file", side_effect=lambda p: (str(p), None, "denied")),
+        ):
             result = run_phase1(test_db, cfg, mock_plog, workers=1)
-            # May or may not fail depending on permissions
-            assert result["files_processed"] >= 0
-        finally:
-            f.chmod(0o644)  # Restore so tmp_path can clean up
+        assert result["files_failed"] >= 1
+        fails = list(test_db["failure"].rows_where("phase = ?", ["walk"]))
+        assert len(fails) >= 1

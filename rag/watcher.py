@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import logging
 import threading
@@ -60,8 +61,12 @@ class _SyncHandler(FileSystemEventHandler):
     def on_moved(self, event: FileSystemEvent) -> None:
         # Treat move as delete(src) + sync(dest)
         if not event.is_directory:
-            self._watcher._enqueue(event.src_path, "delete")
-            self._watcher._enqueue(event.dest_path, "sync")
+            # OCR audit #73: honor skip rules on both ends — a move into
+            # .rag-cache / hidden / ignored locations must not be indexed.
+            if not self._watcher._should_skip(str(event.src_path)):
+                self._watcher._enqueue(event.src_path, "delete")
+            if not self._watcher._should_skip(str(event.dest_path)):
+                self._watcher._enqueue(event.dest_path, "sync")
 
     def _handle(self, event: FileSystemEvent, action: str) -> None:
         if event.is_directory:
@@ -97,11 +102,18 @@ class CorpusWatcher:
         chroma_client=None,
         db_factory=None,
         startup_sync: bool = False,
+        chroma_factory=None,
     ) -> None:
         self._cfg = cfg
         self._db = db
         self._db_factory = db_factory
         self._chroma_client = chroma_client
+        # OCR audit #16: when a factory is supplied, a Chroma client is
+        # opened per flush and closed afterwards, so the shared System is
+        # released between syncs and external CLI writes become visible.
+        # A process-lifetime client pins the System and defeats the
+        # per-query reload in rag/retrieval.py.
+        self._chroma_factory = chroma_factory
         self._indexer = IncrementalIndexer(db, cfg, chroma_client)
         # Worker-thread-affine resources (set in _flush_loop when a factory
         # is provided; sqlite3 objects raised in another thread are unusable).
@@ -142,15 +154,26 @@ class CorpusWatcher:
     def stop(self) -> None:
         """Stop watching and drain pending events."""
         self._stop_event.set()
+        worker_alive = False
         if self._worker is not None:
             self._worker.join(timeout=10)
+            worker_alive = self._worker.is_alive()
             self._worker = None
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=5)
             self._observer = None
         if self._chroma_client is not None:
-            self._chroma_client.close()
+            # OCR audit #18: never close the client out from under a worker
+            # that is still mid-flush (join timed out) — its next coll.add
+            # would raise and leave the file partially embedded.
+            if worker_alive:
+                logger.warning(
+                    "Watcher worker still running after stop timeout; "
+                    "leaving Chroma client open to avoid mid-flush close"
+                )
+            else:
+                self._chroma_client.close()
             self._chroma_client = None
         logger.info("CorpusWatcher stopped")
 
@@ -218,6 +241,11 @@ class CorpusWatcher:
 
     def _enqueue(self, path: str, action: str) -> None:
         """Add or update a path in the pending queue."""
+        # OCR audit #17: canonicalize to the resolved absolute spelling that
+        # IncrementalIndexer.sync_file stores — relative or symlinked corpus
+        # roots otherwise make delete lookups miss their DB rows.
+        with contextlib.suppress(OSError):
+            path = str(Path(path).resolve())
         with self._lock:
             self._pending[path] = (action, time.monotonic())
             self._stats["last_event_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -237,11 +265,18 @@ class CorpusWatcher:
         if self._startup_sync:
             # Runs here (worker thread), not on the API event loop: a full
             # sync hashes + embeds every file and can block for minutes.
+            opened = self._chroma_factory() if self._chroma_factory is not None else None
+            if opened is not None:
+                self._active_indexer().chroma_client = opened
             try:
                 self._active_indexer().sync_all()
                 logger.info("Watcher startup sync completed")
             except Exception as exc:
                 logger.error("Watcher startup sync failed: %s", exc)
+            finally:
+                if opened is not None:
+                    self._active_indexer().chroma_client = None
+                    opened.close()
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=1.0)
             self._flush_ready()
@@ -270,17 +305,28 @@ class CorpusWatcher:
                     del self._pending[path]
 
         indexer = self._active_indexer()
-        for path, action in ready:
-            try:
-                if action == "delete":
-                    self._handle_delete(path)
-                else:
-                    indexer.sync_file(Path(path))
-                self._stats["processed"] += 1
-                logger.info("Watcher synced: %s (%s)", path, action)
-            except Exception as exc:
-                self._stats["failed"] += 1
-                logger.error("Watcher sync failed for %s: %s", path, exc)
+        # OCR audit #16: per-flush client (factory mode) — released after the
+        # batch so the cached Chroma System does not outlive the sync.
+        opened = None
+        if self._chroma_factory is not None and ready:
+            opened = self._chroma_factory()
+            indexer.chroma_client = opened
+        try:
+            for path, action in ready:
+                try:
+                    if action == "delete":
+                        self._handle_delete(path)
+                    else:
+                        indexer.sync_file(Path(path))
+                    self._stats["processed"] += 1
+                    logger.info("Watcher synced: %s (%s)", path, action)
+                except Exception as exc:
+                    self._stats["failed"] += 1
+                    logger.error("Watcher sync failed for %s: %s", path, exc)
+        finally:
+            if opened is not None:
+                indexer.chroma_client = None
+                opened.close()
 
     def _handle_delete(self, path: str) -> None:
         """Look up file_id by path and remove from index."""

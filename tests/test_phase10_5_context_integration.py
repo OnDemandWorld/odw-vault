@@ -102,7 +102,12 @@ class TestRunContextMocked:
         })
         db.conn.commit()
 
-        with patch("rag.phase10_5_context._call_ollama", return_value="New context.") as mock_call:
+        # OCR audit #25: the skip now happens via the live prompt-hash check
+        # (the chunk IS selected; a matching hash means its context is current).
+        with (
+            patch("rag.phase10_5_context._build_prompt", return_value=("p", "abc123")),
+            patch("rag.phase10_5_context._call_ollama", return_value="New context.") as mock_call,
+        ):
             processed, failed = run_context(db, cfg)
 
         assert processed == 0

@@ -2,6 +2,24 @@
 
 from __future__ import annotations
 
+import threading
+
+# OCR audit #29: one converter per thread — DocumentConverter loads the full
+# layout/tableformer/OCR pipeline, and rebuilding it per file turned a
+# minutes-long extraction into hours. Converters are not thread-safe to
+# share, so thread-local is the right granularity (phase 8 uses a pool).
+_thread_local = threading.local()
+
+
+def _get_converter():
+    from docling.document_converter import DocumentConverter
+
+    converter = getattr(_thread_local, "converter", None)
+    if converter is None:
+        converter = DocumentConverter()
+        _thread_local.converter = converter
+    return converter
+
 
 def extract_docling(filepath: str) -> tuple[str | None, dict, bool, str | None]:
     """Convert a document file to markdown text via Docling.
@@ -9,9 +27,7 @@ def extract_docling(filepath: str) -> tuple[str | None, dict, bool, str | None]:
     Returns (text, metadata, succeeded, error_message).
     """
     try:
-        from docling.document_converter import DocumentConverter
-
-        converter = DocumentConverter()
+        converter = _get_converter()
         result = converter.convert(filepath)
 
         md_text = result.document.export_to_markdown()

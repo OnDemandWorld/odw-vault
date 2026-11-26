@@ -170,6 +170,23 @@ _PROVIDER_PRESETS = [
 ]
 
 
+def _settings_loopback_guard(request: Request):
+    """OCR audit #40: provider/settings mutations can redirect generation —
+    and thus every retrieved corpus excerpt — to an arbitrary endpoint.
+    Restrict them to loopback clients; non-loopback deployments must front
+    the UI with an authenticating proxy. Returns an error response or None.
+    """
+    from fastapi.responses import JSONResponse
+
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        return JSONResponse(
+            {"ok": False, "error": "settings changes are restricted to local clients"},
+            status_code=403,
+        )
+    return None
+
+
 def _load_provider_registry() -> dict:
     """Load (or seed) the provider registry from llm_providers.json."""
     if _PROVIDERS_FILE.exists():
@@ -179,6 +196,10 @@ def _load_provider_registry() -> dict:
                 return data
         except Exception:
             logger.warning("Failed to parse llm_providers.json; reseeding", exc_info=True)
+            # OCR audit #86: preserve the corrupt file (it may hold API keys)
+            # instead of silently overwriting it with the default seed.
+            with contextlib.suppress(OSError):
+                _PROVIDERS_FILE.replace(_PROVIDERS_FILE.with_suffix(".json.corrupt"))
     return _seed_default_registry()
 
 
@@ -208,11 +229,21 @@ def _seed_default_registry() -> dict:
     return reg
 
 
-def _save_provider_registry(reg: dict) -> None:
+_registry_lock = threading.Lock()
+
+
+def _save_provider_registry(reg: dict) -> bool:
+    """OCR audit #86: atomic write under a lock; report failure so callers
+    never return ok:True when nothing was persisted."""
+    tmp = _PROVIDERS_FILE.with_suffix(".json.tmp")
     try:
-        _PROVIDERS_FILE.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+        with _registry_lock:
+            tmp.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+            tmp.replace(_PROVIDERS_FILE)
+        return True
     except Exception:
         logger.error("Failed to write llm_providers.json", exc_info=True)
+        return False
 
 
 def _mask_key(key: str) -> str:
@@ -551,7 +582,9 @@ def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float
                 "unknown",
                 json.dumps([h.rel_path for h in hits]),
                 answer,
-                _cfg.models.generation.name,
+                # OCR audit #85: record the ACTIVE provider's model — the
+                # config default mislabeled every switched-provider turn.
+                (_get_active_provider() or {}).get("model") or _cfg.models.generation.name,
                 _cfg.models.embedding.name,
                 _cfg.models.reranker.name if getattr(_cfg.models.reranker, "enabled", False) else None,
                 int(total_ms * 1000),
@@ -569,6 +602,20 @@ def _record_query_log(message: str, answer: str, hits: list, retrieval_ms: float
 def _chat_history_snapshot() -> list:
     """Latest chat history as tracked by the Gradio state (best-effort)."""
     return _LATEST_HISTORY
+
+
+# OCR audit #87: server-side stop flags — the client abort alone left the
+# backend generating (and persisting) the full answer after "Stop".
+_chat_cancels: set[str] = set()
+
+
+def _request_chat_cancel(conv_id: str | None) -> None:
+    if conv_id:
+        _chat_cancels.add(conv_id)
+
+
+def _chat_cancel_requested(conv_id: str | None) -> bool:
+    return bool(conv_id) and conv_id in _chat_cancels
 
 
 # The history list most recently yielded by _on_chat (feedback alignment).
@@ -595,6 +642,7 @@ def _on_feedback(feedback_data: gr.LikeData) -> None:
 def _on_chat(message: str, history: list[dict], folder_filter: str, conversation_id: str | None = None):
     import time as _time
     import uuid as _uuid
+    _chat_cancels.discard(conversation_id)  # OCR #87: stale stop must not kill a new turn
     query_start = _time.time()
     logger.info(f"[QUERY] message={message[:100]!r}, folder_filter={folder_filter!r}")
 
@@ -678,6 +726,12 @@ def _on_chat(message: str, history: list[dict], folder_filter: str, conversation
         # the same way).
         token_gen = _stream_tokens(message.strip(), hits, history=history[:-2])
         for result in token_gen:
+            # OCR audit #87: honor Stop — close the token generator (which
+            # tears down the LLM stream) and persist only what was shown.
+            if _chat_cancel_requested(conversation_id):
+                _chat_cancels.discard(conversation_id)
+                token_gen.close()
+                break
             if isinstance(result, tuple):
                 full_text, citations = result
             else:
@@ -801,15 +855,28 @@ def _delete_conversation(conv_id: str):
     db.conn.commit()
 
 
-def _record_message_feedback(conv_id: str, feedback: str):
-    """Record feedback on the most recent assistant message in a conversation."""
+def _record_message_feedback(conv_id: str, feedback: str, index: int | None = None):
+    """Record feedback on a specific assistant message (OCR audit #44).
+
+    ``index`` is the 0-based ordinal among the conversation's assistant
+    messages (oldest first, matching UI render order). Without it, fall back
+    to the most recent assistant message (legacy clients).
+    """
     db = _get_db()
-    db.conn.execute(
-        "UPDATE message SET feedback = ? WHERE id = ("
-        "  SELECT id FROM message WHERE conversation_id = ? AND role = 'assistant' "
-        "  ORDER BY created_at DESC, id DESC LIMIT 1)",
-        (feedback, conv_id),
-    )
+    if index is not None and index >= 0:
+        db.conn.execute(
+            "UPDATE message SET feedback = ? WHERE id = ("
+            "  SELECT id FROM message WHERE conversation_id = ? AND role = 'assistant' "
+            "  ORDER BY created_at, id LIMIT 1 OFFSET ?)",
+            (feedback, conv_id, index),
+        )
+    else:
+        db.conn.execute(
+            "UPDATE message SET feedback = ? WHERE id = ("
+            "  SELECT id FROM message WHERE conversation_id = ? AND role = 'assistant' "
+            "  ORDER BY created_at DESC, id DESC LIMIT 1)",
+            (feedback, conv_id),
+        )
     db.conn.commit()
 
 
@@ -1076,7 +1143,9 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
             fb = payload.get("feedback")
             if fb not in ("up", "down"):
                 return {"ok": False, "error": "invalid feedback value"}
-            _record_message_feedback(conv_id, fb)
+            idx = payload.get("index")
+            idx = int(idx) if isinstance(idx, (int, float)) and idx >= 0 else None
+            _record_message_feedback(conv_id, fb, idx)
             return {"ok": True}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -1124,12 +1193,25 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
             "config": cfg_summary,
         }
 
+    @proxy_app.post("/api/chat/cancel")
+    async def cancel_chat(request: Request):
+        # OCR audit #87: propagate the UI Stop button to the backend.
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        _request_chat_cancel(payload.get("conversation_id"))
+        return {"ok": True}
+
     @proxy_app.get("/api/settings")
     async def get_settings():
         return _settings_payload()
 
     @proxy_app.post("/api/settings/providers")
     async def upsert_provider(request: Request):
+        denied = _settings_loopback_guard(request)
+        if denied is not None:
+            return denied
         try:
             payload = await request.json()
         except Exception:
@@ -1164,11 +1246,15 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
                 "api_key": api_key, "model": model,
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             })
-        _save_provider_registry(reg)
+        if not _save_provider_registry(reg):
+            return {"ok": False, "error": "failed to persist provider registry"}
         return {"ok": True, "settings": _settings_payload()}
 
     @proxy_app.delete("/api/settings/providers/{pid}")
-    async def delete_provider(pid: str):
+    async def delete_provider(pid: str, request: Request):
+        denied = _settings_loopback_guard(request)
+        if denied is not None:
+            return denied
         reg = _load_provider_registry()
         before = len(reg["providers"])
         reg["providers"] = [p for p in reg["providers"] if p.get("id") != pid]
@@ -1176,16 +1262,21 @@ def launch_ui(cfg, share: bool = False, server_name: str = "127.0.0.1", server_p
             return {"ok": False, "error": "not found"}
         if reg.get("active_id") == pid:
             reg["active_id"] = reg["providers"][0]["id"] if reg["providers"] else None
-        _save_provider_registry(reg)
+        if not _save_provider_registry(reg):
+            return {"ok": False, "error": "failed to persist provider registry"}
         return {"ok": True, "settings": _settings_payload()}
 
     @proxy_app.post("/api/settings/providers/{pid}/activate")
-    async def activate_provider(pid: str):
+    async def activate_provider(pid: str, request: Request):
+        denied = _settings_loopback_guard(request)
+        if denied is not None:
+            return denied
         reg = _load_provider_registry()
         if not any(p.get("id") == pid for p in reg["providers"]):
             return {"ok": False, "error": "not found"}
         reg["active_id"] = pid
-        _save_provider_registry(reg)
+        if not _save_provider_registry(reg):
+            return {"ok": False, "error": "failed to persist provider registry"}
         return {"ok": True, "settings": _settings_payload()}
 
     @proxy_app.post("/api/settings/providers/test")
@@ -2045,7 +2136,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 
 <script>
 (function(){
-  var _S = {H:[], streaming:false, abortFlag:false, lastQuery:'', lastFolder:''};
+  var _S = {H:[], streaming:false, abortFlag:false, lastQuery:'', lastFolder:'', streamSeq:0};
   var _allConvs = [];
   var _LOGO = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect fill='%23FEFEFE' width='512' height='512' rx='90'/%3E%3Cpath d='M160.66 199.59h-2.92c-2.94 0-5.33 2.39-5.33 5.33s2.39 5.33 5.33 5.33h4.9a25.4 25.4 0 01-1.98-10.66zm60.3-26.08l2.52 2.52c-.21-7.43-6.27-13.4-13.75-13.4-2.16 0-4.17.54-5.99 1.42a37.7 37.7 0 0117.22 9.46zm-27.38 72.61h-49.84c-20.88 0-37.86-16.99-37.86-37.87v-63.52c0-20.88 16.98-37.86 37.86-37.86h63.52c20.88 0 37.86 16.98 37.86 37.86v52.95l19.9 19.9v-.04l3.63 3.63c.88-4.17 1.35-8.49 1.35-12.92v-63.52c0-34.65-28.09-62.74-62.74-62.74h-63.52c-34.65 0-62.74 28.09-62.74 62.74v63.52c0 34.65 28.09 62.74 62.74 62.74h63.52c3.51 0 6.93-.36 10.29-.91l-23.97-23.97zm-38.52-69.7c0 7.62-6.18 13.79-13.79 13.79s-13.79-6.17-13.79-13.79c0-7.62 6.18-13.79 13.79-13.79s13.79 6.17 13.79 13.79z' fill='%23020303'/%3E%3Cpath d='M233.45 482.5c0-.15.01-.3.01-.45v-.05H90c-33.08 0-60-26.92-60-60V90c0-33.08 26.92-60 60-60h332c33.08 0 60 26.92 60 60v86.63c3.98-1.49 8.15-2.25 12.44-2.25 6.23 0 12.24 1.62 17.56 4.69V90c0-49.71-40.29-90-90-90H90C40.3 0 0 40.29 0 90v332c0 49.71 40.3 90 90 90h159.25c-9.67-6.4-15.8-17.35-15.8-29.5z' fill='%23020303'/%3E%3Cg transform='translate(166,168)'%3E%3Cpath d='M316.02 13.88c-3.32 1.49-6.44 3.59-9.18 6.32-11.3 11.33-11.7 29.29-1.43 41.23l10.61 10.62 7.08 7.08c1.42 1.43 1.42 3.74 0 5.16-.79.8-1.85 1.11-2.88 1.01l.03.52-.62-.63c-.62-.15-1.21-.42-1.68-.9l-1.93-1.92-39.56-39.59c-11.82-8.15-28.12-7-38.63 3.51-10.31 10.33-11.64 26.2-4.04 37.98l33.5 33.53c1.42 1.41 1.42 3.74 0 5.15-1.42 1.43-3.72 1.43-5.15.01l-14.86-14.88-31.29-31.33c-11.85-11.87-31.11-11.83-42.98.04-11.86 11.87-11.86 31.12 0 42.99l37.56 37.6c1.42 1.42 1.42 3.73 0 5.15-1.42 1.42-3.73 1.43-5.16.01l-3.03-3.04-97.93-98.03v.04L51.85 8.9c-11.86-11.87-31.1-11.87-42.95 0-11.87 11.88-11.87 31.13 0 43l51.01 51.06h.03l135.74 135.87c4.93 5.79 7.84 9.22 7.87 9.26 12.64 14.86 9.09 29.02-9.25 36H103c-16.61 0-30.09 13.33-30.36 29.9-.003.17-.014.33-.014.5-.007 14.27 9.81 26.23 23.05 29.51h160.4c49.68 0 89.95-40.31 89.95-90.04V16.82c-8.84-6.29-20.29-7.3-29.98-2.94' fill='%23CD2028'/%3E%3C/g%3E%3C/svg%3E";
 
@@ -2189,6 +2280,15 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     _S.abortFlag = true;
     _S.streaming = false;
     _updateSend();
+    // OCR audit #87: tell the backend to stop generating too — otherwise it
+    // finishes and persists the full answer the user never saw.
+    if(_currentConvId){
+      fetch('/api/chat/cancel', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({conversation_id: _currentConvId})
+      }).catch(function(){});
+    }
     var msgs = document.getElementById('msgs');
     var lastMsg = msgs ? msgs.lastElementChild : null;
     if(lastMsg && lastMsg.classList.contains('assistant') && lastMsg.classList.contains('cursor')){
@@ -2225,6 +2325,9 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 
     var el = _addMsg('assistant', '<div class="thinking-indicator"><div class="thinking-indicator__pulse"></div><span class="thinking-indicator__text">Thinking...</span></div>', true);
     _S.streaming = true; _S.abortFlag = false;
+    // OCR audit #45: tag this stream; conversation switches bump streamSeq
+    // so frames from the old stream can no longer clobber the new state.
+    var mySeq = ++_S.streamSeq;
     _updateSend();
 
     var _convId = window._getCurrentConvId ? window._getCurrentConvId() : null;
@@ -2263,6 +2366,8 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
                 return true;
               }
               if(d && d[0] && d[0].length){
+                // OCR audit #45: ignore frames from a superseded stream.
+                if(mySeq !== _S.streamSeq) return true;
                 var h = d[0];
                 // Adopt the backend history (user + assistant turns) so the
                 // next send replays answers too, not just prior questions.
@@ -2271,9 +2376,12 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
                 // Citations first: an exception later in this block (e.g. the
                 // markdown renderer choking on some generated text) must
                 // never swallow the citations payload of the final frames.
-                if(d[1]){
+                // OCR audit #41: an empty citations payload must CLEAR the
+                // panel — 'if(d[1])' kept the previous turn's sources visible
+                // under uncited/refused answers.
+                if(d.length > 1){
                   var citEl = document.getElementById('cit');
-                  if(citEl) citEl.innerHTML = d[1];
+                  if(citEl) citEl.innerHTML = d[1] || '';
                 }
                 if(last && last.content && last.content.length){
                   var text = last.content[0].text || '';
@@ -2298,6 +2406,8 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       };
       (function pump(){
         reader.read().then(function(res){
+          // OCR audit #45: stale stream (conversation switched) — drop it.
+          if(mySeq !== _S.streamSeq){ reader.cancel(); _S.streaming = false; return; }
           if(_S.abortFlag){ reader.cancel(); _done(el); return; }
           if(res.done){
             // The stream may close without a trailing newline; flush the
@@ -2404,8 +2514,14 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
     t = t.replace(/((?:<li>.*<\\/li>\\n?)+)/g, '<ul>$1</ul>');
     // Ordered lists
     t = t.replace(/^\\d+\\. (.+)$/gm, '<li>$1</li>');
-    // Links
-    t = t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // Links — OCR audit #5: allow only http(s)/mailto schemes and escape
+    // quotes so a crafted URL cannot break out of the href attribute.
+    t = t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, function(m, label, url){
+      var u = String(url).trim();
+      if(!/^(https?:|mailto:)/i.test(u)) return label;
+      u = u.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      return '<a href="' + u + '" target="_blank" rel="noopener">' + label + '</a>';
+    });
     // Citation markers - make clickable
     t = t.replace(/\\[([\\d,\\s]+)\\]/g, function(m, nums){
       var parts = nums.split(/[,\\s]+/).filter(Boolean);
@@ -2521,15 +2637,19 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       var c = conversations[i];
       var active = c.id === _currentConvId ? ' active' : '';
       var title = (c.title || 'Untitled').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      html += '<div class="conv-item' + active + '" data-conv-id="' + c.id + '">' +
+      // OCR audit #6: conversation ids are client-supplied — escape before
+      // interpolating into attributes (stored XSS via innerHTML).
+      var cid = _escHtml(String(c.id));
+      html += '<div class="conv-item' + active + '" data-conv-id="' + cid + '">' +
               '<span class="conv-item__title">' + title + '</span>' +
-              '<button class="conv-item__delete" data-conv-id="' + c.id + '" title="Delete">&times;</button>' +
+              '<button class="conv-item__delete" data-conv-id="' + cid + '" title="Delete">&times;</button>' +
               '</div>';
     }
     list.innerHTML = html;
   }
 
   function _newChat(){
+    _S.streamSeq++;  // OCR audit #45: invalidate any in-flight stream
     _currentConvId = null;
     _S.H = [];
     _S.lastQuery = '';
@@ -2552,6 +2672,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
   }
 
   function _selectConversation(convId){
+    _S.streamSeq++;  // OCR audit #45: invalidate any in-flight stream
     _currentConvId = convId;
     fetch('/conversations/' + convId + '/messages')
     .then(function(r){ return r.json(); })
@@ -2575,6 +2696,9 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
           _S.H.push({role:'user', content:[{text:m.content, type:'text'}]});
         } else if(m.role === 'assistant'){
           _addMsg('assistant', m.content);
+          // OCR audit #42: replay assistant turns too — a user-only history
+          // loses context and breaks role alternation (Anthropic 400).
+          _S.H.push({role:'assistant', content:[{text:m.content, type:'text'}]});
         }
       }
       msgs.scrollTop = msgs.scrollHeight;
@@ -2628,7 +2752,9 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       var indent = 0;
       var parts = opt.value.split('/');
       if(parts.length > 1) indent = (parts.length - 1) * 12;
-      html += '<div class="folder-tree-item" data-folder="' + opt.value.replace(/"/g, '&quot;') + '" style="padding-left:' + (8 + indent) + 'px"><span class="folder-tree-item__icon">&#x1f4c4;</span><span>' + opt.text + '</span></div>';
+      // OCR audit #39: opt.text/opt.value are entity-decoded by the browser —
+      // re-escape before innerHTML interpolation (folder names are untrusted).
+      html += '<div class="folder-tree-item" data-folder="' + _escHtml(opt.value) + '" style="padding-left:' + (8 + indent) + 'px"><span class="folder-tree-item__icon">&#x1f4c4;</span><span>' + _escHtml(opt.text) + '</span></div>';
     }
     tree.innerHTML = html;
   }
@@ -2696,21 +2822,29 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
       var liked = btn.classList.toggle('liked');
       var downBtn = msgEl.querySelector('.feedback-down');
       if(downBtn) downBtn.classList.remove('disliked');
-      if(liked) _sendFeedback('up');
+      if(liked) _sendFeedback('up', _assistantIndexOf(msgEl));
     } else if(btn.classList.contains('feedback-down')){
       var disliked = btn.classList.toggle('disliked');
       var upBtn = msgEl.querySelector('.feedback-up');
       if(upBtn) upBtn.classList.remove('liked');
-      if(disliked) _sendFeedback('down');
+      if(disliked) _sendFeedback('down', _assistantIndexOf(msgEl));
     }
   });
 
-  function _sendFeedback(fb){
+  // OCR audit #44: identify WHICH assistant message was clicked (ordinal
+  // among rendered assistant messages) instead of always targeting the newest.
+  function _assistantIndexOf(msgEl){
+    var nodes = document.querySelectorAll('#msgs .msg.assistant');
+    for(var i = 0; i < nodes.length; i++){ if(nodes[i] === msgEl) return i; }
+    return -1;
+  }
+
+  function _sendFeedback(fb, idx){
     if(!_currentConvId) return;
     fetch('/conversations/' + _currentConvId + '/feedback', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({feedback: fb})
+      body: JSON.stringify({feedback: fb, index: idx})
     }).catch(function(){});
   }
 

@@ -174,8 +174,10 @@ class TestRetrievalClientLifecycle:
              patch("rag.retrieval._detect_language", return_value="en"):
             instance = mock_client.return_value
             instance.embed.side_effect = RuntimeError("ollama down")
-            hits, _metrics = retrieve("test query", test_db, None, "/chroma", app_config)
-        assert hits == []
+            # OCR audit #68: an embed outage now raises (API -> 503) instead
+            # of masquerading as an empty result; the client must still close.
+            with pytest.raises(RuntimeError, match="embedding"):
+                retrieve("test query", test_db, None, "/chroma", app_config)
         instance.close.assert_called_once()
 
 
